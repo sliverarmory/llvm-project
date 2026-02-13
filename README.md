@@ -1,4 +1,4 @@
-# LLVM Obfuscation Port (LLVM v21)
+# LLVM Obfuscation Port (v21)
 
 ### Clang-exposed transforms
 
