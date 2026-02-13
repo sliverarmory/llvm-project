@@ -14,6 +14,7 @@
 #include "llvm/Transforms/Obfuscation/CryptoUtils.h"
 #include "llvm/Transforms/Obfuscation/Split.h"
 #include "llvm/Transforms/Obfuscation/Utils.h"
+#include <memory>
 
 #define DEBUG_TYPE "split"
 
@@ -33,8 +34,8 @@ struct SplitBasicBlock : public FunctionPass {
   SplitBasicBlock() : FunctionPass(ID) {}
   SplitBasicBlock(bool flag) : FunctionPass(ID), flag(flag) {}
 
-  bool runOnFunction(Function &F);
-  void split(Function *f);
+  bool runOnFunction(Function &F) override;
+  bool split(Function *f);
 
   bool containsPHI(BasicBlock *b);
   void shuffle(std::vector<int> &vec);
@@ -46,6 +47,14 @@ static RegisterPass<SplitBasicBlock> X("splitbbl", "BasicBlock splitting");
 
 Pass *llvm::createSplitBasicBlock(bool flag) {
   return new SplitBasicBlock(flag);
+}
+
+PreservedAnalyses SplitBasicBlockPass::run(Function &F,
+                                           FunctionAnalysisManager &AM) {
+  (void)AM;
+  std::unique_ptr<Pass> Legacy(createSplitBasicBlock(Flag));
+  bool Changed = static_cast<FunctionPass *>(Legacy.get())->runOnFunction(F);
+  return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }
 
 bool SplitBasicBlock::runOnFunction(Function &F) {
@@ -60,16 +69,16 @@ bool SplitBasicBlock::runOnFunction(Function &F) {
 
   // Do we obfuscate
   if (toObfuscate(flag, tmp, "split")) {
-    split(tmp);
-    ++Split;
+    return split(tmp);
   }
 
   return false;
 }
 
-void SplitBasicBlock::split(Function *f) {
+bool SplitBasicBlock::split(Function *f) {
   std::vector<BasicBlock *> origBB;
   int splitN = SplitNum;
+  bool Changed = false;
 
   // Save all basic blocks
   for (Function::iterator I = f->begin(), IE = f->end(); I != IE; ++I) {
@@ -116,10 +125,13 @@ void SplitBasicBlock::split(Function *f) {
       if (toSplit->size() < 2)
         continue;
       toSplit = toSplit->splitBasicBlock(it, toSplit->getName() + ".split");
+      Changed = true;
     }
 
     ++Split;
   }
+
+  return Changed;
 }
 
 bool SplitBasicBlock::containsPHI(BasicBlock *b) {

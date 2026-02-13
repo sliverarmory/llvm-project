@@ -17,6 +17,7 @@
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Obfuscation/Utils.h"
+#include <memory>
 
 #define DEBUG_TYPE "substitution"
 
@@ -24,6 +25,7 @@ using namespace llvm;
 
 #define NUMBER_ADD_SUBST 4
 #define NUMBER_SUB_SUBST 3
+#define NUMBER_MUL_SUBST 2
 #define NUMBER_AND_SUBST 2
 #define NUMBER_OR_SUBST 2
 #define NUMBER_XOR_SUBST 2
@@ -36,7 +38,7 @@ static cl::opt<int>
 // Stats
 STATISTIC(Add, "Add substitued");
 STATISTIC(Sub, "Sub substitued");
-// STATISTIC(Mul,  "Mul substitued");
+STATISTIC(Mul, "Mul substitued");
 // STATISTIC(Div,  "Div substitued");
 // STATISTIC(Rem,  "Rem substitued");
 // STATISTIC(Shi,  "Shift substitued");
@@ -46,10 +48,21 @@ STATISTIC(Xor, "Xor substitued");
 
 namespace {
 
+static Constant *getRandomIntConstant(Type *Ty) {
+  Type *ScalarTy = Ty->getScalarType();
+  if (!ScalarTy->isIntegerTy())
+    return nullptr;
+
+  unsigned BitWidth = cast<IntegerType>(ScalarTy)->getBitWidth();
+  APInt Value(BitWidth, llvm::cryptoutils->get_uint64_t());
+  return Constant::getIntegerValue(Ty, Value);
+}
+
 struct Substitution : public FunctionPass {
   static char ID; // Pass identification, replacement for typeid
   void (Substitution::*funcAdd[NUMBER_ADD_SUBST])(BinaryOperator *bo);
   void (Substitution::*funcSub[NUMBER_SUB_SUBST])(BinaryOperator *bo);
+  void (Substitution::*funcMul[NUMBER_MUL_SUBST])(BinaryOperator *bo);
   void (Substitution::*funcAnd[NUMBER_AND_SUBST])(BinaryOperator *bo);
   void (Substitution::*funcOr[NUMBER_OR_SUBST])(BinaryOperator *bo);
   void (Substitution::*funcXor[NUMBER_XOR_SUBST])(BinaryOperator *bo);
@@ -71,6 +84,9 @@ struct Substitution : public FunctionPass {
     funcSub[1] = &Substitution::subRand;
     funcSub[2] = &Substitution::subRand2;
 
+    funcMul[0] = &Substitution::mulNeg;
+    funcMul[1] = &Substitution::mulRand;
+
     funcAnd[0] = &Substitution::andSubstitution;
     funcAnd[1] = &Substitution::andSubstitutionRand;
 
@@ -81,7 +97,7 @@ struct Substitution : public FunctionPass {
     funcXor[1] = &Substitution::xorSubstitutionRand;
   }
 
-  bool runOnFunction(Function &F);
+  bool runOnFunction(Function &F) override;
   bool substitute(Function *f);
 
   void addNeg(BinaryOperator *bo);
@@ -92,6 +108,9 @@ struct Substitution : public FunctionPass {
   void subNeg(BinaryOperator *bo);
   void subRand(BinaryOperator *bo);
   void subRand2(BinaryOperator *bo);
+
+  void mulNeg(BinaryOperator *bo);
+  void mulRand(BinaryOperator *bo);
 
   void andSubstitution(BinaryOperator *bo);
   void andSubstitutionRand(BinaryOperator *bo);
@@ -108,6 +127,14 @@ char Substitution::ID = 0;
 static RegisterPass<Substitution> X("substitution", "operators substitution");
 Pass *llvm::createSubstitution(bool flag) { return new Substitution(flag); }
 
+PreservedAnalyses SubstitutionPass::run(Function &F,
+                                        FunctionAnalysisManager &AM) {
+  (void)AM;
+  std::unique_ptr<Pass> Legacy(createSubstitution(Flag));
+  bool Changed = static_cast<FunctionPass *>(Legacy.get())->runOnFunction(F);
+  return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
+}
+
 bool Substitution::runOnFunction(Function &F) {
   // Check if the percentage is correct
   if (ObfTimes <= 0) {
@@ -118,14 +145,14 @@ bool Substitution::runOnFunction(Function &F) {
   Function *tmp = &F;
   // Do we obfuscate
   if (toObfuscate(flag, tmp, "sub")) {
-    substitute(tmp);
-    return true;
+    return substitute(tmp);
   }
   return false;
 }
 
 bool Substitution::substitute(Function *f) {
   Function *tmp = f;
+  bool Changed = false;
 
   // Loop for the number of time we run the pass on the function
   int times = ObfTimes;
@@ -133,24 +160,40 @@ bool Substitution::substitute(Function *f) {
     for (Function::iterator bb = tmp->begin(); bb != tmp->end(); ++bb) {
       for (BasicBlock::iterator inst = bb->begin(); inst != bb->end(); ++inst) {
         if (inst->isBinaryOp()) {
+          BinaryOperator *BO = cast<BinaryOperator>(inst);
           switch (inst->getOpcode()) {
           case BinaryOperator::Add:
+            if (!BO->getType()->isIntOrIntVectorTy() ||
+                BO->hasNoSignedWrap() || BO->hasNoUnsignedWrap())
+              break;
             // case BinaryOperator::FAdd:
             // Substitute with random add operation
             (this->*funcAdd[llvm::cryptoutils->get_range(NUMBER_ADD_SUBST)])(
-                cast<BinaryOperator>(inst));
+                BO);
             ++Add;
+            Changed = true;
             break;
           case BinaryOperator::Sub:
+            if (!BO->getType()->isIntOrIntVectorTy() ||
+                BO->hasNoSignedWrap() || BO->hasNoUnsignedWrap())
+              break;
             // case BinaryOperator::FSub:
             // Substitute with random sub operation
             (this->*funcSub[llvm::cryptoutils->get_range(NUMBER_SUB_SUBST)])(
-                cast<BinaryOperator>(inst));
+                BO);
             ++Sub;
+            Changed = true;
             break;
           case BinaryOperator::Mul:
+            if (!BO->getType()->isIntOrIntVectorTy() ||
+                BO->hasNoSignedWrap() || BO->hasNoUnsignedWrap())
+              break;
+            (this->*funcMul[llvm::cryptoutils->get_range(NUMBER_MUL_SUBST)])(
+                BO);
+            ++Mul;
+            Changed = true;
+            break;
           case BinaryOperator::FMul:
-            //++Mul;
             break;
           case BinaryOperator::UDiv:
           case BinaryOperator::SDiv:
@@ -172,19 +215,27 @@ bool Substitution::substitute(Function *f) {
             //++Shi;
             break;
           case Instruction::And:
-            (this->*funcAnd[llvm::cryptoutils->get_range(2)])(
-                cast<BinaryOperator>(inst));
+            if (!BO->getType()->isIntOrIntVectorTy())
+              break;
+            (this->*funcAnd[llvm::cryptoutils->get_range(NUMBER_AND_SUBST)])(
+                BO);
             ++And;
+            Changed = true;
             break;
           case Instruction::Or:
-            (this->*funcOr[llvm::cryptoutils->get_range(2)])(
-                cast<BinaryOperator>(inst));
+            if (!BO->getType()->isIntOrIntVectorTy())
+              break;
+            (this->*funcOr[llvm::cryptoutils->get_range(NUMBER_OR_SUBST)])(BO);
             ++Or;
+            Changed = true;
             break;
           case Instruction::Xor:
-            (this->*funcXor[llvm::cryptoutils->get_range(2)])(
-                cast<BinaryOperator>(inst));
+            if (!BO->getType()->isIntOrIntVectorTy())
+              break;
+            (this->*funcXor[llvm::cryptoutils->get_range(NUMBER_XOR_SUBST)])(
+                BO);
             ++Xor;
+            Changed = true;
             break;
           default:
             break;
@@ -193,7 +244,7 @@ bool Substitution::substitute(Function *f) {
       }                  // End for basickblock
     }                    // End for Function
   } while (--times > 0); // for times
-  return false;
+  return Changed;
 }
 
 // Implementation of a = b - (-c)
@@ -246,9 +297,9 @@ void Substitution::addRand(BinaryOperator *bo) {
   BinaryOperator *op = NULL;
 
   if (bo->getOpcode() == Instruction::Add) {
-    Type *ty = bo->getType();
-    ConstantInt *co =
-        (ConstantInt *)ConstantInt::get(ty, llvm::cryptoutils->get_uint64_t());
+    Constant *co = getRandomIntConstant(bo->getType());
+    if (!co)
+      return;
     op =
         BinaryOperator::Create(Instruction::Add, bo->getOperand(0), co, "", bo);
     op =
@@ -276,9 +327,9 @@ void Substitution::addRand2(BinaryOperator *bo) {
   BinaryOperator *op = NULL;
 
   if (bo->getOpcode() == Instruction::Add) {
-    Type *ty = bo->getType();
-    ConstantInt *co =
-        (ConstantInt *)ConstantInt::get(ty, llvm::cryptoutils->get_uint64_t());
+    Constant *co = getRandomIntConstant(bo->getType());
+    if (!co)
+      return;
     op =
         BinaryOperator::Create(Instruction::Sub, bo->getOperand(0), co, "", bo);
     op =
@@ -327,9 +378,9 @@ void Substitution::subRand(BinaryOperator *bo) {
   BinaryOperator *op = NULL;
 
   if (bo->getOpcode() == Instruction::Sub) {
-    Type *ty = bo->getType();
-    ConstantInt *co =
-        (ConstantInt *)ConstantInt::get(ty, llvm::cryptoutils->get_uint64_t());
+    Constant *co = getRandomIntConstant(bo->getType());
+    if (!co)
+      return;
     op =
         BinaryOperator::Create(Instruction::Add, bo->getOperand(0), co, "", bo);
     op =
@@ -357,9 +408,9 @@ void Substitution::subRand2(BinaryOperator *bo) {
   BinaryOperator *op = NULL;
 
   if (bo->getOpcode() == Instruction::Sub) {
-    Type *ty = bo->getType();
-    ConstantInt *co =
-        (ConstantInt *)ConstantInt::get(ty, llvm::cryptoutils->get_uint64_t());
+    Constant *co = getRandomIntConstant(bo->getType());
+    if (!co)
+      return;
     op =
         BinaryOperator::Create(Instruction::Sub, bo->getOperand(0), co, "", bo);
     op =
@@ -382,6 +433,35 @@ void Substitution::subRand2(BinaryOperator *bo) {
   } */
 }
 
+// Implementation of a = -((-b) * c)
+void Substitution::mulNeg(BinaryOperator *bo) {
+  if (bo->getOpcode() != Instruction::Mul)
+    return;
+
+  Value *op = BinaryOperator::CreateNeg(bo->getOperand(0), "", bo);
+  op = BinaryOperator::Create(Instruction::Mul, op, bo->getOperand(1), "", bo);
+  op = BinaryOperator::CreateNeg(op, "", bo);
+  bo->replaceAllUsesWith(op);
+}
+
+// Implementation of a = ((b + r) * c) - (r * c)
+void Substitution::mulRand(BinaryOperator *bo) {
+  if (bo->getOpcode() != Instruction::Mul)
+    return;
+
+  Constant *co = getRandomIntConstant(bo->getType());
+  if (!co)
+    return;
+
+  Value *op =
+      BinaryOperator::Create(Instruction::Add, bo->getOperand(0), co, "", bo);
+  op = BinaryOperator::Create(Instruction::Mul, op, bo->getOperand(1), "", bo);
+  Value *adjust =
+      BinaryOperator::Create(Instruction::Mul, bo->getOperand(1), co, "", bo);
+  op = BinaryOperator::Create(Instruction::Sub, op, adjust, "", bo);
+  bo->replaceAllUsesWith(op);
+}
+
 // Implementation of a = b & c => a = (b^~c)& b
 void Substitution::andSubstitution(BinaryOperator *bo) {
   BinaryOperator *op = NULL;
@@ -402,11 +482,10 @@ void Substitution::andSubstitution(BinaryOperator *bo) {
 void Substitution::andSubstitutionRand(BinaryOperator *bo) {
   // Copy of the BinaryOperator type to create the random number with the
   // same type of the operands
-  Type *ty = bo->getType();
-
   // r (Random number)
-  ConstantInt *co =
-      (ConstantInt *)ConstantInt::get(ty, llvm::cryptoutils->get_uint64_t());
+  Constant *co = getRandomIntConstant(bo->getType());
+  if (!co)
+    return;
 
   // !a
   BinaryOperator *op = BinaryOperator::CreateNot(bo->getOperand(0), "", bo);
@@ -437,9 +516,9 @@ void Substitution::andSubstitutionRand(BinaryOperator *bo) {
 // Implementation of a = b | c => a = (b & c) | (b ^ c)
 void Substitution::orSubstitutionRand(BinaryOperator *bo) {
 
-  Type *ty = bo->getType();
-  ConstantInt *co =
-      (ConstantInt *)ConstantInt::get(ty, llvm::cryptoutils->get_uint64_t());
+  Constant *co = getRandomIntConstant(bo->getType());
+  if (!co)
+    return;
 
   // !a
   BinaryOperator *op = BinaryOperator::CreateNot(bo->getOperand(0), "", bo);
@@ -540,9 +619,9 @@ void Substitution::xorSubstitution(BinaryOperator *bo) {
 void Substitution::xorSubstitutionRand(BinaryOperator *bo) {
   BinaryOperator *op = NULL;
 
-  Type *ty = bo->getType();
-  ConstantInt *co =
-      (ConstantInt *)ConstantInt::get(ty, llvm::cryptoutils->get_uint64_t());
+  Constant *co = getRandomIntConstant(bo->getType());
+  if (!co)
+    return;
 
   // !a
   op = BinaryOperator::CreateNot(bo->getOperand(0), "", bo);

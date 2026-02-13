@@ -96,6 +96,7 @@
 
 #include "llvm/Transforms/Obfuscation/BogusControlFlow.h"
 #include "llvm/Transforms/Obfuscation/Utils.h"
+#include <memory>
 
 // Stats
 #define DEBUG_TYPE "BogusControlFlow"
@@ -139,7 +140,7 @@ struct BogusControlFlow : public FunctionPass {
    * Overwrite FunctionPass method to apply the transformation
    * to the function. See header for more details.
    */
-  virtual bool runOnFunction(Function &F) {
+  bool runOnFunction(Function &F) override {
     // Check if the percentage is correct
     if (ObfTimes <= 0) {
       errs() << "BogusControlFlow application number -bcf_loop=x must be x > 0";
@@ -680,3 +681,11 @@ static RegisterPass<BogusControlFlow> X("boguscf",
 Pass *llvm::createBogus() { return new BogusControlFlow(); }
 
 Pass *llvm::createBogus(bool flag) { return new BogusControlFlow(flag); }
+
+PreservedAnalyses BogusControlFlowPass::run(Function &F,
+                                            FunctionAnalysisManager &AM) {
+  (void)AM;
+  std::unique_ptr<Pass> Legacy(createBogus(Flag));
+  bool Changed = static_cast<FunctionPass *>(Legacy.get())->runOnFunction(F);
+  return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
+}

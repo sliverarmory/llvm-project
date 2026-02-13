@@ -16,6 +16,7 @@
 #include "llvm/ADT/Statistic.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/PassManager.h"
 #include "llvm/Pass.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Transforms/IPO.h"
@@ -25,6 +26,15 @@
 #include "llvm/Transforms/Utils/Local.h" // For DemoteRegToStack and DemotePHIToStack
 
 namespace llvm {
+class SplitBasicBlockPass : public PassInfoMixin<SplitBasicBlockPass> {
+public:
+  explicit SplitBasicBlockPass(bool Flag = false) : Flag(Flag) {}
+  PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
+
+private:
+  bool Flag = false;
+};
+
 Pass *createSplitBasicBlock(bool flag);
 }
 

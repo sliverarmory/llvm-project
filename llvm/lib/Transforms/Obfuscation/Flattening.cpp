@@ -15,6 +15,7 @@
 #include "llvm/Transforms/Obfuscation/CryptoUtils.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/Transforms/Utils.h"
+#include <memory>
 
 #define DEBUG_TYPE "flattening"
 
@@ -31,7 +32,7 @@ struct Flattening : public FunctionPass {
   Flattening() : FunctionPass(ID) {}
   Flattening(bool flag) : FunctionPass(ID), flag(flag) {}
 
-  bool runOnFunction(Function &F);
+  bool runOnFunction(Function &F) override;
   bool flatten(Function *f);
 };
 } // namespace
@@ -40,13 +41,23 @@ char Flattening::ID = 0;
 static RegisterPass<Flattening> X("flattening", "Call graph flattening");
 Pass *llvm::createFlattening(bool flag) { return new Flattening(flag); }
 
+PreservedAnalyses FlatteningPass::run(Function &F,
+                                      FunctionAnalysisManager &AM) {
+  (void)AM;
+  std::unique_ptr<Pass> Legacy(createFlattening(Flag));
+  bool Changed = static_cast<FunctionPass *>(Legacy.get())->runOnFunction(F);
+  return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
+}
+
 bool Flattening::runOnFunction(Function &F) {
   Function *tmp = &F;
   // Do we obfuscate
   if (toObfuscate(flag, tmp, "fla")) {
-    if (flatten(tmp)) {
+    bool Changed = flatten(tmp);
+    if (Changed) {
       ++Flattened;
     }
+    return Changed;
   }
 
   return false;

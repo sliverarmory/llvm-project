@@ -23,6 +23,7 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/PassManager.h"
 #include "llvm/IR/Type.h"
 #include "llvm/Pass.h"
 #include "llvm/Support/CommandLine.h"
@@ -34,6 +35,15 @@
 #include "llvm/Transforms/Utils/Cloning.h"
 
 namespace llvm {
+class BogusControlFlowPass : public PassInfoMixin<BogusControlFlowPass> {
+public:
+  explicit BogusControlFlowPass(bool Flag = false) : Flag(Flag) {}
+  PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
+
+private:
+  bool Flag = false;
+};
+
 Pass *createBogus();
 Pass *createBogus(bool flag);
 } // namespace llvm

@@ -1,44 +1,163 @@
-# The LLVM Compiler Infrastructure
+# LLVM Obfuscation Port (This Repository)
 
-[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/llvm/llvm-project/badge)](https://securityscorecards.dev/viewer/?uri=github.com/llvm/llvm-project)
-[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/8273/badge)](https://www.bestpractices.dev/projects/8273)
-[![libc++](https://github.com/llvm/llvm-project/actions/workflows/libcxx-build-and-test.yaml/badge.svg?branch=main&event=schedule)](https://github.com/llvm/llvm-project/actions/workflows/libcxx-build-and-test.yaml?query=event%3Aschedule)
+This tree contains a port of obfuscation transforms from `old/` into
+`llvm-project/`, with Clang integration on the new pass manager pipeline.
 
-Welcome to the LLVM project!
+## Current Status
 
-This repository contains the source code for LLVM, a toolkit for the
-construction of highly optimized compilers, optimizers, and run-time
-environments.
+### Clang-exposed transforms
 
-The LLVM project has multiple components. The core of the project is
-itself called "LLVM". This contains all of the tools, libraries, and header
-files needed to process intermediate representations and convert them into
-object files. Tools include an assembler, disassembler, bitcode analyzer, and
-bitcode optimizer.
+- `-mllvm -sobf`: string obfuscation
+- `-mllvm -sub`: instruction substitution
+- `-mllvm -sub_loop=<N>`: substitution iteration count (default `1`)
+- `-mllvm -split`: basic block splitting
+- `-mllvm -split_num=<N>`: splits per block (default `2`, valid `2..10`)
+- `-mllvm -bcf`: bogus control flow
+- `-mllvm -bcf_prob=<N>`: block obfuscation probability in `%` (default `30`, valid `1..100`)
+- `-mllvm -bcf_loop=<N>`: BCF loop count (default `1`, valid `>0`)
+- `-mllvm -fla`: control-flow flattening
 
-C-like languages use the [Clang](https://clang.llvm.org/) frontend. This
-component compiles C, C++, Objective-C, and Objective-C++ code into LLVM bitcode
--- and from there into object files, using LLVM.
+`split`, `bcf`, and `fla` are now wired into Clang's new PM pipeline:
 
-Other components include:
-the [libc++ C++ standard library](https://libcxx.llvm.org),
-the [LLD linker](https://lld.llvm.org), and more.
+- `O0`: pipeline-start extension point
+- `O1+`: optimizer-last extension point
 
-## Getting the Source Code and Building LLVM
+## Build
 
-Consult the
-[Getting Started with LLVM](https://llvm.org/docs/GettingStarted.html#getting-the-source-code-and-building-llvm)
-page for information on building and running LLVM.
+From `/Users/moloch/git/llvm-obfuscator`:
 
-For information on how to contribute to the LLVM project, please take a look at
-the [Contributing to LLVM](https://llvm.org/docs/Contributing.html) guide.
+```bash
+cmake -S llvm-project/llvm -B build-llvm-project \
+  -DLLVM_ENABLE_PROJECTS=clang \
+  -DCMAKE_BUILD_TYPE=Release
 
-## Getting in touch
+cmake --build build-llvm-project --target clang opt -j8
+```
 
-Join the [LLVM Discourse forums](https://discourse.llvm.org/), [Discord
-chat](https://discord.gg/xS7Z362),
-[LLVM Office Hours](https://llvm.org/docs/GettingInvolved.html#office-hours) or
-[Regular sync-ups](https://llvm.org/docs/GettingInvolved.html#online-sync-ups).
+## Usage
 
-The LLVM project has adopted a [code of conduct](https://llvm.org/docs/CodeOfConduct.html) for
-participants to all modes of communication within the project.
+Compiler path used below:
+
+```bash
+CLANG=/Users/moloch/git/llvm-obfuscator/build-llvm-project/bin/clang
+```
+
+### macOS note
+
+If standard headers are missing, pass SDK sysroot:
+
+```bash
+SDKROOT=$(xcrun --show-sdk-path)
+```
+
+and add `-isysroot "$SDKROOT"` to commands.
+
+### Example commands
+
+```bash
+# string obfuscation
+$CLANG -isysroot "$SDKROOT" -O2 -mllvm -sobf hello.c -o hello.obf
+
+# substitution
+$CLANG -isysroot "$SDKROOT" -O2 -mllvm -sub -mllvm -sub_loop=2 hello.c -o hello.sub
+
+# split / bcf / flattening
+$CLANG -isysroot "$SDKROOT" -O2 -mllvm -split hello_complex.c -o hello_complex.split
+$CLANG -isysroot "$SDKROOT" -O2 -mllvm -bcf hello_complex.c -o hello_complex.bcf
+$CLANG -isysroot "$SDKROOT" -O2 -mllvm -fla hello_complex.c -o hello_complex.fla
+
+# combined control-flow obfuscation
+$CLANG -isysroot "$SDKROOT" -O2 \
+  -mllvm -split -mllvm -bcf -mllvm -fla \
+  hello_complex.c -o hello_complex.all
+```
+
+## Function-Level Annotations
+
+These passes use annotations from `llvm.global.annotations`:
+
+```c
+__attribute__((annotate("sub")))   int f(int x) { ... }
+__attribute__((annotate("nosub"))) int g(int x) { ... }
+
+__attribute__((annotate("split")))   int h(int x) { ... }
+__attribute__((annotate("nosplit"))) int i(int x) { ... }
+
+__attribute__((annotate("bcf")))   int j(int x) { ... }
+__attribute__((annotate("nobcf"))) int k(int x) { ... }
+
+__attribute__((annotate("fla")))   int m(int x) { ... }
+__attribute__((annotate("nofla"))) int n(int x) { ... }
+```
+
+Behavior:
+
+- If a pass flag is enabled (`-mllvm -sub`, `-mllvm -split`, `-mllvm -bcf`, `-mllvm -fla`), it applies broadly to eligible functions unless `no<pass>` is present.
+- If a flag is not enabled, a positive annotation (`sub`, `split`, `bcf`, `fla`) still enables that pass for the function.
+
+## Quick Verification
+
+### Runtime checks
+
+```bash
+./hello.obf
+./hello_complex.split
+./hello_complex.bcf
+./hello_complex.fla
+./hello_complex.all
+```
+
+Expected sample output:
+
+- `hello.obf`: `Hello from ported LLVM obfuscation: 42`
+- `hello_complex.*`: `complex result: 56`
+
+### IR checks
+
+```bash
+$CLANG -isysroot "$SDKROOT" -O2 -S -emit-llvm hello_complex.c -o hello_complex.base.ll
+$CLANG -isysroot "$SDKROOT" -O2 -S -emit-llvm -mllvm -split hello_complex.c -o hello_complex.split.ll
+$CLANG -isysroot "$SDKROOT" -O2 -S -emit-llvm -mllvm -bcf hello_complex.c -o hello_complex.bcf.ll
+$CLANG -isysroot "$SDKROOT" -O2 -S -emit-llvm -mllvm -fla hello_complex.c -o hello_complex.fla.ll
+```
+
+What to look for:
+
+- `split`: noticeably more basic blocks / `br` instructions vs baseline.
+- `bcf`: inserted opaque-predicate globals like `@x` and `@y`.
+- `fla`: dispatcher-style flattened CFG with extra state/switch structure.
+
+### String obfuscation sanity check
+
+```bash
+strings ./hello.obf | grep "Hello from ported LLVM obfuscation" || true
+```
+
+Expected: no plaintext match.
+
+## Implementation Notes
+
+### String obfuscation
+
+- obfuscates constant C-string globals (`ConstantDataSequential::isCString()`)
+- skips metadata and ObjC method-name sections
+- uses per-byte rolling mask in decode
+- emits decode startup via `@llvm.global_ctors`
+
+### Substitution
+
+- integer/int-vector substitutions for add/sub/and/or/xor/mul
+- skips add/sub/mul with `nsw`/`nuw` to avoid semantic drift
+
+### Control-flow transforms
+
+- `split`: random split points per block
+- `bcf`: inserts opaque predicates and altered blocks
+- `fla`: rewrites CFG into dispatcher loop/switch form
+
+## Troubleshooting
+
+- `fatal error: 'stdio.h' file not found`:
+  - use `-isysroot "$(xcrun --show-sdk-path)"` on macOS
+- very long compile times with heavy obfuscation:
+  - reduce `-bcf_prob`, `-bcf_loop`, and/or `-split_num`

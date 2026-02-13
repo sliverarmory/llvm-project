@@ -82,11 +82,16 @@
 #include "llvm/Transforms/Instrumentation/ThreadSanitizer.h"
 #include "llvm/Transforms/Instrumentation/TypeSanitizer.h"
 #include "llvm/Transforms/ObjCARC.h"
+#include "llvm/Transforms/Obfuscation/BogusControlFlow.h"
+#include "llvm/Transforms/Obfuscation/Flattening.h"
+#include "llvm/Transforms/Obfuscation/Split.h"
+#include "llvm/Transforms/Obfuscation/Substitution.h"
 #include "llvm/Transforms/Obfuscation/StringObfuscation.h"
 #include "llvm/Transforms/Scalar/EarlyCSE.h"
 #include "llvm/Transforms/Scalar/GVN.h"
 #include "llvm/Transforms/Scalar/JumpThreading.h"
 #include "llvm/Transforms/Utils/Debugify.h"
+#include "llvm/Transforms/Utils/LowerSwitch.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 #include <limits>
 #include <memory>
@@ -122,6 +127,14 @@ static cl::opt<PGOOptions::ColdFuncOpt> ClPGOColdFuncAttr(
 // Obfuscation compatibility option from legacy pass manager pipeline.
 static cl::opt<bool> ClStringObf("sobf", cl::init(false),
                                  cl::desc("Enable the string obfuscation"));
+static cl::opt<bool> ClFlattening("fla", cl::init(false),
+                                  cl::desc("Enable control flow flattening"));
+static cl::opt<bool> ClBogusControlFlow("bcf", cl::init(false),
+                                        cl::desc("Enable bogus control flow"));
+static cl::opt<bool> ClSplitBasicBlocks("split", cl::init(false),
+                                        cl::desc("Enable basic block splitting"));
+static cl::opt<bool> ClSubstitution("sub", cl::init(false),
+                                    cl::desc("Enable instruction substitution"));
 
 LLVM_ABI extern cl::opt<InstrProfCorrelator::ProfCorrelatorKind>
     ProfileCorrelate;
@@ -1114,6 +1127,58 @@ void EmitAssemblyHelper::RunOptimizationPipeline(
             (void)Level;
             MPM.addPass(StringObfuscationPass(/*Flag=*/true));
           });
+
+    if (ClSplitBasicBlocks || ClBogusControlFlow || ClFlattening) {
+      PB.registerPipelineStartEPCallback(
+          [](ModulePassManager &MPM, OptimizationLevel Level) {
+            if (Level != OptimizationLevel::O0)
+              return;
+            FunctionPassManager FPM;
+            if (ClSplitBasicBlocks)
+              FPM.addPass(SplitBasicBlockPass(/*Flag=*/true));
+            if (ClBogusControlFlow)
+              FPM.addPass(BogusControlFlowPass(/*Flag=*/true));
+            if (ClFlattening) {
+              FPM.addPass(LowerSwitchPass());
+              FPM.addPass(FlatteningPass(/*Flag=*/true));
+            }
+            MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
+          });
+      PB.registerOptimizerLastEPCallback(
+          [](ModulePassManager &MPM, OptimizationLevel Level,
+             ThinOrFullLTOPhase) {
+            if (Level == OptimizationLevel::O0)
+              return;
+            FunctionPassManager FPM;
+            if (ClSplitBasicBlocks)
+              FPM.addPass(SplitBasicBlockPass(/*Flag=*/true));
+            if (ClBogusControlFlow)
+              FPM.addPass(BogusControlFlowPass(/*Flag=*/true));
+            if (ClFlattening) {
+              FPM.addPass(LowerSwitchPass());
+              FPM.addPass(FlatteningPass(/*Flag=*/true));
+            }
+            MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
+          });
+    }
+
+    if (ClSubstitution) {
+      PB.registerPipelineStartEPCallback(
+          [](ModulePassManager &MPM, OptimizationLevel Level) {
+            if (Level == OptimizationLevel::O0) {
+              MPM.addPass(createModuleToFunctionPassAdaptor(
+                  SubstitutionPass(/*Flag=*/true)));
+            }
+          });
+      PB.registerOptimizerLastEPCallback(
+          [](ModulePassManager &MPM, OptimizationLevel Level,
+             ThinOrFullLTOPhase) {
+            if (Level != OptimizationLevel::O0) {
+              MPM.addPass(createModuleToFunctionPassAdaptor(
+                  SubstitutionPass(/*Flag=*/true)));
+            }
+          });
+    }
 
     // TODO: Consider passing the MemoryProfileOutput to the pass builder via
     // the PGOOptions, and set this up there.

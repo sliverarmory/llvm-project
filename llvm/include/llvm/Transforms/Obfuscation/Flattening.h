@@ -17,6 +17,7 @@
 #include "llvm/ADT/Statistic.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/PassManager.h"
 #include "llvm/Pass.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Transforms/IPO.h"
@@ -26,6 +27,15 @@
 #include "llvm/Transforms/Utils/Local.h" // For DemoteRegToStack and DemotePHIToStack
 
 namespace llvm {
+class FlatteningPass : public PassInfoMixin<FlatteningPass> {
+public:
+  explicit FlatteningPass(bool Flag = false) : Flag(Flag) {}
+  PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
+
+private:
+  bool Flag = false;
+};
+
 Pass *createFlattening(bool flag);
 } // namespace llvm
 
