@@ -1,9 +1,4 @@
-# LLVM Obfuscation Port (This Repository)
-
-This tree contains a port of obfuscation transforms from `old/` into
-`llvm-project/`, with Clang integration on the new pass manager pipeline.
-
-## Current Status
+# LLVM Obfuscation Port (LLVM v21)
 
 ### Clang-exposed transforms
 
