@@ -172,6 +172,7 @@ jobs:
       - name: Create release and upload archives with gh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           shopt -s globstar nullglob
@@ -183,12 +184,13 @@ jobs:
             exit 1
           fi
 
-          if gh release view "$TAG" >/dev/null 2>&1; then
+          if gh release view "$TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
             echo "Release $TAG already exists, uploading with --clobber."
           else
             gh release create "$TAG" \
+              --repo "$GH_REPO" \
               --title "$TAG" \
               --notes "Automated release for $TAG"
           fi
 
-          gh release upload "$TAG" "${FILES[@]}" --clobber
+          gh release upload "$TAG" "${FILES[@]}" --clobber --repo "$GH_REPO"
