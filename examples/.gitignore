@@ -1,0 +1,7 @@
+*.out
+*.ll
+*.base
+*.obf
+*.tmp
+*.dSYM/
+
