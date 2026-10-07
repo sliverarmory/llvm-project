@@ -15,7 +15,6 @@
 #include "HexagonRegisterInfo.h"
 #include "MCTargetDesc/HexagonMCTargetDesc.h"
 #include "llvm/ADT/STLExtras.h"
-#include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/CodeGen/MachineInstr.h"
@@ -29,7 +28,6 @@
 #include "llvm/Target/TargetMachine.h"
 #include <algorithm>
 #include <cassert>
-#include <map>
 #include <optional>
 
 using namespace llvm;
@@ -78,8 +76,7 @@ HexagonSubtarget::HexagonSubtarget(const Triple &TT, StringRef CPU,
       OptLevel(TM.getOptLevel()),
       CPUString(std::string(Hexagon_MC::selectHexagonCPU(CPU))),
       TargetTriple(TT), InstrInfo(initializeSubtargetDependencies(CPU, FS)),
-      RegInfo(getHwMode()), TLInfo(TM, *this),
-      InstrItins(getInstrItineraryForCPU(CPUString)) {
+      TLInfo(TM, *this), InstrItins(getInstrItineraryForCPU(CPUString)) {
   Hexagon_MC::addArchSubtarget(this, FS);
   // Beware of the default constructor of InstrItineraryData: it will
   // reset all members to 0.
@@ -140,6 +137,25 @@ HexagonSubtarget::initializeSubtargetDependencies(StringRef CPU, StringRef FS) {
 
   std::string FeatureString = Features.getString();
   ParseSubtargetFeatures(CPUString, /*TuneCPU*/ CPUString, FeatureString);
+
+  // Resolve the shadow call stack pointer register.  At most one "scs-reg-rN"
+  // feature may be given; R18 is the default.  R18 is chosen because it is the
+  // lowest callee-saved register that neither the Hexagon Linux kernel (which
+  // reserves R19 for the thread-info pointer) nor code that reserves the upper
+  // callee-saved range already claims.
+  static_assert(Hexagon::R27 - Hexagon::R16 == 11,
+                "Callee-saved R16-R27 are assumed to be consecutive");
+  SCSPReg = Hexagon::R18;
+  bool SCSRegSelected = false;
+  for (unsigned Reg = Hexagon::R16; Reg <= Hexagon::R27; ++Reg) {
+    if (!SCSPointerRegister[Reg])
+      continue;
+    if (SCSRegSelected)
+      report_fatal_error(
+          "Only one shadow call stack pointer register may be selected");
+    SCSPReg = Reg;
+    SCSRegSelected = true;
+  }
 
   if (useHVXV68Ops())
     UseHVXFloatingPoint = UseHVXIEEEFPOps || UseHVXQFloatOps;
@@ -445,8 +461,8 @@ void HexagonSubtarget::adjustSchedDependency(
   const HexagonInstrInfo *QII = getInstrInfo();
 
   // Instructions with .new operands have zero latency.
-  SmallSet<SUnit *, 4> ExclSrc;
-  SmallSet<SUnit *, 4> ExclDst;
+  SmallPtrSet<SUnit *, 4> ExclSrc;
+  SmallPtrSet<SUnit *, 4> ExclDst;
   if (QII->canExecuteInBundle(*SrcInst, *DstInst) &&
       isBestZeroLatency(Src, Dst, QII, ExclSrc, ExclDst)) {
     Dep.setLatency(0);
@@ -545,7 +561,7 @@ int HexagonSubtarget::updateLatency(MachineInstr &SrcInst,
   if (!hasV60Ops())
     return Latency;
 
-  auto &QII = static_cast<const HexagonInstrInfo &>(*getInstrInfo());
+  const HexagonInstrInfo &QII = *getInstrInfo();
   // BSB scheduling.
   if (QII.isHVXVec(SrcInst) || useBSBScheduling())
     Latency = (Latency + 1) >> 1;
@@ -630,9 +646,9 @@ static SUnit *getZeroLatency(SUnit *N, SmallVector<SDep, 4> &Deps) {
 // together with a zero latency. Only one dependence should have a zero
 // latency. If there are multiple choices, choose the best, and change
 // the others, if needed.
-bool HexagonSubtarget::isBestZeroLatency(SUnit *Src, SUnit *Dst,
-      const HexagonInstrInfo *TII, SmallSet<SUnit*, 4> &ExclSrc,
-      SmallSet<SUnit*, 4> &ExclDst) const {
+bool HexagonSubtarget::isBestZeroLatency(
+    SUnit *Src, SUnit *Dst, const HexagonInstrInfo *TII,
+    SmallPtrSet<SUnit *, 4> &ExclSrc, SmallPtrSet<SUnit *, 4> &ExclDst) const {
   MachineInstr &SrcInst = *Src->getInstr();
   MachineInstr &DstInst = *Dst->getInstr();
 

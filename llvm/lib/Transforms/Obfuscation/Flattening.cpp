@@ -15,6 +15,7 @@
 #include "llvm/Transforms/Obfuscation/CryptoUtils.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/Transforms/Utils.h"
+#include "llvm/Transforms/Utils/LowerSwitch.h"
 #include <memory>
 
 #define DEBUG_TYPE "flattening"
@@ -43,10 +44,37 @@ Pass *llvm::createFlattening(bool flag) { return new Flattening(flag); }
 
 PreservedAnalyses FlatteningPass::run(Function &F,
                                       FunctionAnalysisManager &AM) {
-  (void)AM;
+  // The legacy rewriter handles ordinary branches and exits only. Reject
+  // exceptional and indirect control flow before lowering any switches.
+  if (!toObfuscate(Flag, &F, "fla"))
+    return PreservedAnalyses::all();
+  Instruction *EntryTerm = F.getEntryBlock().getTerminator();
+  if (!isa<BranchInst>(EntryTerm) && !isa<SwitchInst>(EntryTerm))
+    return PreservedAnalyses::all();
+
+  bool HasSwitch = false;
+  for (BasicBlock &BB : F) {
+    if (BB.isEHPad() || hasMustTailCall(BB))
+      return PreservedAnalyses::all();
+    Instruction *Term = BB.getTerminator();
+    if (isa<SwitchInst>(Term)) {
+      HasSwitch = true;
+      continue;
+    }
+    if (!isa<BranchInst>(Term) && !isa<ReturnInst>(Term) &&
+        !isa<UnreachableInst>(Term))
+      return PreservedAnalyses::all();
+  }
+
+  // Lower switches here so the flattening code never sees a multiway switch.
+  // This is also needed at -O0, where optnone skips optional passes.
+  if (HasSwitch)
+    LowerSwitchPass().run(F, AM);
+
   std::unique_ptr<Pass> Legacy(createFlattening(Flag));
-  bool Changed = static_cast<FunctionPass *>(Legacy.get())->runOnFunction(F);
-  return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
+  bool Flattened = static_cast<FunctionPass *>(Legacy.get())->runOnFunction(F);
+  return HasSwitch || Flattened ? PreservedAnalyses::none()
+                                : PreservedAnalyses::all();
 }
 
 bool Flattening::runOnFunction(Function &F) {

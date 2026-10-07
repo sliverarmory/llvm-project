@@ -42,7 +42,6 @@ demonstrates and validates control-flow/instruction obfuscation.
 
 ## Notes
 
-- Toolchain defaults to:
-  - `/Users/moloch/git/llvm-obfuscator/build-llvm-project/bin/clang`
-  - `/Users/moloch/git/llvm-obfuscator/build-llvm-project/bin/clang++`
+- Toolchain defaults to `build-llvm-project/bin/clang` and
+  `build-llvm-project/bin/clang++` under this repository's root.
 - On macOS, SDK sysroot is auto-detected with `xcrun --show-sdk-path`.

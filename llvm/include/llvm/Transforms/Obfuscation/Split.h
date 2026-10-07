@@ -26,7 +26,7 @@
 #include "llvm/Transforms/Utils/Local.h" // For DemoteRegToStack and DemotePHIToStack
 
 namespace llvm {
-class SplitBasicBlockPass : public PassInfoMixin<SplitBasicBlockPass> {
+class SplitBasicBlockPass : public RequiredPassInfoMixin<SplitBasicBlockPass> {
 public:
   explicit SplitBasicBlockPass(bool Flag = false) : Flag(Flag) {}
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);

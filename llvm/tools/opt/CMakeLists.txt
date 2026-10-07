@@ -20,6 +20,7 @@ set(LLVM_LINK_COMPONENTS
   MC
   Obfuscation
   ObjCARCOpts
+  Plugins
   Remarks
   ScalarOpts
   Support

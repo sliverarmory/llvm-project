@@ -1,4 +1,4 @@
-WORKSPACE_ROOT ?= $(abspath $(CURDIR)/../../..)
+WORKSPACE_ROOT ?= $(abspath $(CURDIR)/../..)
 CLANG ?= $(WORKSPACE_ROOT)/build-llvm-project/bin/clang
 CLANGXX ?= $(WORKSPACE_ROOT)/build-llvm-project/bin/clang++
 

@@ -6,6 +6,16 @@
 
 using namespace llvm;
 
+bool hasMustTailCall(const BasicBlock &BB) {
+  for (const Instruction &I : BB) {
+    if (const auto *Call = dyn_cast<CallInst>(&I)) {
+      if (Call->isMustTailCall())
+        return true;
+    }
+  }
+  return false;
+}
+
 // Shamefully borrowed from ../Scalar/RegToMem.cpp :(
 bool valueEscapes(Instruction *Inst) {
   BasicBlock *BB = Inst->getParent();

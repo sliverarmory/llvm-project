@@ -102,6 +102,14 @@ jobs:
         shell: pwsh
         run: cmake --build build-llvm-project --target clang opt --parallel
 
+      - name: Verify custom transforms before packaging (Linux amd64)
+        if: matrix.target == 'linux-amd64'
+        run: |
+          python3 tests/obfuscation/test_transforms.py \
+            --clang build-llvm-project/bin/clang \
+            --opt build-llvm-project/bin/opt \
+            --work-dir build-llvm-project/transform-smoke
+
       - name: Package archive (Linux/macOS)
         if: runner.os != 'Windows'
         run: |

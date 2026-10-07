@@ -1,4 +1,7 @@
-# LLVM Obfuscator (LLVM v21)
+# LLVM Obfuscator (LLVM 23.1.3)
+
+Based on upstream [`llvmorg-23.1.3`](https://github.com/llvm/llvm-project/releases/tag/llvmorg-23.1.3)
+at commit `0d261d1ca552c95a8f007e061c787ac7132fbcbc`.
 
 ### Clang-exposed transforms
 
@@ -19,22 +22,35 @@
 
 ## Build
 
-From `/Users/moloch/git/llvm-obfuscator`:
+From the repository root:
 
 ```bash
-cmake -S llvm-project/llvm -B build-llvm-project \
+cmake -S llvm -B build-llvm-project \
   -DLLVM_ENABLE_PROJECTS=clang \
   -DCMAKE_BUILD_TYPE=Release
 
 cmake --build build-llvm-project --target clang opt -j8
 ```
 
-## Usage
+## Verify the transforms
 
-Compiler path used below:
+The smoke test compiles each transform separately and together at `-O0` and
+`-O2`. It checks emitted IR, verifies it with `opt`, and compares executable
+results with an independent oracle. It also checks function annotations.
 
 ```bash
-CLANG=/Users/moloch/git/llvm-obfuscator/build-llvm-project/bin/clang
+python3 tests/obfuscation/test_transforms.py \
+  --clang build-llvm-project/bin/clang \
+  --opt build-llvm-project/bin/opt \
+  --work-dir build-llvm-project/transform-smoke
+```
+
+## Usage
+
+Compiler path used below (from the repository root):
+
+```bash
+CLANG="$PWD/build-llvm-project/bin/clang"
 ```
 
 ### macOS note

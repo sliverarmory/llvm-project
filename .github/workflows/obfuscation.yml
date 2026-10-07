@@ -1,0 +1,55 @@
+name: Obfuscation transforms
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: obfuscation-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  transform-smoke:
+    name: Clang transform smoke tests (Linux x86_64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build python3
+
+      - name: Configure Clang and LLVM tools
+        run: |
+          cmake -S llvm -B build-llvm-project -G Ninja \
+            -DLLVM_ENABLE_PROJECTS=clang \
+            -DLLVM_TARGETS_TO_BUILD=X86 \
+            -DLLVM_INCLUDE_TESTS=OFF \
+            -DLLVM_ENABLE_ASSERTIONS=ON \
+            -DLLVM_PARALLEL_LINK_JOBS=1 \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build clang and opt
+        run: cmake --build build-llvm-project --target clang opt --parallel 2
+
+      - name: Verify all custom transforms at O0 and O2
+        run: |
+          python3 tests/obfuscation/test_transforms.py \
+            --clang build-llvm-project/bin/clang \
+            --opt build-llvm-project/bin/opt \
+            --work-dir build-llvm-project/transform-smoke
+
+      - name: Upload emitted IR on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: transform-smoke-ir
+          path: build-llvm-project/transform-smoke/*.ll
+          if-no-files-found: ignore

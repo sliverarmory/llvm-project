@@ -14,6 +14,7 @@
 #include "llvm/Transforms/Obfuscation/CryptoUtils.h"
 #include "llvm/Transforms/Obfuscation/Split.h"
 #include "llvm/Transforms/Obfuscation/Utils.h"
+#include <algorithm>
 #include <memory>
 
 #define DEBUG_TYPE "split"
@@ -77,7 +78,6 @@ bool SplitBasicBlock::runOnFunction(Function &F) {
 
 bool SplitBasicBlock::split(Function *f) {
   std::vector<BasicBlock *> origBB;
-  int splitN = SplitNum;
   bool Changed = false;
 
   // Save all basic blocks
@@ -91,15 +91,14 @@ bool SplitBasicBlock::split(Function *f) {
     BasicBlock *curr = *I;
 
     // No need to split a 1 inst bb
-    // Or ones containing a PHI node
-    if (curr->size() < 2 || containsPHI(curr)) {
+    // Or ones containing a PHI node or a musttail call.
+    if (curr->size() < 2 || containsPHI(curr) || hasMustTailCall(*curr)) {
       continue;
     }
 
-    // Check splitN and current BB size
-    if ((size_t)splitN > curr->size()) {
-      splitN = curr->size() - 1;
-    }
+    // Cap each block independently. A small earlier block must not reduce the
+    // number of split points selected for later, larger blocks.
+    int splitN = std::min<int>(SplitNum, curr->size() - 1);
 
     // Generate splits point
     std::vector<int> test;

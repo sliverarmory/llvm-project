@@ -127,7 +127,7 @@ elif [ "$GOOS" = "freebsd" ]; then
 	# We removed this dependency for Go runtime for other OSes,
 	# and we should remove it for FreeBSD as well, but there is no pressing need.
 	DEPENDS_ON_LIBC=1
-	OSCFLAGS="-fno-strict-aliasing -fPIC -Werror"
+	OSCFLAGS="-fno-strict-aliasing -fPIC -Werror -Wno-unused-template"
 	ARCHCFLAGS="-m64"
 	OSLDFLAGS="-lpthread -fPIC -fpie"
 	SRCS="
@@ -147,7 +147,7 @@ elif [ "$GOOS" = "netbsd" ]; then
 	# We removed this dependency for Go runtime for other OSes,
 	# and we should remove it for NetBSD as well, but there is no pressing need.
 	DEPENDS_ON_LIBC=1
-	OSCFLAGS="-fno-strict-aliasing -fPIC -Werror"
+	OSCFLAGS="-fno-strict-aliasing -fPIC -Werror -Wno-unused-template"
 	ARCHCFLAGS="-m64"
 	OSLDFLAGS="-lpthread -fPIC -fpie"
 	SRCS="
@@ -165,7 +165,7 @@ elif [ "$GOOS" = "netbsd" ]; then
 	"
 elif [ "$GOOS" = "darwin" ]; then
 	OSCFLAGS="-fPIC -Wno-unused-const-variable -Wno-unknown-warning-option -mmacosx-version-min=10.7"
-	OSLDFLAGS="-lpthread -fPIC -fpie -mmacosx-version-min=10.7"
+	OSLDFLAGS="-lpthread -fPIC -fpie -mmacosx-version-min=10.7 -Wl,-U,__dyld_get_dyld_header"
 	SRCS="
 		$SRCS
 		../rtl/tsan_platform_mac.cpp
