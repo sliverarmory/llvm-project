@@ -1,5 +1,6 @@
 #define DEBUG_TYPE "objdiv"
 
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/ADT/StringRef.h"
@@ -7,6 +8,7 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Pass.h"
 #include "llvm/Transforms/Obfuscation/CryptoUtils.h"
@@ -30,6 +32,50 @@ struct EncodedGlobal {
   uint32_t Size;
 };
 
+static bool isObjCRuntimeName(StringRef Name) {
+  return Name.starts_with("OBJC_") || Name.starts_with("_OBJC_") ||
+         Name.starts_with("._OBJC_") || Name.starts_with(".objc_") ||
+         Name.starts_with("_objc_") || Name.starts_with("__objc_") ||
+         Name.starts_with(".objcv2_");
+}
+
+static bool isObjCRuntimeSection(StringRef Section) {
+  return Section.contains("__objc_") || Section.contains("__cfstring") ||
+         Section.starts_with("__OBJC,") || Section.starts_with(".objcrt$");
+}
+
+// Objective-C runtime strings must be available before global constructors run.
+// GNU runtimes also emit unnamed strings whose only distinguishing feature is
+// that a generated metadata global (or its registration function) uses them.
+static bool isObjCRuntimeMetadata(const GlobalVariable &GV) {
+  if (isObjCRuntimeName(GV.getName()) ||
+      isObjCRuntimeSection(GV.getSection()))
+    return true;
+
+  SmallVector<const User *, 16> Pending(GV.user_begin(), GV.user_end());
+  SmallPtrSet<const User *, 32> Seen;
+  while (!Pending.empty()) {
+    const User *U = Pending.pop_back_val();
+    if (!Seen.insert(U).second)
+      continue;
+    if (const auto *OtherGV = dyn_cast<GlobalVariable>(U)) {
+      if (isObjCRuntimeName(OtherGV->getName()) ||
+          isObjCRuntimeSection(OtherGV->getSection()))
+        return true;
+    }
+    if (const auto *I = dyn_cast<Instruction>(U)) {
+      const Function *F = I->getFunction();
+      if (F && isObjCRuntimeName(F->getName()))
+        return true;
+      continue;
+    }
+    if (const auto *C = dyn_cast<Constant>(U))
+      for (const User *Parent : C->users())
+        Pending.push_back(Parent);
+  }
+  return false;
+}
+
 static bool shouldEncodeGlobal(const GlobalVariable &GV) {
   if (!GV.isConstant() || !GV.hasInitializer())
     return false;
@@ -37,7 +83,7 @@ static bool shouldEncodeGlobal(const GlobalVariable &GV) {
     return false;
 
   StringRef Section = GV.getSection();
-  if (Section == "llvm.metadata" || Section.contains("__objc_methname"))
+  if (Section == "llvm.metadata" || isObjCRuntimeMetadata(GV))
     return false;
 
   const auto *CDS = dyn_cast<ConstantDataSequential>(GV.getInitializer());
@@ -205,4 +251,3 @@ PreservedAnalyses StringObfuscationPass::run(Module &M,
 Pass *llvm::createStringObfuscation(bool flag) {
   return new LegacyStringObfuscationPass(flag);
 }
-

@@ -45,6 +45,28 @@ python3 tests/obfuscation/test_transforms.py \
   --work-dir build-llvm-project/transform-smoke
 ```
 
+The integration test builds HTTPS clients in C, C++, Objective-C, and
+Objective-C++. Each client follows a redirect, verifies a local TLS
+certificate, parses two different HTML pages, and reports the title, link
+count, and total path length. The test checks all five transforms separately
+and together at `-O0` and `-O2`, verifies each emitted IR module, and runs
+every executable. It needs `pkg-config`, OpenSSL, libcurl development files,
+and an Objective-C runtime with development files.
+
+```bash
+python3 tests/obfuscation/test_http_programs.py \
+  --clang build-llvm-project/bin/clang \
+  --opt build-llvm-project/bin/opt \
+  --work-dir build-llvm-project/http-integration
+```
+
+GitHub Actions runs both suites on Ubuntu. The release workflow runs them
+before packaging its Linux amd64 archive.
+
+The CI suite also compiles Objective-C and Objective-C++ metadata probes for
+the Apple, GNUstep, and GCC runtimes at both optimization levels. This guards
+class and selector registration while string obfuscation is enabled.
+
 ## Usage
 
 Compiler path used below (from the repository root):
@@ -151,7 +173,8 @@ Expected: no plaintext match.
 ### String obfuscation
 
 - obfuscates constant C-string globals (`ConstantDataSequential::isCString()`)
-- skips metadata and ObjC method-name sections
+- skips LLVM metadata, Objective-C runtime metadata, and constant-string
+  backing storage used before startup constructors run
 - uses per-byte rolling mask in decode
 - emits decode startup via `@llvm.global_ctors`
 
