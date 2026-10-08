@@ -116,6 +116,7 @@ bool Flattening::runOnFunction(Function &F) {
     bool Changed = flatten(tmp);
     if (Changed) {
       ++Flattened;
+      reportObfuscationEffect("fla", "function", F.getName());
     }
     return Changed;
   }

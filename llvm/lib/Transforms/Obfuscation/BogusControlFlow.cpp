@@ -219,6 +219,7 @@ struct BogusControlFlow : public FunctionPass {
         return false;
       }
       doF(F);
+      reportObfuscationEffect("bcf", "function", F.getName());
       return true;
     }
 

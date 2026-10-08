@@ -71,7 +71,10 @@ bool SplitBasicBlock::runOnFunction(Function &F) {
 
   // Do we obfuscate
   if (toObfuscate(flag, tmp, "split")) {
-    return split(tmp);
+    bool Changed = split(tmp);
+    if (Changed)
+      reportObfuscationEffect("split", "function", F.getName());
+    return Changed;
   }
 
   return false;

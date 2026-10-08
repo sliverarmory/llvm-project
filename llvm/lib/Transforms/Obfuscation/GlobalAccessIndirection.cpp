@@ -230,6 +230,7 @@ PreservedAnalyses GlobalAccessIndirectionPass::run(Module &M,
       }
       Site.Inst->setOperand(Site.PointerOperand, Pointer);
     }
+    reportObfuscationEffect("gai", "global", GV->getName(), Sites.size());
     Changed = true;
   }
 

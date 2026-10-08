@@ -1,4 +1,4 @@
-name: Rust milestone 0 (Linux amd64)
+name: Rust obfuscation (Linux amd64)
 
 on:
   push:
@@ -109,6 +109,30 @@ jobs:
             --work-dir build-llvm-project/rust-m0 \
             --live-https
 
+      - name: Verify stage-aware Rust pipeline
+        run: |
+          set -euo pipefail
+          python3 -B tests/obfuscation/rust/test_pipeline.py \
+            --opt build-llvm-project/bin/opt \
+            --clang build-llvm-project/bin/clang
+          python3 -B tests/obfuscation/rust/run_pipeline.py \
+            --rustc build-rust-1.99/build/x86_64-unknown-linux-gnu/stage1/bin/rustc \
+            --work-dir build-llvm-project/rust-m1
+
+      - name: Build Cargo wrapper and verify package selection
+        run: |
+          set -euo pipefail
+          export CARGO_HOME="$PWD/build-rust-1.99/build/obfuscation-cargo-home"
+          export CARGO_TARGET_DIR="$PWD/build-llvm-project/cargo-wrapper-target"
+          cargo build --locked --release \
+            --manifest-path tools/rust-obfuscation/cargo-wrapper/Cargo.toml
+          python3 -B tests/obfuscation/rust/test_cargo.py \
+            --wrapper "$CARGO_TARGET_DIR/release/rust-obf-cargo" \
+            --rustc build-rust-1.99/build/x86_64-unknown-linux-gnu/stage1/bin/rustc \
+            --objdump build-llvm-project/bin/llvm-objdump \
+            --work-dir build-llvm-project/rust-m2 \
+            --online
+
       - name: Verify portable obfuscation suites
         run: |
           set -euo pipefail
@@ -147,6 +171,7 @@ jobs:
           path: |
             build-llvm-project/rust-m0/rust-m0-report.json
             build-llvm-project/rust-m0/*.ll
+            build-llvm-project/rust-m2/*-report.json
             build-llvm-project/portable-rust-m0/**/*.ll
             build-llvm-project/http-rust-m0/*.ll
           if-no-files-found: ignore

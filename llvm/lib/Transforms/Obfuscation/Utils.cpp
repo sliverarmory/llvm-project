@@ -1,11 +1,16 @@
 #include "llvm/Transforms/Obfuscation/Utils.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/Demangle/Demangle.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Support/JSON.h"
 #include "llvm/Support/raw_ostream.h"
+#include <cstdlib>
+#include <fstream>
+#include <mutex>
 
 using namespace llvm;
 
@@ -18,13 +23,47 @@ static cl::opt<bool> ReportObfuscationSkips(
     "obf-report-skips", cl::init(false),
     cl::desc("Report why requested obfuscation transformations were skipped"));
 
+// The Cargo wrapper gives each rustc invocation a distinct event file. This
+// keeps multi-CGU and parallel Cargo builds separate without redirecting
+// compiler diagnostics or relying on their text format.
+static void appendObfuscationEvent(StringRef Event, StringRef Pass,
+                                   StringRef Kind, StringRef Symbol,
+                                   StringRef Reason, uint64_t Count) {
+  const char *Path = std::getenv("RUST_OBF_EVENT_FILE");
+  if (!Path || !*Path)
+    return;
+  static std::mutex EventMutex;
+  std::lock_guard<std::mutex> Lock(EventMutex);
+  std::ofstream Out(Path, std::ios::binary | std::ios::app);
+  if (!Out)
+    return;
+  json::Object Record{{"event", Event.str()},
+                      {"pass", Pass.str()},
+                      {"kind", Kind.str()},
+                      {"raw_name", Symbol.str()},
+                      {"demangled_name", demangle(Symbol.str())},
+                      {"count", static_cast<int64_t>(Count)}};
+  if (!Reason.empty())
+    Record["reason"] = Reason.str();
+  std::string Line;
+  raw_string_ostream Stream(Line);
+  Stream << json::Value(std::move(Record));
+  Out << Line << '\n';
+}
+
 void reportObfuscationSkip(StringRef Pass, StringRef Kind, StringRef Symbol,
                            StringRef Reason) {
+  appendObfuscationEvent("skip", Pass, Kind, Symbol, Reason, 0);
   if (!ReportObfuscationSkips)
     return;
   errs() << "obf-skip pass=" << Pass << " kind=" << Kind << " symbol=\"";
   errs().write_escaped(Symbol);
   errs() << "\" reason=" << Reason << '\n';
+}
+
+void reportObfuscationEffect(StringRef Pass, StringRef Kind, StringRef Symbol,
+                             uint64_t Count) {
+  appendObfuscationEvent("effect", Pass, Kind, Symbol, "", Count);
 }
 
 static bool isAllowedFunction(StringRef Name) {

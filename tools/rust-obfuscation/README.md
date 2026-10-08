@@ -34,7 +34,7 @@ python3 tools/rust-obfuscation/bootstrap.py build --jobs 6
 
 `prepare` writes `bootstrap-obfuscation.toml` inside the Rust source tree;
 `check` only validates the existing source and LLVM build. `build` prepares as
-needed and runs Rust's `x.py build compiler/rustc library/std` using that
+needed and runs Rust's `x.py build compiler/rustc library/std library/proc_macro` using that
 config. The generated config selects the prebuilt `llvm-config`, disables CI
 LLVM and compiler downloads, and builds the LLVM codegen backend with static
 LLVM linkage. It is separate from any developer-owned `bootstrap.toml`.

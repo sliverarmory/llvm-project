@@ -359,7 +359,7 @@ def main() -> int:
                 print(f"LIBRARY_PATH={env['LIBRARY_PATH']}", flush=True)
             subprocess.run(
                 [sys.executable, "x.py", "--config", str(config_path),
-                 "build", "compiler/rustc", "library/std"],
+                 "build", "compiler/rustc", "library/std", "library/proc_macro"],
                 cwd=source, env=env, check=True,
             )
             print("stage-1 Rust bootstrap completed")

@@ -264,6 +264,7 @@ PreservedAnalyses ConstantEncodingPass::run(Module &M, ModuleAnalysisManager &AM
     }
     for (const Site &S : Sites)
       encodeSite(M, S, Marker);
+    reportObfuscationEffect("constenc", "function", F.getName(), Sites.size());
     if (HitSiteLimit)
       reportObfuscationSkip("constenc", "function", F.getName(),
                             "site-limit");
