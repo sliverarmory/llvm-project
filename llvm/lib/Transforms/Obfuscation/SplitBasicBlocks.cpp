@@ -77,6 +77,22 @@ bool SplitBasicBlock::runOnFunction(Function &F) {
 }
 
 bool SplitBasicBlock::split(Function *f) {
+  // Splitting can move a convergence entry intrinsic out of the entry block
+  // or change a loop token's cycle. Keep convergent control flow intact.
+  if (f->isConvergent())
+    return false;
+  for (BasicBlock &BB : *f) {
+    for (Instruction &I : BB) {
+      if (I.getType()->isTokenTy())
+        return false;
+      if (auto *Call = dyn_cast<CallBase>(&I)) {
+        if (Call->isConvergent() ||
+            Call->countOperandBundlesOfType(LLVMContext::OB_convergencectrl))
+          return false;
+      }
+    }
+  }
+
   std::vector<BasicBlock *> origBB;
   bool Changed = false;
 

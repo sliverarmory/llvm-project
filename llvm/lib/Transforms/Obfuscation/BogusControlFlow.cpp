@@ -96,6 +96,7 @@
 
 #include "llvm/Transforms/Obfuscation/BogusControlFlow.h"
 #include "llvm/Transforms/Obfuscation/Utils.h"
+#include "llvm/IR/IntrinsicInst.h"
 #include <memory>
 
 // Stats
@@ -155,12 +156,27 @@ struct BogusControlFlow : public FunctionPass {
     }
     // If fla annotations
     if (toObfuscate(flag, &F, "bcf")) {
+      // The bogus paths clone calls and introduce cycles. Convergence control
+      // tokens constrain both placement and cycles, so this rewriter cannot
+      // safely transform functions that use them.
+      if (F.isConvergent())
+        return false;
       // Splitting or cloning EH and indirect control flow blocks can break
       // unwind edges or produce invalid terminators. Leave such functions
       // untouched rather than partially rewriting their CFG.
       for (BasicBlock &BB : F) {
         if (BB.isEHPad())
           return false;
+        for (Instruction &I : BB) {
+          if (isa<ConvergenceControlInst>(I))
+            return false;
+          if (auto *Call = dyn_cast<CallBase>(&I)) {
+            if (Call->isConvergent() ||
+                Call->countOperandBundlesOfType(
+                    LLVMContext::OB_convergencectrl))
+              return false;
+          }
+        }
         Instruction *Term = BB.getTerminator();
         if (!isa<BranchInst>(Term) && !isa<SwitchInst>(Term) &&
             !isa<ReturnInst>(Term) && !isa<UnreachableInst>(Term))

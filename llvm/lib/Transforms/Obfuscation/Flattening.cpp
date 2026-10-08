@@ -48,6 +48,8 @@ PreservedAnalyses FlatteningPass::run(Function &F,
   // exceptional and indirect control flow before lowering any switches.
   if (!toObfuscate(Flag, &F, "fla"))
     return PreservedAnalyses::all();
+  if (F.isConvergent())
+    return PreservedAnalyses::all();
   Instruction *EntryTerm = F.getEntryBlock().getTerminator();
   if (!isa<BranchInst>(EntryTerm) && !isa<SwitchInst>(EntryTerm))
     return PreservedAnalyses::all();
@@ -56,6 +58,17 @@ PreservedAnalyses FlatteningPass::run(Function &F,
   for (BasicBlock &BB : F) {
     if (BB.isEHPad() || hasMustTailCall(BB))
       return PreservedAnalyses::all();
+    // The dispatcher changes the cycles and control dependence around
+    // convergent operations. Its stack repair also cannot demote token values.
+    for (Instruction &I : BB) {
+      if (I.getType()->isTokenTy())
+        return PreservedAnalyses::all();
+      if (auto *Call = dyn_cast<CallBase>(&I)) {
+        if (Call->isConvergent() ||
+            Call->countOperandBundlesOfType(LLVMContext::OB_convergencectrl))
+          return PreservedAnalyses::all();
+      }
+    }
     Instruction *Term = BB.getTerminator();
     if (isa<SwitchInst>(Term)) {
       HasSwitch = true;

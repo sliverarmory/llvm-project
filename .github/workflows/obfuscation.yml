@@ -48,6 +48,17 @@ jobs:
             --opt build-llvm-project/bin/opt \
             --work-dir build-llvm-project/transform-smoke
 
+      - name: Verify convergence-control IR is preserved
+        run: |
+          python3 tests/obfuscation/test_convergence.py \
+            --clang build-llvm-project/bin/clang \
+            --opt build-llvm-project/bin/opt \
+            --work-dir build-llvm-project/convergence-tests
+          python3 tests/obfuscation/test_cfg_convergence.py \
+            --clang build-llvm-project/bin/clang \
+            --opt build-llvm-project/bin/opt \
+            --work-dir build-llvm-project/convergence-tests
+
       - name: Verify real HTTPS clients in four languages
         run: |
           python3 tests/obfuscation/test_http_programs.py \
@@ -69,6 +80,7 @@ jobs:
           name: transform-smoke-ir
           path: |
             build-llvm-project/transform-smoke/*.ll
+            build-llvm-project/convergence-tests/*.ll
             build-llvm-project/http-integration/*.ll
             build-llvm-project/objc-metadata/*.ll
           if-no-files-found: ignore
