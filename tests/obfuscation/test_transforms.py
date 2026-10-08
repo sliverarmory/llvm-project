@@ -79,6 +79,17 @@ def branch_count(body):
     return len(re.findall(r"^\s+br\s", body, re.MULTILINE))
 
 
+def check_bcf_state(ir):
+    for name in ("x", "y"):
+        assert re.search(
+            rf"^@\.obf\.bcf\.{name}(?:\.\d+)?\s*=\s*private global i32 0",
+            ir, re.MULTILINE,
+        ), f"BCF lacks private {name} predicate state"
+        assert not re.search(rf"^@{name}(?:\.\d+)?\s*=", ir, re.MULTILINE), (
+            f"BCF exposed external predicate state @{name}"
+        )
+
+
 def check_function_effect(name, body, base_body, ir=""):
     if name == "sub":
         assert instruction_count(body) > instruction_count(base_body), (
@@ -89,10 +100,9 @@ def check_function_effect(name, body, base_body, ir=""):
             "split did not add basic-block branches"
         )
     elif name == "bcf":
-        assert re.search(r"^@x(?:\.\d+)?\s*=\s*common\b", ir, re.MULTILINE), (
-            "bogus control flow did not emit an opaque-predicate global"
-        )
-        assert "urem i32" in body and branch_count(body) > branch_count(base_body), (
+        check_bcf_state(ir)
+        assert ("urem i32" in body and "load volatile i32" in body
+                and branch_count(body) > branch_count(base_body)), (
             "bogus control flow did not alter the function's branches"
         )
     elif name == "fla":
@@ -113,9 +123,7 @@ def check_effect(name, ir, baseline):
 def check_combined_effect(ir, baseline):
     check_effect("sobf", ir, baseline)
     body = target_body(ir)
-    assert re.search(r"^@x(?:\.\d+)?\s*=\s*common\b", ir, re.MULTILINE), (
-        "combined pipeline did not emit BCF opaque-predicate globals"
-    )
+    check_bcf_state(ir)
     assert "urem i32" in body, "combined pipeline did not apply BCF to target"
     assert "switch i32" in body, "combined pipeline lacks flatten dispatcher"
     assert re.search(r"(?m)^[^\s;][^:\n]*\.split[^:\n]*:", body), (
@@ -155,7 +163,7 @@ def check_annotations(clang, opt, work_dir, level):
             for a, b in CASES:
                 actual = run([str(executable), str(a), str(b)], timeout=10)
                 value = expected_value(a, b)
-                assert actual == f"{value}:{value}\n", (
+                assert actual == ":".join([str(value)] * 6) + "\n", (
                     f"{level}/{name}/{variant}({a}, {b}): {actual!r}"
                 )
 
@@ -167,10 +175,22 @@ def check_annotations(clang, opt, work_dir, level):
             target_body(plain, "negative"),
             plain,
         )
-        assert target_body(with_global, "negative") == target_body(
-            plain, "negative"
-        ), f"{name} ignored the no{name} annotation under the global flag"
-        print(f"[{level}] {name} annotation-only and negative override passed", flush=True)
+        negative = target_body(plain, "negative")
+        for collision in ("collision_positive", "collision_negative",
+                          "positive_and_negative"):
+            assert target_body(plain, collision) == negative, (
+                f"{name} matched a partial annotation or ignored an exact negative"
+            )
+        check_function_effect(name, target_body(plain, "mixed_positive"),
+                              negative, plain)
+        for excluded in ("negative", "positive_and_negative"):
+            assert target_body(with_global, excluded) == negative, (
+                f"{name} ignored an exact no{name} annotation under the global flag"
+            )
+        check_function_effect(name, target_body(with_global, "collision_negative"),
+                              negative, with_global)
+        print(f"[{level}] {name} exact annotations and negative override passed",
+              flush=True)
 
 
 def check_indirectbr(clang, opt, work_dir, level):
@@ -211,10 +231,60 @@ def check_musttail(clang, opt, work_dir, level):
         print(f"[{level}] {name} preserves musttail", flush=True)
 
 
+def check_substitution_undef(clang, opt, work_dir):
+    source = Path(__file__).with_name("substitution_undef.ll").resolve()
+    output = work_dir / "O0-substitution-undef.ll"
+    run([
+        *clang, "-x", "ir", "-O0", "-mllvm", "-sub", "-S", "-emit-llvm",
+        str(source), "-o", str(output),
+    ])
+    run([opt, "-passes=verify", "-disable-output", str(output)])
+    ir = output.read_text(encoding="utf-8")
+    for name, ty in (("scalar_or_undef", "i32"),
+                     ("vector_or_undef", "<2 x i32>")):
+        body = target_body(ir, name)
+        assert len(re.findall(rf"\bfreeze {re.escape(ty)}(?=\s)", body)) >= 2, (
+            f"{name}: substitution reused an undef-dependent operand "
+            "without stabilizing both source operands"
+        )
+
+    # The multiplication and AND rewrites that reuse an operand are chosen at
+    # random. Give each choice 32 independent opportunities; XOR and OR reuse
+    # both operands in either rewrite.
+    coverage = work_dir / "substitution-reused-operands.ll"
+    lines = []
+    for name, operation, lhs, rhs in (
+        ("mul_undef", "mul", "0", "undef"),
+        ("and_undef", "and", "undef", "0"),
+        ("xor_undef", "xor", "undef", "undef"),
+    ):
+        lines.extend((f"define i32 @{name}() noinline optnone {{", "entry:"))
+        for index in range(32):
+            lines.append(f"  %v{index} = {operation} i32 {lhs}, {rhs}")
+            previous = f"%sum{index - 1}" if index else "0"
+            lines.append(f"  %sum{index} = add i32 %v{index}, {previous}")
+        lines.extend(("  ret i32 %sum31", "}", ""))
+    coverage.write_text("\n".join(lines), encoding="utf-8")
+    covered_ir = work_dir / "O0-substitution-reused-operands.ll"
+    run([
+        *clang, "-x", "ir", "-O0", "-mllvm", "-sub", "-S", "-emit-llvm",
+        str(coverage), "-o", str(covered_ir),
+    ])
+    run([opt, "-passes=verify", "-disable-output", str(covered_ir)])
+    covered = covered_ir.read_text(encoding="utf-8")
+    for name in ("mul_undef", "and_undef", "xor_undef"):
+        body = target_body(covered, name)
+        assert "freeze i32 undef" in body, (
+            f"{name}: substitution reused undef without stabilizing it"
+        )
+    print("[O0] substitution stabilizes reused scalar and vector operands", flush=True)
+
+
 def check_eh(clang, opt, work_dir, level):
     source = Path(__file__).with_name("eh.cpp").resolve()
+    native_pad = "catchpad" if sys.platform == "win32" else "landingpad"
     for target, extra_flags, pad in (
-        ("native", (), "landingpad"),
+        ("native", (), native_pad),
         ("windows", ("--target=x86_64-pc-windows-msvc", "-fexceptions",
                      "-fcxx-exceptions"), "catchpad"),
     ):
@@ -265,6 +335,8 @@ def check_cross_tu_strings(clang, clangxx, opt, work_dir, level):
         objects.append(str(object_path))
 
     executable = work_dir / f"{level}-odr-strings"
+    if sys.platform == "win32":
+        executable = executable.with_suffix(".exe")
     run([
         *clang, f"-{level}", str(fixture_dir / "odr_string_main.c"),
         *objects, "-o", str(executable),
@@ -293,7 +365,8 @@ def main():
         sdk = run(["xcrun", "--show-sdk-path"]).strip()
         clang.extend(("-isysroot", sdk))
     opt = str(args.opt.resolve())
-    clangxx = [str(args.clang.resolve().with_name("clang++")), *clang[1:]]
+    clangxx_name = "clang++.exe" if sys.platform == "win32" else "clang++"
+    clangxx = [str(args.clang.resolve().with_name(clangxx_name)), *clang[1:]]
 
     for level in ("O0", "O2"):
         ir_by_variant = {}
@@ -333,6 +406,8 @@ def main():
         check_musttail(clang, opt, work_dir, level)
         check_eh(clang, opt, work_dir, level)
         check_cross_tu_strings(clang, clangxx, opt, work_dir, level)
+
+    check_substitution_undef(clang, opt, work_dir)
 
 
 if __name__ == "__main__":

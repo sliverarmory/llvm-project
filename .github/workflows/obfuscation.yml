@@ -21,6 +21,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+
       - name: Install build dependencies
         run: |
           sudo apt-get update
@@ -33,45 +37,31 @@ jobs:
           cmake -S llvm -B build-llvm-project -G Ninja \
             -DLLVM_ENABLE_PROJECTS=clang \
             -DLLVM_TARGETS_TO_BUILD=X86 \
-            -DLLVM_INCLUDE_TESTS=OFF \
+            -DLLVM_INCLUDE_TESTS=ON \
             -DLLVM_ENABLE_ASSERTIONS=ON \
             -DLLVM_PARALLEL_LINK_JOBS=1 \
             -DCMAKE_BUILD_TYPE=Release
 
-      - name: Build clang and opt
-        run: cmake --build build-llvm-project --target clang opt --parallel 4
+      - name: Build Clang, LLVM tools, and obfuscation unit tests
+        run: cmake --build build-llvm-project --target clang opt llvm-objdump ObfuscationTests --parallel 4
 
-      - name: Verify all custom transforms at O0 and O2
-        run: |
-          python3 tests/obfuscation/test_transforms.py \
-            --clang build-llvm-project/bin/clang \
-            --opt build-llvm-project/bin/opt \
-            --work-dir build-llvm-project/transform-smoke
+      - name: Run obfuscation unit tests
+        run: build-llvm-project/unittests/Transforms/Obfuscation/ObfuscationTests
 
-      - name: Verify convergence-control IR is preserved
+      - name: Verify portable transforms at O0 and O2
         run: |
-          python3 tests/obfuscation/test_convergence.py \
+          python tests/obfuscation/run_portable.py \
             --clang build-llvm-project/bin/clang \
             --opt build-llvm-project/bin/opt \
-            --work-dir build-llvm-project/convergence-tests
-          python3 tests/obfuscation/test_cfg_convergence.py \
-            --clang build-llvm-project/bin/clang \
-            --opt build-llvm-project/bin/opt \
-            --work-dir build-llvm-project/convergence-tests
+            --objdump build-llvm-project/bin/llvm-objdump \
+            --work-dir build-llvm-project/portable-smoke
 
       - name: Verify real HTTPS clients in four languages
         run: |
-          python3 tests/obfuscation/test_http_programs.py \
+          python tests/obfuscation/test_http_programs.py \
             --clang build-llvm-project/bin/clang \
             --opt build-llvm-project/bin/opt \
             --work-dir build-llvm-project/http-integration
-
-      - name: Verify Objective-C runtime metadata survives string obfuscation
-        run: |
-          python3 tests/obfuscation/test_objc_metadata.py \
-            --clang build-llvm-project/bin/clang \
-            --opt build-llvm-project/bin/opt \
-            --work-dir build-llvm-project/objc-metadata
 
       - name: Upload emitted IR on failure
         if: failure()
@@ -79,8 +69,6 @@ jobs:
         with:
           name: transform-smoke-ir
           path: |
-            build-llvm-project/transform-smoke/*.ll
-            build-llvm-project/convergence-tests/*.ll
+            build-llvm-project/portable-smoke/**/*.ll
             build-llvm-project/http-integration/*.ll
-            build-llvm-project/objc-metadata/*.ll
           if-no-files-found: ignore

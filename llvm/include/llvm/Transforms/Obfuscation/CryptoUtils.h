@@ -18,9 +18,12 @@
 
 #include "llvm/Support/ManagedStatic.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <mutex>
 #include <string>
+#include <system_error>
 
 namespace llvm {
 
@@ -233,10 +236,12 @@ extern ManagedStatic<CryptoUtils> cryptoutils;
 
 class CryptoUtils {
 public:
+  using EntropySource = std::error_code (*)(void *, std::size_t);
+
   CryptoUtils();
+  explicit CryptoUtils(EntropySource ReadEntropy);
   ~CryptoUtils();
 
-  char *get_seed();
   void get_bytes(char *buffer, const int len);
   char get_char();
   bool prng_seed(std::string const &seed);
@@ -256,12 +261,13 @@ public:
   int sha256(const char *msg, unsigned char *hash);
 
 private:
+  std::mutex Mutex;
+  EntropySource ReadEntropy;
   uint32_t ks[44];
   char key[16];
   char ctr[16];
   char pool[CryptoUtils_POOL_SIZE];
   uint32_t idx;
-  std::string seed;
   bool seeded;
 
   typedef struct {
@@ -272,7 +278,9 @@ private:
 
   void aes_compute_ks(uint32_t *ks, const char *k);
   void aes_encrypt(char *out, const char *in, const uint32_t *ks);
-  bool prng_seed();
+  std::error_code prng_seed();
+  bool seedFromHex(std::string const &Seed);
+  void initializePool();
   void inc_ctr();
   void populate_pool();
   int sha256_done(sha256_state *md, unsigned char *out);

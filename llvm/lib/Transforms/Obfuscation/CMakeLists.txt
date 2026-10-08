@@ -1,5 +1,7 @@
 add_llvm_component_library(LLVMObfuscation
   CryptoUtils.cpp
+  ConstantEncoding.cpp
+  GlobalAccessIndirection.cpp
   Substitution.cpp
   StringObfuscation.cpp
   BogusControlFlow.cpp

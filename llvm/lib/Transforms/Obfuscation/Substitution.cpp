@@ -13,9 +13,11 @@
 
 #include "llvm/Transforms/Obfuscation/Substitution.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Transforms/Obfuscation/OptionParser.h"
 #include "llvm/Transforms/Obfuscation/Utils.h"
 #include <memory>
 
@@ -30,10 +32,20 @@ using namespace llvm;
 #define NUMBER_OR_SUBST 2
 #define NUMBER_XOR_SUBST 2
 
-static cl::opt<int>
+static cl::opt<int, false, obfuscation::RangedIntParser<1>>
     ObfTimes("sub_loop",
              cl::desc("Choose how many time the -sub pass loops on a function"),
              cl::value_desc("number of times"), cl::init(1), cl::Optional);
+
+static cl::opt<int, false, obfuscation::RangedIntParser<0>>
+    MaxGrowth("sub_max_growth",
+              cl::desc("Maximum new instructions per function from substitution"),
+              cl::value_desc("instructions"), cl::init(8192), cl::Optional);
+
+// The largest replacement is orSubstitutionRand: 15 binary operations and
+// two freezes replace one instruction. Reserve its worst-case net growth
+// before invoking any replacement handler.
+static constexpr uint64_t MaxGrowthPerReplacement = 16;
 
 // Stats
 STATISTIC(Add, "Add substitued");
@@ -59,6 +71,13 @@ static Constant *getRandomIntConstant(Type *Ty) {
   APInt Value(64, llvm::cryptoutils->get_uint64_t());
   Value = Value.zextOrTrunc(BitWidth);
   return Constant::getIntegerValue(Ty, Value);
+}
+
+// An undef-dependent value may differ at each use. A rewrite that duplicates
+// an operand must use one stable value for every copy of that operand.
+static Value *freezeReusedOperand(BinaryOperator *BO, unsigned Operand) {
+  IRBuilder<> Builder(BO);
+  return Builder.CreateFreeze(BO->getOperand(Operand), "sub.freeze");
 }
 
 struct Substitution : public FunctionPass {
@@ -139,32 +158,54 @@ PreservedAnalyses SubstitutionPass::run(Function &F,
 }
 
 bool Substitution::runOnFunction(Function &F) {
-  // Check if the percentage is correct
+  // Guard against invalid values set programmatically after option parsing.
   if (ObfTimes <= 0) {
-    errs() << "Substitution application number -sub_loop=x must be x > 0";
+    F.getContext().emitError("-sub_loop must be >= 1");
+    return false;
+  }
+  if (MaxGrowth < 0) {
+    F.getContext().emitError("-sub_max_growth must be >= 0");
     return false;
   }
 
   Function *tmp = &F;
   // Do we obfuscate
   if (toObfuscate(flag, tmp, "sub")) {
-    return substitute(tmp);
+    if (MaxGrowth < MaxGrowthPerReplacement) {
+      reportObfuscationSkip("sub", "function", F.getName(), "growth-limit");
+      return false;
+    }
+    bool Changed = substitute(tmp);
+    if (!Changed)
+      reportObfuscationSkip("sub", "function", F.getName(),
+                            "no-eligible-instructions");
+    return Changed;
   }
   return false;
 }
 
 bool Substitution::substitute(Function *f) {
-  Function *tmp = f;
   bool Changed = false;
+  uint64_t Growth = 0;
 
-  // Loop for the number of time we run the pass on the function
-  int times = ObfTimes;
-  do {
-    for (Function::iterator bb = tmp->begin(); bb != tmp->end(); ++bb) {
-      for (BasicBlock::iterator inst = bb->begin(); inst != bb->end(); ++inst) {
-        if (inst->isBinaryOp()) {
-          BinaryOperator *BO = cast<BinaryOperator>(inst);
-          switch (inst->getOpcode()) {
+  for (int times = 0; times < ObfTimes; ++times) {
+    bool ChangedThisRound = false;
+    bool BudgetExhausted = false;
+    for (BasicBlock &BB : *f) {
+      // Replacement instructions are inserted before BO. Advance before
+      // rewriting so erasing BO cannot invalidate the traversal iterator.
+      for (auto inst = BB.begin(); inst != BB.end();) {
+        auto *BO = dyn_cast<BinaryOperator>(&*inst++);
+        if (!BO || BO->use_empty())
+          continue;
+        if (static_cast<uint64_t>(MaxGrowth) - Growth <
+            MaxGrowthPerReplacement) {
+          BudgetExhausted = true;
+          break;
+        }
+        size_t Before = BB.size();
+        bool Rewritten = false;
+        switch (BO->getOpcode()) {
           case BinaryOperator::Add:
             if (!BO->getType()->isIntOrIntVectorTy() ||
                 BO->hasNoSignedWrap() || BO->hasNoUnsignedWrap())
@@ -173,8 +214,10 @@ bool Substitution::substitute(Function *f) {
             // Substitute with random add operation
             (this->*funcAdd[llvm::cryptoutils->get_range(NUMBER_ADD_SUBST)])(
                 BO);
-            ++Add;
-            Changed = true;
+            if (BO->use_empty()) {
+              ++Add;
+              Rewritten = true;
+            }
             break;
           case BinaryOperator::Sub:
             if (!BO->getType()->isIntOrIntVectorTy() ||
@@ -184,8 +227,10 @@ bool Substitution::substitute(Function *f) {
             // Substitute with random sub operation
             (this->*funcSub[llvm::cryptoutils->get_range(NUMBER_SUB_SUBST)])(
                 BO);
-            ++Sub;
-            Changed = true;
+            if (BO->use_empty()) {
+              ++Sub;
+              Rewritten = true;
+            }
             break;
           case BinaryOperator::Mul:
             if (!BO->getType()->isIntOrIntVectorTy() ||
@@ -193,8 +238,10 @@ bool Substitution::substitute(Function *f) {
               break;
             (this->*funcMul[llvm::cryptoutils->get_range(NUMBER_MUL_SUBST)])(
                 BO);
-            ++Mul;
-            Changed = true;
+            if (BO->use_empty()) {
+              ++Mul;
+              Rewritten = true;
+            }
             break;
           case BinaryOperator::FMul:
             break;
@@ -222,31 +269,45 @@ bool Substitution::substitute(Function *f) {
               break;
             (this->*funcAnd[llvm::cryptoutils->get_range(NUMBER_AND_SUBST)])(
                 BO);
-            ++And;
-            Changed = true;
+            if (BO->use_empty()) {
+              ++And;
+              Rewritten = true;
+            }
             break;
           case Instruction::Or:
             if (!BO->getType()->isIntOrIntVectorTy())
               break;
             (this->*funcOr[llvm::cryptoutils->get_range(NUMBER_OR_SUBST)])(BO);
-            ++Or;
-            Changed = true;
+            if (BO->use_empty()) {
+              ++Or;
+              Rewritten = true;
+            }
             break;
           case Instruction::Xor:
             if (!BO->getType()->isIntOrIntVectorTy())
               break;
             (this->*funcXor[llvm::cryptoutils->get_range(NUMBER_XOR_SUBST)])(
                 BO);
-            ++Xor;
-            Changed = true;
+            if (BO->use_empty()) {
+              ++Xor;
+              Rewritten = true;
+            }
             break;
           default:
             break;
-          }              // End switch
-        }                // End isBinaryOp
-      }                  // End for basickblock
-    }                    // End for Function
-  } while (--times > 0); // for times
+        }
+        if (!Rewritten)
+          continue;
+        BO->eraseFromParent();
+        Growth += BB.size() - Before;
+        Changed = ChangedThisRound = true;
+      }
+      if (BudgetExhausted)
+        break;
+    }
+    if (BudgetExhausted || !ChangedThisRound)
+      break;
+  }
   return Changed;
 }
 
@@ -456,11 +517,13 @@ void Substitution::mulRand(BinaryOperator *bo) {
   if (!co)
     return;
 
+  Value *RHS = freezeReusedOperand(bo, 1);
+
   Value *op =
       BinaryOperator::Create(Instruction::Add, bo->getOperand(0), co, "", bo);
-  op = BinaryOperator::Create(Instruction::Mul, op, bo->getOperand(1), "", bo);
+  op = BinaryOperator::Create(Instruction::Mul, op, RHS, "", bo);
   Value *adjust =
-      BinaryOperator::Create(Instruction::Mul, bo->getOperand(1), co, "", bo);
+      BinaryOperator::Create(Instruction::Mul, RHS, co, "", bo);
   op = BinaryOperator::Create(Instruction::Sub, op, adjust, "", bo);
   bo->replaceAllUsesWith(op);
 }
@@ -468,16 +531,17 @@ void Substitution::mulRand(BinaryOperator *bo) {
 // Implementation of a = b & c => a = (b^~c)& b
 void Substitution::andSubstitution(BinaryOperator *bo) {
   BinaryOperator *op = NULL;
+  Value *LHS = freezeReusedOperand(bo, 0);
 
   // Create NOT on second operand => ~c
   op = BinaryOperator::CreateNot(bo->getOperand(1), "", bo);
 
   // Create XOR => (b^~c)
   BinaryOperator *op1 =
-      BinaryOperator::Create(Instruction::Xor, bo->getOperand(0), op, "", bo);
+      BinaryOperator::Create(Instruction::Xor, LHS, op, "", bo);
 
   // Create AND => (b^~c) & b
-  op = BinaryOperator::Create(Instruction::And, op1, bo->getOperand(0), "", bo);
+  op = BinaryOperator::Create(Instruction::And, op1, LHS, "", bo);
   bo->replaceAllUsesWith(op);
 }
 
@@ -523,11 +587,14 @@ void Substitution::orSubstitutionRand(BinaryOperator *bo) {
   if (!co)
     return;
 
+  Value *LHS = freezeReusedOperand(bo, 0);
+  Value *RHS = freezeReusedOperand(bo, 1);
+
   // !a
-  BinaryOperator *op = BinaryOperator::CreateNot(bo->getOperand(0), "", bo);
+  BinaryOperator *op = BinaryOperator::CreateNot(LHS, "", bo);
 
   // !b
-  BinaryOperator *op1 = BinaryOperator::CreateNot(bo->getOperand(1), "", bo);
+  BinaryOperator *op1 = BinaryOperator::CreateNot(RHS, "", bo);
 
   // !r
   BinaryOperator *op2 = BinaryOperator::CreateNot(co, "", bo);
@@ -538,7 +605,7 @@ void Substitution::orSubstitutionRand(BinaryOperator *bo) {
 
   // a && !r
   BinaryOperator *op4 =
-      BinaryOperator::Create(Instruction::And, bo->getOperand(0), op2, "", bo);
+      BinaryOperator::Create(Instruction::And, LHS, op2, "", bo);
 
   // !b && r
   BinaryOperator *op5 =
@@ -546,7 +613,7 @@ void Substitution::orSubstitutionRand(BinaryOperator *bo) {
 
   // b && !r
   BinaryOperator *op6 =
-      BinaryOperator::Create(Instruction::And, bo->getOperand(1), op2, "", bo);
+      BinaryOperator::Create(Instruction::And, RHS, op2, "", bo);
 
   // (!a && r) || (a && !r)
   op3 = BinaryOperator::Create(Instruction::Or, op3, op4, "", bo);
@@ -577,14 +644,15 @@ void Substitution::orSubstitutionRand(BinaryOperator *bo) {
 
 void Substitution::orSubstitution(BinaryOperator *bo) {
   BinaryOperator *op = NULL;
+  Value *LHS = freezeReusedOperand(bo, 0);
+  Value *RHS = freezeReusedOperand(bo, 1);
 
   // Creating first operand (b & c)
-  op = BinaryOperator::Create(Instruction::And, bo->getOperand(0),
-                              bo->getOperand(1), "", bo);
+  op = BinaryOperator::Create(Instruction::And, LHS, RHS, "", bo);
 
   // Creating second operand (b ^ c)
   BinaryOperator *op1 = BinaryOperator::Create(
-      Instruction::Xor, bo->getOperand(0), bo->getOperand(1), "", bo);
+      Instruction::Xor, LHS, RHS, "", bo);
 
   // final op
   op = BinaryOperator::Create(Instruction::Or, op, op1, "", bo);
@@ -594,21 +662,20 @@ void Substitution::orSubstitution(BinaryOperator *bo) {
 // Implementation of a = a ~ b => a = (!a && b) || (a && !b)
 void Substitution::xorSubstitution(BinaryOperator *bo) {
   BinaryOperator *op = NULL;
+  Value *LHS = freezeReusedOperand(bo, 0);
+  Value *RHS = freezeReusedOperand(bo, 1);
 
   // Create NOT on first operand
-  op = BinaryOperator::CreateNot(bo->getOperand(0), "", bo); // !a
+  op = BinaryOperator::CreateNot(LHS, "", bo); // !a
 
   // Create AND
-  op = BinaryOperator::Create(Instruction::And, bo->getOperand(1), op, "",
-                              bo); // !a && b
+  op = BinaryOperator::Create(Instruction::And, RHS, op, "", bo); // !a && b
 
   // Create NOT on second operand
-  BinaryOperator *op1 =
-      BinaryOperator::CreateNot(bo->getOperand(1), "", bo); // !b
+  BinaryOperator *op1 = BinaryOperator::CreateNot(RHS, "", bo); // !b
 
   // Create AND
-  op1 = BinaryOperator::Create(Instruction::And, bo->getOperand(0), op1, "",
-                               bo); // a && !b
+  op1 = BinaryOperator::Create(Instruction::And, LHS, op1, "", bo); // a && !b
 
   // Create OR
   op = BinaryOperator::Create(Instruction::Or, op, op1, "",
@@ -626,8 +693,11 @@ void Substitution::xorSubstitutionRand(BinaryOperator *bo) {
   if (!co)
     return;
 
+  Value *LHS = freezeReusedOperand(bo, 0);
+  Value *RHS = freezeReusedOperand(bo, 1);
+
   // !a
-  op = BinaryOperator::CreateNot(bo->getOperand(0), "", bo);
+  op = BinaryOperator::CreateNot(LHS, "", bo);
 
   // !a && r
   op = BinaryOperator::Create(Instruction::And, co, op, "", bo);
@@ -637,17 +707,17 @@ void Substitution::xorSubstitutionRand(BinaryOperator *bo) {
 
   // a && !r
   BinaryOperator *op1 =
-      BinaryOperator::Create(Instruction::And, bo->getOperand(0), opr, "", bo);
+      BinaryOperator::Create(Instruction::And, LHS, opr, "", bo);
 
   // !b
-  BinaryOperator *op2 = BinaryOperator::CreateNot(bo->getOperand(1), "", bo);
+  BinaryOperator *op2 = BinaryOperator::CreateNot(RHS, "", bo);
 
   // !b && r
   op2 = BinaryOperator::Create(Instruction::And, op2, co, "", bo);
 
   // b && !r
   BinaryOperator *op3 =
-      BinaryOperator::Create(Instruction::And, bo->getOperand(1), opr, "", bo);
+      BinaryOperator::Create(Instruction::And, RHS, opr, "", bo);
 
   // (!a && r) || (a && !r)
   op = BinaryOperator::Create(Instruction::Or, op, op1, "", bo);

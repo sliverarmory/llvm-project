@@ -50,15 +50,15 @@
 //  Each basic block of the function is choosen if a random number in the range
 //  [0,100] is smaller than the choosen probability rate. The default value
 //  is 30. This value can be modify using the option -boguscf-prob=[value].
-//  Value must be an integer in the range [0, 100], otherwise the default value
-//  is taken. Exemple: -bcf -bcf_prob=60
+//  Value must be an integer in the range [1, 100], otherwise option parsing
+//  fails. Exemple: -bcf -bcf_prob=60
 //
 //  The pass can also be loop many times on a function, including on the basic
 //  blocks added in a previous loop. Be careful if you use a big probability
 //  number and choose to run the loop many times wich may cause the pass to run
 //  for a very long time. The default value is one loop, but you can change it
-//  with -boguscf-loop=[value]. Value must be an integer greater than 1,
-//  otherwise the default value is taken. Exemple: -bcf -bcf_loop=2
+//  with -boguscf-loop=[value]. Value must be an integer at least 1,
+//  otherwise option parsing fails. Exemple: -bcf -bcf_loop=2
 //
 //
 //  Defined debug types:
@@ -95,6 +95,7 @@
 //===---------------------------------------------------------------------===//
 
 #include "llvm/Transforms/Obfuscation/BogusControlFlow.h"
+#include "llvm/Transforms/Obfuscation/OptionParser.h"
 #include "llvm/Transforms/Obfuscation/Utils.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include <memory>
@@ -116,18 +117,33 @@ using namespace llvm;
 // Options for the pass
 const int defaultObfRate = 30, defaultObfTime = 1;
 
-static cl::opt<int>
+static cl::opt<int, false, obfuscation::RangedIntParser<1, 100>>
     ObfProbRate("bcf_prob",
                 cl::desc("Choose the probability [%] each basic blocks will be "
                          "obfuscated by the -bcf pass"),
                 cl::value_desc("probability rate"), cl::init(defaultObfRate),
                 cl::Optional);
 
-static cl::opt<int>
+static cl::opt<int, false, obfuscation::RangedIntParser<1>>
     ObfTimes("bcf_loop",
              cl::desc("Choose how many time the -bcf pass loop on a function"),
              cl::value_desc("number of times"), cl::init(defaultObfTime),
              cl::Optional);
+
+static cl::opt<int, false, obfuscation::RangedIntParser<0>>
+    MaxAddedBlocks("bcf_max_blocks",
+                   cl::desc("Maximum new basic blocks per function from BCF"),
+                   cl::value_desc("blocks"), cl::init(1024), cl::Optional);
+
+static cl::opt<int, false, obfuscation::RangedIntParser<0>>
+    MaxGrowth("bcf_max_growth",
+              cl::desc("Maximum new instructions per function from BCF"),
+              cl::value_desc("instructions"), cl::init(16384), cl::Optional);
+
+// A zero-probability streak or a function whose blocks are all too large
+// must not make an extremely large -bcf_loop spin indefinitely.
+static constexpr uint64_t MaxCandidateVisits = 65536;
+static constexpr StringLiteral GeneratedPredicateMD = "obfuscation.bcf.generated";
 
 namespace {
 struct BogusControlFlow : public FunctionPass {
@@ -142,16 +158,18 @@ struct BogusControlFlow : public FunctionPass {
    * to the function. See header for more details.
    */
   bool runOnFunction(Function &F) override {
-    // Check if the percentage is correct
+    // Guard against invalid values set programmatically after option parsing.
     if (ObfTimes <= 0) {
-      errs() << "BogusControlFlow application number -bcf_loop=x must be x > 0";
+      F.getContext().emitError("-bcf_loop must be >= 1");
       return false;
     }
 
-    // Check if the number of applications is correct
     if (!((ObfProbRate > 0) && (ObfProbRate <= 100))) {
-      errs() << "BogusControlFlow application basic blocks percentage "
-                "-bcf_prob=x must be 0 < x <= 100";
+      F.getContext().emitError("-bcf_prob must be between 1 and 100");
+      return false;
+    }
+    if (MaxAddedBlocks < 0 || MaxGrowth < 0) {
+      F.getContext().emitError("BCF growth limits must be >= 0");
       return false;
     }
     // If fla annotations
@@ -159,31 +177,47 @@ struct BogusControlFlow : public FunctionPass {
       // The bogus paths clone calls and introduce cycles. Convergence control
       // tokens constrain both placement and cycles, so this rewriter cannot
       // safely transform functions that use them.
-      if (F.isConvergent())
+      if (F.isConvergent()) {
+        reportObfuscationSkip("bcf", "function", F.getName(), "convergent");
         return false;
+      }
       // Splitting or cloning EH and indirect control flow blocks can break
       // unwind edges or produce invalid terminators. Leave such functions
       // untouched rather than partially rewriting their CFG.
       for (BasicBlock &BB : F) {
-        if (BB.isEHPad())
+        if (BB.isEHPad()) {
+          reportObfuscationSkip("bcf", "function", F.getName(), "eh-pad");
           return false;
+        }
         for (Instruction &I : BB) {
-          if (isa<ConvergenceControlInst>(I))
+          if (isa<ConvergenceControlInst>(I)) {
+            reportObfuscationSkip("bcf", "function", F.getName(),
+                                  "convergence-control");
             return false;
+          }
           if (auto *Call = dyn_cast<CallBase>(&I)) {
             if (Call->isConvergent() ||
                 Call->countOperandBundlesOfType(
-                    LLVMContext::OB_convergencectrl))
+                    LLVMContext::OB_convergencectrl)) {
+              reportObfuscationSkip("bcf", "function", F.getName(),
+                                    "convergent-call");
               return false;
+            }
           }
         }
         Instruction *Term = BB.getTerminator();
         if (!isa<BranchInst>(Term) && !isa<SwitchInst>(Term) &&
-            !isa<ReturnInst>(Term) && !isa<UnreachableInst>(Term))
+            !isa<ReturnInst>(Term) && !isa<UnreachableInst>(Term)) {
+          reportObfuscationSkip("bcf", "function", F.getName(),
+                                "unsupported-terminator");
           return false;
+        }
       }
-      if (!bogus(F))
+      if (!bogus(F)) {
+        reportObfuscationSkip("bcf", "function", F.getName(),
+                              "no-block-selected");
         return false;
+      }
       doF(F);
       return true;
     }
@@ -195,8 +229,11 @@ struct BogusControlFlow : public FunctionPass {
     // For statistics and debug
     ++NumFunction;
     int NumBasicBlocks = 0;
-    bool firstTime = true; // First time we do the loop in this function
     bool hasBeenModified = false;
+    uint64_t RemainingBlocks = MaxAddedBlocks;
+    uint64_t RemainingGrowth = MaxGrowth;
+    uint64_t CandidateVisits = 0;
+    InitNumBasicBlocks += F.size();
     DEBUG_WITH_TYPE("opt", errs() << "bcf: Started on function " << F.getName()
                                   << "\n");
     DEBUG_WITH_TYPE("opt",
@@ -217,12 +254,13 @@ struct BogusControlFlow : public FunctionPass {
                                  << defaultObfTime << " \n");
       ObfTimes = defaultObfTime;
     }
-    NumTimesOnFunctions = ObfTimes;
-    int NumObfTimes = ObfTimes;
-
     // Real begining of the pass
     // Loop for the number of time we run the pass on the function
-    do {
+    bool Stop = false;
+    for (int Round = 0; Round < ObfTimes && !Stop; ++Round) {
+      if (RemainingBlocks < 3 || RemainingGrowth < 33)
+        break;
+      ++NumTimesOnFunctions;
       DEBUG_WITH_TYPE("cfg", errs() << "bcf: Function " << F.getName()
                                     << ", before the pass:\n");
       DEBUG_WITH_TYPE("cfg", F.viewCFG());
@@ -235,29 +273,44 @@ struct BogusControlFlow : public FunctionPass {
           "gen", errs() << "bcf: Iterating on the Function's Basic Blocks\n");
 
       while (!basicBlocks.empty()) {
+        if (CandidateVisits++ >= MaxCandidateVisits) {
+          Stop = true;
+          break;
+        }
         NumBasicBlocks++;
         // Basic Blocks' selection
         BasicBlock *basicBlock = basicBlocks.front();
-        if ((int)llvm::cryptoutils->get_range(100) <= ObfProbRate &&
+        basicBlocks.pop_front();
+        if ((int)llvm::cryptoutils->get_range(100) < ObfProbRate &&
             !hasMustTailCall(*basicBlock)) {
-          DEBUG_WITH_TYPE("opt", errs() << "bcf: Block " << NumBasicBlocks
-                                        << " selected. \n");
-          hasBeenModified = true;
-          ++NumModifiedBasicBlocks;
-          NumAddedBasicBlocks += 3;
-          FinalNumBasicBlocks += 3;
-          // Add bogus flow to the given Basic Block (see description)
-          addBogusFlow(basicBlock, F);
+          // Splitting creates three blocks. The clone contains no more than
+          // the original block's instructions, and each original binary op
+          // can add at most 20 junk instructions. Reserve final opaque
+          // predicate expansion too, before mutating the CFG.
+          uint64_t Bound = static_cast<uint64_t>(basicBlock->size()) + 32;
+          uint64_t BinaryOps = 0;
+          for (Instruction &I : *basicBlock)
+            BinaryOps += I.isBinaryOp();
+          if (Bound <= RemainingGrowth &&
+              BinaryOps <= (RemainingGrowth - Bound) / 20) {
+            Bound += 20 * BinaryOps;
+            DEBUG_WITH_TYPE("opt", errs() << "bcf: Block " << NumBasicBlocks
+                                          << " selected. \n");
+            hasBeenModified = true;
+            ++NumModifiedBasicBlocks;
+            NumAddedBasicBlocks += 3;
+            RemainingBlocks -= 3;
+            RemainingGrowth -= Bound;
+            // Add bogus flow to the given Basic Block (see description).
+            addBogusFlow(basicBlock, F);
+          }
         } else {
           DEBUG_WITH_TYPE("opt", errs() << "bcf: Block " << NumBasicBlocks
                                         << " not selected.\n");
         }
-        // remove the block from the list
-        basicBlocks.pop_front();
-
-        if (firstTime) { // first time we iterate on this function
-          ++InitNumBasicBlocks;
-          ++FinalNumBasicBlocks;
+        if (RemainingBlocks < 3 || RemainingGrowth < 33) {
+          Stop = true;
+          break;
         }
       } // end of while(!basicBlocks.empty())
       DEBUG_WITH_TYPE("gen",
@@ -270,8 +323,8 @@ struct BogusControlFlow : public FunctionPass {
         DEBUG_WITH_TYPE("cfg", errs()
                                    << "bcf: Function's not been modified \n");
       }
-      firstTime = false;
-    } while (--NumObfTimes > 0);
+    }
+    FinalNumBasicBlocks += F.size();
     return hasBeenModified;
   }
 
@@ -326,6 +379,8 @@ struct BogusControlFlow : public FunctionPass {
     Twine *var4 = new Twine("condition");
     FCmpInst *condition =
         new FCmpInst(basicBlock->end(), FCmpInst::FCMP_TRUE, LHS, RHS, *var4);
+    condition->setMetadata(GeneratedPredicateMD,
+                           MDNode::get(F.getContext(), {}));
     DEBUG_WITH_TYPE("gen", errs() << "bcf: Always true condition created\n");
 
     // Jump to the original basic block if the condition is true or
@@ -362,6 +417,8 @@ struct BogusControlFlow : public FunctionPass {
     Twine *var6 = new Twine("condition2");
     FCmpInst *condition2 =
         new FCmpInst(originalBB->end(), CmpInst::FCMP_TRUE, LHS, RHS, *var6);
+    condition2->setMetadata(GeneratedPredicateMD,
+                            MDNode::get(F.getContext(), {}));
     BranchInst::Create(originalBBpart2, alteredBB, (Value *)condition2,
                        originalBB);
     DEBUG_WITH_TYPE("gen", errs()
@@ -612,7 +669,8 @@ struct BogusControlFlow : public FunctionPass {
       if (!Br || !Br->isConditional())
         continue;
       auto *Cond = dyn_cast<FCmpInst>(Br->getCondition());
-      if (Cond && Cond->getPredicate() == FCmpInst::FCMP_TRUE) {
+      if (Cond && Cond->getPredicate() == FCmpInst::FCMP_TRUE &&
+          Cond->getMetadata(GeneratedPredicateMD)) {
         DEBUG_WITH_TYPE("gen",
                         errs() << "bcf: an always true predicate !\n");
         toEdit.push_back(Br);
@@ -624,9 +682,11 @@ struct BogusControlFlow : public FunctionPass {
     // Create the opaque predicate globals only when this function needs them.
     auto *Zero = ConstantInt::get(Type::getInt32Ty(M.getContext()), 0);
     GlobalVariable *x = new GlobalVariable(
-        M, Zero->getType(), false, GlobalValue::CommonLinkage, Zero, "x");
+        M, Zero->getType(), false, GlobalValue::PrivateLinkage, Zero,
+        ".obf.bcf.x");
     GlobalVariable *y = new GlobalVariable(
-        M, Zero->getType(), false, GlobalValue::CommonLinkage, Zero, "y");
+        M, Zero->getType(), false, GlobalValue::PrivateLinkage, Zero,
+        ".obf.bcf.y");
 
     // Replacing all the branches we found
     for (BranchInst *Br : toEdit) {
@@ -634,6 +694,10 @@ struct BogusControlFlow : public FunctionPass {
       // if y < 10 || x*(x+1) % 2 == 0
       opX = new LoadInst(x->getValueType(), x, "", Br);
       opY = new LoadInst(y->getValueType(), y, "", Br);
+      // Keep the private predicate state opaque to later optimization while
+      // avoiding externally visible common symbols named x and y.
+      opX->setVolatile(true);
+      opY->setVolatile(true);
 
       op = BinaryOperator::Create(
           Instruction::Sub, (Value *)opX,
