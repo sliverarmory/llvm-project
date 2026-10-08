@@ -12,6 +12,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Transforms/Obfuscation/CryptoUtils.h"
+#include "llvm/Transforms/Obfuscation/OptionParser.h"
 #include "llvm/Transforms/Obfuscation/Split.h"
 #include "llvm/Transforms/Obfuscation/Utils.h"
 #include <algorithm>
@@ -24,8 +25,8 @@ using namespace llvm;
 // Stats
 STATISTIC(Split, "Basicblock splitted");
 
-static cl::opt<int> SplitNum("split_num", cl::init(2),
-                             cl::desc("Split <split_num> time each BB"));
+static cl::opt<int, false, obfuscation::RangedIntParser<2, 10>> SplitNum(
+    "split_num", cl::init(2), cl::desc("Split <split_num> time each BB"));
 
 namespace {
 struct SplitBasicBlock : public FunctionPass {
@@ -59,10 +60,9 @@ PreservedAnalyses SplitBasicBlockPass::run(Function &F,
 }
 
 bool SplitBasicBlock::runOnFunction(Function &F) {
-  // Check if the number of applications is correct
+  // Guard against invalid values set programmatically after option parsing.
   if (!((SplitNum > 1) && (SplitNum <= 10))) {
-    errs() << "Split application basic block percentage\
-            -split_num=x must be 1 < x <= 10";
+    F.getContext().emitError("-split_num must be between 2 and 10");
     return false;
   }
 
@@ -79,22 +79,31 @@ bool SplitBasicBlock::runOnFunction(Function &F) {
 bool SplitBasicBlock::split(Function *f) {
   // Splitting can move a convergence entry intrinsic out of the entry block
   // or change a loop token's cycle. Keep convergent control flow intact.
-  if (f->isConvergent())
+  if (f->isConvergent()) {
+    reportObfuscationSkip("split", "function", f->getName(), "convergent");
     return false;
+  }
   for (BasicBlock &BB : *f) {
     for (Instruction &I : BB) {
-      if (I.getType()->isTokenTy())
+      if (I.getType()->isTokenTy()) {
+        reportObfuscationSkip("split", "function", f->getName(), "token");
         return false;
+      }
       if (auto *Call = dyn_cast<CallBase>(&I)) {
         if (Call->isConvergent() ||
-            Call->countOperandBundlesOfType(LLVMContext::OB_convergencectrl))
+            Call->countOperandBundlesOfType(LLVMContext::OB_convergencectrl)) {
+          reportObfuscationSkip("split", "function", f->getName(),
+                                "convergent-call");
           return false;
+        }
       }
     }
   }
 
   std::vector<BasicBlock *> origBB;
   bool Changed = false;
+  bool SawPHI = false;
+  bool SawMustTail = false;
 
   // Save all basic blocks
   for (Function::iterator I = f->begin(), IE = f->end(); I != IE; ++I) {
@@ -108,7 +117,14 @@ bool SplitBasicBlock::split(Function *f) {
 
     // No need to split a 1 inst bb
     // Or ones containing a PHI node or a musttail call.
-    if (curr->size() < 2 || containsPHI(curr) || hasMustTailCall(*curr)) {
+    if (curr->size() < 2)
+      continue;
+    if (containsPHI(curr)) {
+      SawPHI = true;
+      continue;
+    }
+    if (hasMustTailCall(*curr)) {
+      SawMustTail = true;
       continue;
     }
 
@@ -146,6 +162,14 @@ bool SplitBasicBlock::split(Function *f) {
     ++Split;
   }
 
+  if (!Changed) {
+    StringRef Reason = "no-eligible-blocks";
+    if (SawMustTail)
+      Reason = "musttail";
+    else if (SawPHI)
+      Reason = "phi";
+    reportObfuscationSkip("split", "function", f->getName(), Reason);
+  }
   return Changed;
 }
 

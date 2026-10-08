@@ -89,7 +89,9 @@
 #include "llvm/Transforms/Instrumentation/TypeSanitizer.h"
 #include "llvm/Transforms/ObjCARC.h"
 #include "llvm/Transforms/Obfuscation/BogusControlFlow.h"
+#include "llvm/Transforms/Obfuscation/ConstantEncoding.h"
 #include "llvm/Transforms/Obfuscation/Flattening.h"
+#include "llvm/Transforms/Obfuscation/GlobalAccessIndirection.h"
 #include "llvm/Transforms/Obfuscation/Split.h"
 #include "llvm/Transforms/Obfuscation/StringObfuscation.h"
 #include "llvm/Transforms/Obfuscation/Substitution.h"
@@ -140,6 +142,12 @@ static cl::opt<bool> ClSplitBasicBlocks("split", cl::init(false),
                                         cl::desc("Enable basic block splitting"));
 static cl::opt<bool> ClSubstitution("sub", cl::init(false),
                                     cl::desc("Enable instruction substitution"));
+static cl::opt<bool> ClConstantEncoding(
+    "constenc", cl::init(false),
+    cl::desc("Enable selected integer constant encoding"));
+static cl::opt<bool> ClGlobalAccessIndirection(
+    "gai", cl::init(false),
+    cl::desc("Enable selected global access indirection"));
 
 LLVM_ABI extern cl::opt<InstrProfCorrelator::ProfCorrelatorKind>
     ProfileCorrelate;
@@ -202,6 +210,14 @@ static void addObfuscationPasses(ModulePassManager &MPM) {
   RemainingFPM.addPass(ConditionalObfuscationPass<SubstitutionPass>(
       SubstitutionPass(ClSubstitution), ClSubstitution, "sub"));
   MPM.addPass(createModuleToFunctionPassAdaptor(std::move(RemainingFPM)));
+
+  // Encode only explicitly selected typed constants after other obfuscation
+  // transforms have run. The pass also honors function annotations.
+  MPM.addPass(ConstantEncodingPass(ClConstantEncoding));
+
+  // Introduce private pointer slots after the function transforms. Only
+  // explicitly named local globals can be redirected.
+  MPM.addPass(GlobalAccessIndirectionPass(ClGlobalAccessIndirection));
 }
 
 class EmitAssemblyHelper {

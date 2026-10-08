@@ -1,12 +1,40 @@
 #include "llvm/Transforms/Obfuscation/Utils.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringRef.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Module.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/raw_ostream.h"
-#include <sstream>
 
 using namespace llvm;
+
+static cl::list<std::string> OnlyFunctions(
+    "obf-only-functions", cl::CommaSeparated,
+    cl::desc("Apply enabled obfuscation passes only to these exact LLVM "
+             "function names"));
+
+static cl::opt<bool> ReportObfuscationSkips(
+    "obf-report-skips", cl::init(false),
+    cl::desc("Report why requested obfuscation transformations were skipped"));
+
+void reportObfuscationSkip(StringRef Pass, StringRef Kind, StringRef Symbol,
+                           StringRef Reason) {
+  if (!ReportObfuscationSkips)
+    return;
+  errs() << "obf-skip pass=" << Pass << " kind=" << Kind << " symbol=\"";
+  errs().write_escaped(Symbol);
+  errs() << "\" reason=" << Reason << '\n';
+}
+
+static bool isAllowedFunction(StringRef Name) {
+  if (OnlyFunctions.empty())
+    return true;
+  for (const std::string &Allowed : OnlyFunctions)
+    if (Name == Allowed)
+      return true;
+  return false;
+}
 
 bool hasMustTailCall(const BasicBlock &BB) {
   for (const Instruction &I : BB) {
@@ -82,99 +110,72 @@ void fixStack(Function *f) {
   } while (tmpReg.size() != 0 || tmpPhi.size() != 0);
 }
 
-std::string readAnnotate(Function *f) {
-  std::string annotation = "";
+template <typename CallbackT>
+static void forEachFunctionAnnotation(Function *F, CallbackT Callback) {
+  GlobalVariable *Annotations =
+      F->getParent()->getGlobalVariable("llvm.global.annotations");
+  if (!Annotations || !Annotations->hasInitializer())
+    return;
 
-  // Get annotation variable
-  GlobalVariable *glob =
-      f->getParent()->getGlobalVariable("llvm.global.annotations");
+  auto *Entries = dyn_cast<ConstantArray>(Annotations->getInitializer());
+  if (!Entries)
+    return;
 
-  if (glob != NULL) {
-    // Get the array
-    if (ConstantArray *ca = dyn_cast<ConstantArray>(glob->getInitializer())) {
-      for (unsigned i = 0; i < ca->getNumOperands(); ++i) {
-        // Get the struct
-        if (ConstantStruct *structAn =
-                dyn_cast<ConstantStruct>(ca->getOperand(i))) {
-          // llvm.global.annotations uses direct pointers on modern LLVM, and
-          // ConstantExpr bitcasts/GEPs on older LLVM versions.
-          Value *annotatedValue = structAn->getOperand(0);
-          if (ConstantExpr *expr = dyn_cast<ConstantExpr>(annotatedValue)) {
-            if (expr->isCast())
-              annotatedValue = expr->getOperand(0);
-          }
-          if (annotatedValue != f)
-            continue;
+  for (const Use &Entry : Entries->operands()) {
+    auto *Record = dyn_cast<ConstantStruct>(Entry.get());
+    if (!Record || Record->getNumOperands() < 2 ||
+        Record->getOperand(0)->stripPointerCasts() != F)
+      continue;
 
-          Value *noteValue = structAn->getOperand(1);
-          if (ConstantExpr *noteExpr = dyn_cast<ConstantExpr>(noteValue)) {
-            if (noteExpr->getOpcode() == Instruction::GetElementPtr ||
-                noteExpr->isCast()) {
-              noteValue = noteExpr->getOperand(0);
-            }
-          }
-
-          if (GlobalVariable *annoteStr = dyn_cast<GlobalVariable>(noteValue)) {
-            if (ConstantDataSequential *data =
-                    dyn_cast<ConstantDataSequential>(
-                        annoteStr->getInitializer())) {
-              if (data->isString()) {
-                annotation += data->getAsString().lower() + " ";
-              }
-            }
-          }
-        }
-      }
-    }
+    // Modern Clang uses direct pointers; stripPointerCasts also handles the
+    // casts and all-zero GEPs used by older annotation records.
+    auto *TextGlobal = dyn_cast<GlobalVariable>(
+        Record->getOperand(1)->stripPointerCasts());
+    if (!TextGlobal || !TextGlobal->hasInitializer())
+      continue;
+    auto *Data = dyn_cast<ConstantDataSequential>(TextGlobal->getInitializer());
+    if (Data && Data->isCString())
+      Callback(Data->getAsCString());
   }
-  return annotation;
+}
+
+std::string readAnnotate(Function *F) {
+  std::string Annotation;
+  forEachFunctionAnnotation(F, [&](StringRef Text) {
+    Annotation += Text.lower();
+    Annotation += ' ';
+  });
+  return Annotation;
 }
 
 bool toObfuscate(bool flag, Function *f, std::string const &attribute) {
-  std::string attr = attribute;
-  std::string attrNo = "no" + attr;
+  std::string NegativeAttribute = "no" + attribute;
+  bool Positive = false;
+  bool Negative = false;
+  forEachFunctionAnnotation(f, [&](StringRef Text) {
+    Positive |= Text.equals_insensitive(attribute);
+    Negative |= Text.equals_insensitive(NegativeAttribute);
+  });
 
-  // Check if declaration
+  if (Negative) {
+    reportObfuscationSkip(attribute, "function", f->getName(),
+                          "negative-annotation");
+    return false;
+  }
+  if (!Positive && !flag)
+    return false;
   if (f->isDeclaration()) {
+    reportObfuscationSkip(attribute, "function", f->getName(), "declaration");
     return false;
   }
-
-  // Check external linkage
-  if (f->hasAvailableExternallyLinkage() != 0) {
+  if (f->hasAvailableExternallyLinkage()) {
+    reportObfuscationSkip(attribute, "function", f->getName(),
+                          "available-externally");
     return false;
   }
-
-  // We have to check the nofla flag first
-  // Because .find("fla") is true for a string like "fla" or
-  // "nofla"
-  if (readAnnotate(f).find(attrNo) != std::string::npos) {
+  if (!isAllowedFunction(f->getName())) {
+    reportObfuscationSkip(attribute, "function", f->getName(), "not-selected");
     return false;
   }
-
-  // If fla annotations
-  if (readAnnotate(f).find(attr) != std::string::npos) {
-    return true;
-  }
-
-  // If fla flag is set
-  if (flag == true) {
-    /* Check if the number of applications is correct
-    if (!((Percentage > 0) && (Percentage <= 100))) {
-      LLVMContext &ctx = f->getContext();
-      ctx.emitError(Twine("Flattening application function\
-              percentage -perFLA=x must be 0 < x <= 100"));
-    }
-    // Check name
-    else if (func.size() != 0 && func.find(f->getName()) != std::string::npos) {
-      return true;
-    }
-
-    if ((((int)llvm::cryptoutils->get_range(100))) < Percentage) {
-      return true;
-    }
-    */
-    return true;
-  }
-
-  return false;
+  return true;
 }

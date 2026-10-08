@@ -142,6 +142,17 @@ def branch_count(body):
     return len(re.findall(r"^\s+br\s", body, re.MULTILINE))
 
 
+def assert_private_bcf_state(ir, label):
+    for name in ("x", "y"):
+        assert re.search(
+            rf"^@\.obf\.bcf\.{name}(?:\.\d+)?\s*=\s*private global i32 0",
+            ir, re.MULTILINE,
+        ), f"{label}: private opaque-predicate {name} global missing"
+        assert not re.search(rf"^@{name}(?:\.\d+)?\s*=", ir, re.MULTILINE), (
+            f"{label}: external opaque-predicate @{name} remains"
+        )
+
+
 def assert_effect(language, level, name, ir, baseline):
     label = f"{language}/{level}/{name}"
     body = target_body(ir)
@@ -161,10 +172,9 @@ def assert_effect(language, level, name, ir, baseline):
             f"{label}: split did not add branches to transform_target"
         )
     elif name == "bcf":
-        assert re.search(r"^@x(?:\.\d+)?\s*=\s*common\b", ir, re.MULTILINE), (
-            f"{label}: opaque-predicate global missing"
-        )
-        assert "urem i32" in body and branch_count(body) > branch_count(base_body), (
+        assert_private_bcf_state(ir, label)
+        assert ("urem i32" in body and "load volatile i32" in body
+                and branch_count(body) > branch_count(base_body)), (
             f"{label}: bogus control flow missing from transform_target"
         )
     elif name == "fla":
@@ -173,9 +183,7 @@ def assert_effect(language, level, name, ir, baseline):
         )
     elif name == "combined":
         assert_effect(language, level, "sobf", ir, baseline)
-        assert re.search(r"^@x(?:\.\d+)?\s*=\s*common\b", ir, re.MULTILINE), (
-            f"{label}: opaque-predicate global missing"
-        )
+        assert_private_bcf_state(ir, label)
         assert "urem i32" in body, f"{label}: BCF missing from transform_target"
         assert "switch i32" in body, f"{label}: flatten dispatcher missing"
         assert re.search(r"(?m)^[^\s;][^:\n]*\.split[^:\n]*:", body), (

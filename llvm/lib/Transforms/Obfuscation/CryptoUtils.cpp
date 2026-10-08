@@ -18,19 +18,23 @@
 
 #include "llvm/Transforms/Obfuscation/CryptoUtils.h"
 #include "llvm/ADT/Statistic.h"
+#include "llvm/ADT/StringExtras.h"
+#include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/IR/LLVMContext.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/ManagedStatic.h"
+#include "llvm/Support/RandomNumberGenerator.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <cassert>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
-#include <fstream>
+#include <mutex>
 #include <string>
+#include <system_error>
 
 // Stats
 #define DEBUG_TYPE "CryptoUtils"
@@ -48,6 +52,10 @@ using namespace llvm;
 namespace llvm {
 ManagedStatic<CryptoUtils> cryptoutils;
 }
+
+static cl::opt<std::string> ObfuscationTestSeed(
+    "obf-test-seed", cl::Hidden, cl::value_desc("32 hexadecimal digits"),
+    cl::desc("Fixed obfuscation seed for reproducible tests only"));
 
 const uint32_t AES_RCON[10] = {
     0x01000000UL, 0x02000000UL, 0x04000000UL, 0x08000000UL, 0x10000000UL,
@@ -494,7 +502,12 @@ const uint32_t masks[32] = {
     0x00000040UL, 0x00000020UL, 0x00000010UL, 0x00000008UL, 0x00000004UL,
     0x00000002UL, 0x00000001UL};
 
-CryptoUtils::CryptoUtils() { seeded = false; }
+CryptoUtils::CryptoUtils() : CryptoUtils(llvm::getRandomBytes) {}
+
+CryptoUtils::CryptoUtils(EntropySource ReadEntropy)
+    : ReadEntropy(ReadEntropy), idx(0), seeded(false) {
+  assert(ReadEntropy && "CryptoUtils requires an entropy source");
+}
 
 unsigned CryptoUtils::scramble32(const unsigned in, const char key[16]) {
   assert(key != NULL && "CryptoUtils::scramble key=NULL");
@@ -536,49 +549,36 @@ unsigned CryptoUtils::scramble32(const unsigned in, const char key[16]) {
   return tmpA ^ tmpB;
 }
 
-bool CryptoUtils::prng_seed(std::string const &_seed) {
-  unsigned char s[16];
-  unsigned int i = 0;
+bool CryptoUtils::prng_seed(std::string const &Seed) {
+  std::lock_guard<std::mutex> Lock(Mutex);
+  return seedFromHex(Seed);
+}
 
-  /* We accept a prefix "0x" */
-  if (!(_seed.size() == 32 || _seed.size() == 34)) {
-    errs() << "The AES-CTR PRNG seeding mechanism is expecting a 16-byte value "
-              "expressed in hexadecimal, like DEAD....BEEF\n";
+bool CryptoUtils::seedFromHex(std::string const &Seed) {
+  StringRef Hex(Seed);
+  Hex.consume_front("0x");
+  if (Hex.size() != 32)
     return false;
+
+  unsigned char Parsed[16];
+  for (std::size_t I = 0; I < sizeof(Parsed); ++I) {
+    unsigned High = hexDigitValue(Hex[2 * I]);
+    unsigned Low = hexDigitValue(Hex[2 * I + 1]);
+    if (High == ~0U || Low == ~0U)
+      return false;
+    Parsed[I] = static_cast<unsigned char>((High << 4) | Low);
   }
 
-  seed = _seed;
-
-  if (_seed.size() == 34) {
-    // Assuming that the two first characters are "0x"
-    i = 2;
-  }
-
-  for (unsigned int j = 0; i < _seed.size(); i += 2, j++) {
-    std::string byte = _seed.substr(i, 2);
-    s[j] = (unsigned char)(int)strtol(byte.c_str(), NULL, 16);
-  }
-
-  // _seed is defined to be the
-  // key initial value
-  memcpy(key, s, 16);
-  DEBUG_WITH_TYPE("cryptoutils", dbgs()
-                                     << "CPNRG seeded with " << _seed << "\n");
-
-  // ctr is initialized to all-zeroes
-  memset(ctr, 0, 16);
-
-  // Once the seed is there, we compute the
-  // AES128 key-schedule
-  aes_compute_ks(ks, key);
-
-  seeded = true;
-
-  // We are now ready to fill the pool with
-  // cryptographically secure pseudo-random
-  // values.
-  populate_pool();
+  memcpy(key, Parsed, sizeof(key));
+  initializePool();
   return true;
+}
+
+void CryptoUtils::initializePool() {
+  memset(ctr, 0, sizeof(ctr));
+  aes_compute_ks(ks, key);
+  seeded = true;
+  populate_pool();
 }
 
 CryptoUtils::~CryptoUtils() {
@@ -609,92 +609,14 @@ void CryptoUtils::populate_pool() {
   idx = 0;
 }
 
-#if defined(_WIN64) || defined(_WIN32)
-// sic! don't change include order
-#include <windows.h>
-#include <wincrypt.h>
-
-struct WinDevRandom {
-  WinDevRandom() : m_hcryptProv{0}, m_last_read{0} {
-    assert(!m_hcryptProv);
-    if (!CryptAcquireContext(&m_hcryptProv, nullptr, nullptr, PROV_RSA_FULL,
-                             CRYPT_VERIFYCONTEXT)) {
-      errs() << "CryptAcquireContext failed (LastError: " << GetLastError()
-             << ")\n";
-    } else {
-      assert(m_hcryptProv);
-    }
+std::error_code CryptoUtils::prng_seed() {
+  if (std::error_code EC = ReadEntropy(key, sizeof(key))) {
+    memset(key, 0, sizeof(key));
+    return EC;
   }
 
-  ~WinDevRandom() { close(); }
-
-  std::size_t read(char *key, std::size_t sz) {
-    assert(m_hcryptProv);
-    if (!CryptGenRandom(m_hcryptProv, sz, reinterpret_cast<BYTE *>(key))) {
-      errs() << "CryptGenRandom failed (LastError: " << GetLastError() << ")\n";
-    }
-    m_last_read = sz;
-    return sz;
-  }
-
-  void close() {
-    if (m_hcryptProv && !CryptReleaseContext(m_hcryptProv, 0)) {
-      errs() << "CryptReleaseContext failed (LastError: " << GetLastError()
-             << ")\n";
-    }
-    m_hcryptProv = 0;
-    assert(!m_hcryptProv);
-  }
-
-  std::size_t gcount() { return m_last_read; }
-
-  explicit operator bool() { return true; }
-
-  bool good() const { return m_hcryptProv; }
-
-private:
-  HCRYPTPROV m_hcryptProv;
-  std::size_t m_last_read;
-};
-#endif
-
-bool CryptoUtils::prng_seed() {
-
-#if defined(__linux__)
-  std::string const dev = "/dev/urandom";
-  std::ifstream devrandom(dev);
-#elif defined(_WIN64) || defined(_WIN32)
-  std::string const dev = "CryptGenRandom";
-  WinDevRandom devrandom;
-#else
-  std::string const dev = "/dev/random";
-  std::ifstream devrandom(dev);
-#endif
-
-  if (!devrandom.good()) {
-    errs() << "Cannot open " << dev << "\n";
-    return false;
-  }
-
-  devrandom.read(key, 16);
-  auto const gc = devrandom.gcount();
-  if (gc != 16) {
-    errs() << "Cannot read enough bytes got=" << gc << " want=16";
-    return false;
-  }
-
-  devrandom.close();
-  DEBUG_WITH_TYPE("cryptoutils",
-                  dbgs() << "cryptoutils seeded with " << dev << "\n");
-
-  std::memset(ctr, 0, 16);
-
-  // Once the seed is there, we compute the
-  // AES128 key-schedule
-  aes_compute_ks(ks, key);
-
-  seeded = true;
-  return true;
+  initializePool();
+  return std::error_code();
 }
 
 void CryptoUtils::inc_ctr() {
@@ -705,15 +627,6 @@ void CryptoUtils::inc_ctr() {
   STORE64H(ctr + 8, iseed);
 }
 
-char *CryptoUtils::get_seed() {
-
-  if (seeded) {
-    return key;
-  } else {
-    return NULL;
-  }
-}
-
 void CryptoUtils::get_bytes(char *buffer, const int len) {
 
   int sofar = 0, available = 0;
@@ -722,13 +635,19 @@ void CryptoUtils::get_bytes(char *buffer, const int len) {
   assert(len > 0 && "CryptoUtils::get_bytes len <= 0");
 
   statsGetBytes++;
+  std::lock_guard<std::mutex> Lock(Mutex);
 
   if (len > 0) {
 
-    // If the PRNG is not seeded, it the very last time to do it !
     if (!seeded) {
-      prng_seed();
-      populate_pool();
+      if (ObfuscationTestSeed.getNumOccurrences()) {
+        if (!seedFromHex(ObfuscationTestSeed.getValue()))
+          report_fatal_error("invalid -obf-test-seed: expected 32 hexadecimal "
+                             "digits with optional 0x prefix");
+      } else if (std::error_code EC = prng_seed()) {
+        report_fatal_error(Twine("obfuscation entropy acquisition failed: ") +
+                           EC.message());
+      }
     }
 
     do {
@@ -745,7 +664,7 @@ void CryptoUtils::get_bytes(char *buffer, const int len) {
         // This will trigger a loop exit
         sofar = len;
       }
-    } while (sofar < (len - 1));
+    } while (sofar < len);
   }
 }
 

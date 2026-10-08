@@ -48,25 +48,41 @@ PreservedAnalyses FlatteningPass::run(Function &F,
   // exceptional and indirect control flow before lowering any switches.
   if (!toObfuscate(Flag, &F, "fla"))
     return PreservedAnalyses::all();
-  if (F.isConvergent())
+  if (F.isConvergent()) {
+    reportObfuscationSkip("fla", "function", F.getName(), "convergent");
     return PreservedAnalyses::all();
+  }
   Instruction *EntryTerm = F.getEntryBlock().getTerminator();
-  if (!isa<BranchInst>(EntryTerm) && !isa<SwitchInst>(EntryTerm))
+  if (!isa<BranchInst>(EntryTerm) && !isa<SwitchInst>(EntryTerm)) {
+    reportObfuscationSkip("fla", "function", F.getName(),
+                          "entry-terminator");
     return PreservedAnalyses::all();
+  }
 
   bool HasSwitch = false;
   for (BasicBlock &BB : F) {
-    if (BB.isEHPad() || hasMustTailCall(BB))
+    if (BB.isEHPad()) {
+      reportObfuscationSkip("fla", "function", F.getName(), "eh-pad");
       return PreservedAnalyses::all();
+    }
+    if (hasMustTailCall(BB)) {
+      reportObfuscationSkip("fla", "function", F.getName(), "musttail");
+      return PreservedAnalyses::all();
+    }
     // The dispatcher changes the cycles and control dependence around
     // convergent operations. Its stack repair also cannot demote token values.
     for (Instruction &I : BB) {
-      if (I.getType()->isTokenTy())
+      if (I.getType()->isTokenTy()) {
+        reportObfuscationSkip("fla", "function", F.getName(), "token");
         return PreservedAnalyses::all();
+      }
       if (auto *Call = dyn_cast<CallBase>(&I)) {
         if (Call->isConvergent() ||
-            Call->countOperandBundlesOfType(LLVMContext::OB_convergencectrl))
+            Call->countOperandBundlesOfType(LLVMContext::OB_convergencectrl)) {
+          reportObfuscationSkip("fla", "function", F.getName(),
+                                "convergent-call");
           return PreservedAnalyses::all();
+        }
       }
     }
     Instruction *Term = BB.getTerminator();
@@ -75,8 +91,11 @@ PreservedAnalyses FlatteningPass::run(Function &F,
       continue;
     }
     if (!isa<BranchInst>(Term) && !isa<ReturnInst>(Term) &&
-        !isa<UnreachableInst>(Term))
+        !isa<UnreachableInst>(Term)) {
+      reportObfuscationSkip("fla", "function", F.getName(),
+                            "unsupported-terminator");
       return PreservedAnalyses::all();
+    }
   }
 
   // Lower switches here so the flattening code never sees a multiway switch.
@@ -133,12 +152,15 @@ bool Flattening::flatten(Function *f) {
 
     BasicBlock *bb = &*i;
     if (isa<InvokeInst>(bb->getTerminator())) {
+      reportObfuscationSkip("fla", "function", f->getName(),
+                            "unsupported-terminator");
       return false;
     }
   }
 
   // Nothing to flatten
   if (origBB.size() <= 1) {
+    reportObfuscationSkip("fla", "function", f->getName(), "single-block");
     return false;
   }
 

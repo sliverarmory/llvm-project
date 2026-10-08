@@ -11,8 +11,10 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Pass.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Transforms/Obfuscation/CryptoUtils.h"
 #include "llvm/Transforms/Obfuscation/StringObfuscation.h"
+#include "llvm/Transforms/Obfuscation/Utils.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 #include <cstdint>
 #include <memory>
@@ -22,6 +24,11 @@
 using namespace llvm;
 
 STATISTIC(GlobalsEncoded, "Counts number of global variables encoded");
+
+static cl::list<std::string> OnlyStringGlobals(
+    "sobf-only-globals", cl::CommaSeparated,
+    cl::desc("Encode only these exact LLVM global names when string "
+             "obfuscation is enabled"));
 
 namespace llvm {
 
@@ -76,30 +83,52 @@ static bool isObjCRuntimeMetadata(const GlobalVariable &GV) {
   return false;
 }
 
-static bool shouldEncodeGlobal(const GlobalVariable &GV) {
-  if (!GV.isConstant() || !GV.hasInitializer())
+static bool isNamedForEncoding(StringRef Name) {
+  if (OnlyStringGlobals.empty())
+    return true;
+  for (const std::string &Allowed : OnlyStringGlobals)
+    if (Name == Allowed)
+      return true;
+  return false;
+}
+
+static bool hasCStringInitializer(const GlobalVariable &GV) {
+  if (!GV.hasInitializer())
     return false;
+  const auto *CDS = dyn_cast<ConstantDataSequential>(GV.getInitializer());
+  return CDS && CDS->isCString() &&
+         CDS->getElementType()->isIntegerTy(8) &&
+         !CDS->getRawDataValues().empty();
+}
+
+// An empty reason means the global is safe to encode.
+static StringRef stringSkipReason(const GlobalVariable &GV) {
+  if (GV.hasMetadata("obf.constenc"))
+    return "generated-constant";
+  if (!GV.hasInitializer())
+    return "no-initializer";
+  if (!GV.isConstant())
+    return "mutable";
   if (GV.isThreadLocal())
-    return false;
+    return "thread-local";
   // Multiple translation units can emit the same weak/ODR global with
   // different keys. The linker keeps one definition but runs every decoder.
   if (GV.isWeakForLinker() || GV.hasAvailableExternallyLinkage() ||
       GV.hasComdat())
-    return false;
+    return "weak-or-comdat";
 
   StringRef Section = GV.getSection();
-  if (Section == "llvm.metadata" || isObjCRuntimeMetadata(GV))
-    return false;
+  if (Section == "llvm.metadata")
+    return "llvm-metadata";
+  if (isObjCRuntimeMetadata(GV))
+    return "objc-metadata";
 
-  const auto *CDS = dyn_cast<ConstantDataSequential>(GV.getInitializer());
-  if (!CDS || !CDS->isCString())
-    return false;
-  if (!CDS->getElementType()->isIntegerTy(8))
-    return false;
-  if (CDS->getRawDataValues().empty())
-    return false;
+  if (!hasCStringInitializer(GV))
+    return "not-c-string";
+  if (!isNamedForEncoding(GV.getName()))
+    return "not-selected";
 
-  return true;
+  return {};
 }
 
 static Constant *buildEncodedInitializer(Module &M,
@@ -140,8 +169,15 @@ public:
     for (Module::global_iterator GI = M.global_begin(), GE = M.global_end();
          GI != GE; ++GI) {
       GlobalVariable *GV = &*GI;
-      if (!shouldEncodeGlobal(*GV))
+      // Ordinary non-string globals are outside this pass. An explicitly
+      // named global is still reported if it cannot be encoded safely.
+      if (!hasCStringInitializer(*GV) &&
+          (OnlyStringGlobals.empty() || !isNamedForEncoding(GV->getName())))
         continue;
+      if (StringRef Reason = stringSkipReason(*GV); !Reason.empty()) {
+        reportObfuscationSkip("sobf", "global", GV->getName(), Reason);
+        continue;
+      }
 
       auto *CDS = cast<ConstantDataSequential>(GV->getInitializer());
       uint8_t Key = cryptoutils->get_uint8_t();
@@ -150,8 +186,10 @@ public:
       uint32_t Size = 0;
       Constant *EncodedInit =
           buildEncodedInitializer(M, *CDS, Key, Step, Size);
-      if (!EncodedInit || Size == 0)
+      if (!EncodedInit || Size == 0) {
+        reportObfuscationSkip("sobf", "global", GV->getName(), "empty-string");
         continue;
+      }
 
       auto *DynGV = new GlobalVariable(
           M, GV->getValueType(),
@@ -176,6 +214,10 @@ public:
 
     if (!EncodedGlobals.empty())
       addDecodeFunction(M, EncodedGlobals);
+
+    for (const std::string &Selected : OnlyStringGlobals)
+      if (!M.getNamedGlobal(Selected))
+        reportObfuscationSkip("sobf", "global", Selected, "not-found");
 
     return Changed;
   }

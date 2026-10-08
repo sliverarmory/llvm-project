@@ -5,15 +5,19 @@
 #if defined(TEST_SUB)
 #define POSITIVE_ANNOTATION "sub"
 #define NEGATIVE_ANNOTATION "nosub"
+#define MIXED_POSITIVE_ANNOTATION "SuB"
 #elif defined(TEST_SPLIT)
 #define POSITIVE_ANNOTATION "split"
 #define NEGATIVE_ANNOTATION "nosplit"
+#define MIXED_POSITIVE_ANNOTATION "SpLiT"
 #elif defined(TEST_BCF)
 #define POSITIVE_ANNOTATION "bcf"
 #define NEGATIVE_ANNOTATION "nobcf"
+#define MIXED_POSITIVE_ANNOTATION "BcF"
 #elif defined(TEST_FLA)
 #define POSITIVE_ANNOTATION "fla"
 #define NEGATIVE_ANNOTATION "nofla"
+#define MIXED_POSITIVE_ANNOTATION "FlA"
 #else
 #error Define exactly one TEST_* transform selector
 #endif
@@ -49,9 +53,32 @@ uint32_t negative(uint32_t a, uint32_t b) {
   TARGET_BODY;
 }
 
+__attribute__((noinline, annotate("prefix-" POSITIVE_ANNOTATION)))
+uint32_t collision_positive(uint32_t a, uint32_t b) {
+  TARGET_BODY;
+}
+
+__attribute__((noinline, annotate(NEGATIVE_ANNOTATION "-suffix")))
+uint32_t collision_negative(uint32_t a, uint32_t b) {
+  TARGET_BODY;
+}
+
+__attribute__((noinline, annotate(MIXED_POSITIVE_ANNOTATION)))
+uint32_t mixed_positive(uint32_t a, uint32_t b) {
+  TARGET_BODY;
+}
+
+__attribute__((noinline, annotate(POSITIVE_ANNOTATION),
+               annotate(NEGATIVE_ANNOTATION)))
+uint32_t positive_and_negative(uint32_t a, uint32_t b) {
+  TARGET_BODY;
+}
+
 int main(int argc, char **argv) {
   uint32_t a = argc > 1 ? (uint32_t)strtoul(argv[1], NULL, 0) : 17u;
   uint32_t b = argc > 2 ? (uint32_t)strtoul(argv[2], NULL, 0) : 29u;
-  printf("%u:%u\n", positive(a, b), negative(a, b));
+  printf("%u:%u:%u:%u:%u:%u\n", positive(a, b), negative(a, b),
+         collision_positive(a, b), collision_negative(a, b),
+         mixed_positive(a, b), positive_and_negative(a, b));
   return 0;
 }
