@@ -11,9 +11,12 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "EHRegion.h"
 #include "llvm/Transforms/Obfuscation/Flattening.h"
 #include "llvm/Transforms/Obfuscation/CryptoUtils.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/IRBuilder.h"
 #include "llvm/Transforms/Utils.h"
 #include "llvm/Transforms/Utils/LowerSwitch.h"
 #include <memory>
@@ -42,6 +45,94 @@ char Flattening::ID = 0;
 static RegisterPass<Flattening> X("flattening", "Call graph flattening");
 Pass *llvm::createFlattening(bool flag) { return new Flattening(flag); }
 
+// Full-function flattening cannot move invokes or EH pads through its shared
+// dispatcher. Within an EH function, route only ordinary conditional branches
+// through their own state dispatchers. A dedicated dispatcher keeps each
+// successor's PHI edge and the dominance of values from the source block.
+static bool flattenNormalEHBranches(Function &F) {
+  SmallPtrSet<BasicBlock *, 32> Protected;
+  obfuscation::collectProtectedEHBlocks(F, Protected);
+
+  SmallVector<BranchInst *, 32> Candidates;
+  for (BasicBlock &BB : F) {
+    if (Protected.contains(&BB) || hasMustTailCall(BB))
+      continue;
+    auto *Br = dyn_cast<BranchInst>(BB.getTerminator());
+    if (!Br || !Br->isConditional() ||
+        Br->getSuccessor(0) == Br->getSuccessor(1) ||
+        Protected.contains(Br->getSuccessor(0)) ||
+        Protected.contains(Br->getSuccessor(1)))
+      continue;
+    bool Unsafe = false;
+    for (Instruction &I : BB) {
+      Unsafe |= I.getType()->isTokenTy();
+      if (auto *Call = dyn_cast<CallBase>(&I))
+        Unsafe |= Call->isConvergent() ||
+                  Call->countOperandBundlesOfType(
+                      LLVMContext::OB_convergencectrl) != 0 ||
+                  Call->countOperandBundlesOfType(LLVMContext::OB_funclet) !=
+                      0;
+    }
+    if (!Unsafe)
+      Candidates.push_back(Br);
+  }
+  if (Candidates.empty()) {
+    reportObfuscationSkip("fla", "function", F.getName(),
+                          "no-eligible-normal-branch");
+    return false;
+  }
+
+  // Bound the additional blocks and switch cases in large generated Rust
+  // functions. The rest of the ordinary CFG remains valid and untouched.
+  if (Candidates.size() > 256) {
+    reportObfuscationSkip("fla", "function", F.getName(), "growth-limit");
+    Candidates.resize(256);
+  }
+
+  LLVMContext &Ctx = F.getContext();
+  IntegerType *I32 = Type::getInt32Ty(Ctx);
+  IRBuilder<> EntryBuilder(&*F.getEntryBlock().getFirstInsertionPt());
+  AllocaInst *StateSlot = EntryBuilder.CreateAlloca(I32, nullptr,
+                                                    "obf.eh.state");
+  BasicBlock *Default = BasicBlock::Create(Ctx, "eh.dispatch.default", &F);
+  new UnreachableInst(Ctx, Default);
+  char Key[16];
+  cryptoutils->get_bytes(Key, sizeof(Key));
+
+  for (unsigned Index = 0; Index < Candidates.size(); ++Index) {
+    BranchInst *Br = Candidates[Index];
+    BasicBlock *Source = Br->getParent();
+    BasicBlock *TrueDest = Br->getSuccessor(0);
+    BasicBlock *FalseDest = Br->getSuccessor(1);
+    ConstantInt *TrueState = ConstantInt::get(
+        I32, cryptoutils->scramble32(2 * Index, Key));
+    ConstantInt *FalseState = ConstantInt::get(
+        I32, cryptoutils->scramble32(2 * Index + 1, Key));
+    BasicBlock *Dispatcher = BasicBlock::Create(Ctx, "eh.dispatch", &F);
+
+    IRBuilder<> SourceBuilder(Br);
+    Value *ChosenState = SourceBuilder.CreateSelect(
+        Br->getCondition(), TrueState, FalseState, "obf.eh.choice");
+    SourceBuilder.CreateStore(ChosenState, StateSlot)->setVolatile(true);
+    SourceBuilder.CreateBr(Dispatcher);
+    Br->eraseFromParent();
+
+    IRBuilder<> DispatchBuilder(Dispatcher);
+    LoadInst *Loaded =
+        DispatchBuilder.CreateLoad(I32, StateSlot, "obf.eh.loaded");
+    Loaded->setVolatile(true);
+    SwitchInst *Switch = DispatchBuilder.CreateSwitch(Loaded, Default, 2);
+    Switch->addCase(TrueState, TrueDest);
+    Switch->addCase(FalseState, FalseDest);
+    for (BasicBlock *Dest : {TrueDest, FalseDest})
+      for (PHINode &Phi : Dest->phis())
+        Phi.replaceIncomingBlockWith(Source, Dispatcher);
+  }
+  ++Flattened;
+  reportObfuscationEffect("fla", "function", F.getName(), Candidates.size());
+  return true;
+}
+
 PreservedAnalyses FlatteningPass::run(Function &F,
                                       FunctionAnalysisManager &AM) {
   // The legacy rewriter handles ordinary branches and exits only. Reject
@@ -52,6 +143,9 @@ PreservedAnalyses FlatteningPass::run(Function &F,
     reportObfuscationSkip("fla", "function", F.getName(), "convergent");
     return PreservedAnalyses::all();
   }
+  if (obfuscation::hasExceptionalControlFlow(F))
+    return flattenNormalEHBranches(F) ? PreservedAnalyses::none()
+                                      : PreservedAnalyses::all();
   Instruction *EntryTerm = F.getEntryBlock().getTerminator();
   if (!isa<BranchInst>(EntryTerm) && !isa<SwitchInst>(EntryTerm)) {
     reportObfuscationSkip("fla", "function", F.getName(),
