@@ -1,0 +1,7 @@
+{
+  "rust_version": "1.99.0",
+  "rust_commit": "b940084d7eb6a299eb4bfeb8e34901bc051e7ac4",
+  "rust_source_sha256": "cc41916a8c84f5d9ec4f55561b44e39f43b647b133f8a6f51be9ea13c83f7036",
+  "llvm_base_commit": "d881479b157bad1536ce4d77fd06648f89c9fa64",
+  "llvm_version": "23.1.3"
+}

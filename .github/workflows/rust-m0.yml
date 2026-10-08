@@ -1,0 +1,152 @@
+name: Rust milestone 0 (Linux amd64)
+
+on:
+  push:
+    branches: [feat/rust-obfuscation]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-m0-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native-linux-amd64:
+    name: Stage-1 Rust 1.99 and obfuscation regression
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - name: Reclaim unused runner disk
+        run: |
+          set -euo pipefail
+          df -h /
+          sudo rm -rf \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /opt/ghc \
+            /usr/local/.ghcup \
+            /usr/local/share/powershell \
+            /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - uses: actions/checkout@v4
+        with:
+          # The bootstrap verifies ancestry from the pinned LLVM main commit.
+          # Keep that commit reachable without fetching all upstream LLVM history.
+          fetch-depth: 32
+          filter: blob:none
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+
+      - name: Install native build and HTTPS dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake ninja-build g++ xz-utils pkg-config openssl \
+            libcurl4-openssl-dev libssl-dev libobjc-13-dev
+
+      - name: Configure assertions-enabled LLVM 23 and Clang
+        run: |
+          set -euo pipefail
+          cmake -S llvm -B build-llvm-project -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_ENABLE_ASSERTIONS=ON \
+            -DLLVM_ENABLE_PROJECTS=clang \
+            -DLLVM_TARGETS_TO_BUILD=X86 \
+            -DLLVM_INCLUDE_TESTS=ON \
+            -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DLLVM_INCLUDE_BENCHMARKS=OFF \
+            -DLLVM_ENABLE_TERMINFO=OFF \
+            -DLLVM_ENABLE_ZSTD=OFF \
+            -DLLVM_PARALLEL_LINK_JOBS=1
+
+      - name: Build LLVM tools and obfuscation unit tests
+        run: |
+          set -euo pipefail
+          cmake --build build-llvm-project \
+            --target clang opt llvm-objdump llvm-config ObfuscationTests \
+            --parallel 4
+          build-llvm-project/bin/llvm-config --version
+          build-llvm-project/bin/llvm-config --assertion-mode
+          df -h /
+
+      - name: Check LLVM and bootstrap unit tests
+        run: |
+          set -euo pipefail
+          build-llvm-project/unittests/Transforms/Obfuscation/ObfuscationTests
+          python3 -B -m unittest discover -s tools/rust-obfuscation \
+            -p test_bootstrap.py -v
+
+      - name: Fetch pinned Rust source without bundled LLVM and vendor trees
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch 1.99.0 --filter=blob:none \
+            https://github.com/rust-lang/rust.git build-rust-1.99
+          git -C build-rust-1.99 rev-parse HEAD
+          df -h /
+
+      - name: Build pinned stage-1 Rust compiler and sysroot
+        run: |
+          set -euo pipefail
+          python3 -B tools/rust-obfuscation/bootstrap.py build --jobs 4
+          test -x build-rust-1.99/build/x86_64-unknown-linux-gnu/stage1/bin/rustc
+          build-rust-1.99/build/x86_64-unknown-linux-gnu/stage1/bin/rustc -vV
+          df -h /
+
+      - name: Verify direct Rust programs, all seven passes, and HTTPS
+        run: |
+          set -euo pipefail
+          python3 -B tests/obfuscation/rust/run_direct.py \
+            --rustc build-rust-1.99/build/x86_64-unknown-linux-gnu/stage1/bin/rustc \
+            --opt build-llvm-project/bin/opt \
+            --objdump build-llvm-project/bin/llvm-objdump \
+            --llvm-config build-llvm-project/bin/llvm-config \
+            --work-dir build-llvm-project/rust-m0 \
+            --live-https
+
+      - name: Verify portable obfuscation suites
+        run: |
+          set -euo pipefail
+          python3 -B tests/obfuscation/run_portable.py \
+            --clang build-llvm-project/bin/clang \
+            --opt build-llvm-project/bin/opt \
+            --objdump build-llvm-project/bin/llvm-objdump \
+            --work-dir build-llvm-project/portable-rust-m0
+
+      - name: Verify four-language HTTPS transform clients
+        run: |
+          set -euo pipefail
+          python3 -B tests/obfuscation/test_http_programs.py \
+            --clang build-llvm-project/bin/clang \
+            --opt build-llvm-project/bin/opt \
+            --work-dir build-llvm-project/http-rust-m0
+
+      - name: Record toolchain provenance
+        if: success()
+        run: |
+          set -euo pipefail
+          git rev-parse HEAD
+          build-llvm-project/bin/llvm-config --version
+          build-rust-1.99/build/x86_64-unknown-linux-gnu/stage1/bin/rustc -vV
+          sha256sum \
+            build-llvm-project/bin/opt \
+            build-llvm-project/bin/llvm-config \
+            build-rust-1.99/build/x86_64-unknown-linux-gnu/stage1/bin/rustc
+          df -h /
+
+      - name: Upload Rust M0 report and failure IR
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-m0-linux-amd64-evidence
+          path: |
+            build-llvm-project/rust-m0/rust-m0-report.json
+            build-llvm-project/rust-m0/*.ll
+            build-llvm-project/portable-rust-m0/**/*.ll
+            build-llvm-project/http-rust-m0/*.ll
+          if-no-files-found: ignore

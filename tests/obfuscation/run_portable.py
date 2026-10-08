@@ -8,6 +8,7 @@ from pathlib import Path
 
 SUITES = (
     ("test_transforms.py", True, False),
+    ("test_split_machine.py", True, True),
     ("test_opt_passes.py", True, False),
     ("test_convergence.py", True, False),
     ("test_cfg_convergence.py", True, False),
@@ -54,6 +55,10 @@ def main():
     work_dir.mkdir(parents=True, exist_ok=True)
     suite_dir = Path(__file__).resolve().parent
     for script, needs_opt, accepts_objdump in SUITES:
+        if script == "test_split_machine.py" and not objdump:
+            print("skipping final-code split test (pass --objdump to run it)",
+                  flush=True)
+            continue
         suite_work_dir = work_dir / Path(script).stem
         command = [
             sys.executable, str(suite_dir / script),
