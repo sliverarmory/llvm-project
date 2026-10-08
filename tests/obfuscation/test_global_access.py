@@ -200,6 +200,54 @@ def disassemble_symbol(objdump, object_path, symbol):
     return result.stdout.lower()
 
 
+def check_elf_slot_relocation(objdump, object_path, helper, global_name):
+    # ELF assemblers can relocate a local slot through its section symbol.
+    # Follow the helper's slot-section relocation, then check that the slot's
+    # relocation resolves to the selected global's section and exact offset.
+    slot_match = re.search(
+        r"\br_[a-z0-9_]+\s+(\.data\.rel\.ro(?:\.local)?)"
+        r"(?:[+-]0x[0-9a-f]+)?\b", helper,
+    )
+    assert slot_match, "ELF helper does not address a read-only pointer slot"
+    slot_section = slot_match.group(1)
+    relocations = run([objdump, "-r", str(object_path)]).stdout.lower()
+    section_match = re.search(
+        rf"(?ms)^relocation records for \[{re.escape(slot_section)}\]:\n"
+        r"(.*?)(?=^relocation records for \[|\Z)", relocations,
+    )
+    assert section_match, "ELF pointer-slot relocation section is missing"
+    target_match = re.search(
+        r"(?m)^0+\s+r_[a-z0-9_]+\s+(\S+)", section_match.group(1)
+    )
+    assert target_match, "ELF pointer slot has no relocation at offset zero"
+    target = target_match.group(1)
+    if target == global_name:
+        return
+
+    symbols = run([objdump, "-t", str(object_path)]).stdout.lower()
+    symbol = None
+    for line in symbols.splitlines():
+        fields = line.split()
+        if len(fields) >= 5 and fields[-1] == global_name:
+            symbol = fields
+            break
+    assert symbol, f"ELF symbol table has no {global_name}"
+    symbol_offset = int(symbol[0], 16)
+    symbol_section = symbol[-3]
+    if target == symbol_section:
+        relocation_offset = 0
+    elif target.startswith(symbol_section + "+0x"):
+        relocation_offset = int(target[len(symbol_section) + 1:], 16)
+    else:
+        raise AssertionError(
+            f"ELF pointer slot targets {target}, not {global_name}'s section"
+        )
+    assert relocation_offset == symbol_offset, (
+        f"ELF pointer slot targets offset {relocation_offset:#x}, "
+        f"not {global_name} at {symbol_offset:#x}"
+    )
+
+
 def check_object_pattern(clang, source, work_dir, objdump, required):
     if not objdump:
         print("object disassembly skipped: no llvm-objdump/objdump found", flush=True)
@@ -240,6 +288,14 @@ def check_object_pattern(clang, source, work_dir, objdump, required):
                 r"relocation records for \[\.rdata\]:[\s\S]*?"
                 r"image_rel_amd64_addr64\s+selected_value\b", relocations
             ), "COFF pointer-slot section does not point to selected_value"
+        elif "file format elf" in helper:
+            direct_slot = re.search(
+                r"\br_[a-z0-9_]+\s+\.obf\.gai\.selected_value"
+                r"(?:[+-]0x[0-9a-f]+)?\b", helper,
+            )
+            if not direct_slot:
+                check_elf_slot_relocation(objdump, objects["selected"], helper,
+                                          "selected_value")
         else:
             assert ".obf.gai.selected_value" in helper, (
                 "selected() calls a helper, but its object lacks a slot relocation"
