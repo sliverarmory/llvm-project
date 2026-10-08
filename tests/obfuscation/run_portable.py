@@ -19,6 +19,7 @@ SUITES = (
     ("test_objc_metadata.py", True, False),
     ("test_constant_encoding.py", True, True),
     ("test_global_access.py", True, True),
+    ("rust/test_string_data.py", True, False),
 )
 
 

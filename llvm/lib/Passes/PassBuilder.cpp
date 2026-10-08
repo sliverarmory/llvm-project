@@ -655,10 +655,11 @@ PassBuilder::PassBuilder(TargetMachine *TM, PipelineTuningOptions PTO,
     if (isSelected(RustObfuscationPass::String))
       registerPipelineStartEPCallback(
           [](ModulePassManager &MPM, OptimizationLevel) {
-            // Encode eligible strings before pre-link simplification can
-            // copy or fold plaintext, and before embedded bitcode is written.
-            // Link-time pipelines do not invoke this callback.
-            MPM.addPass(StringObfuscationPass(/*Flag=*/true));
+            // Encode Rust byte-array literals before pre-link simplification
+            // can copy or fold their plaintext, and before embedded bitcode
+            // is written. Link-time pipelines do not invoke this callback.
+            MPM.addPass(StringObfuscationPass(/*Flag=*/true,
+                                              /*RustByteArrays=*/true));
           });
     registerOptimizerLastEPCallback(
         [](ModulePassManager &MPM, OptimizationLevel Level,

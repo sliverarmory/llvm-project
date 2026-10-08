@@ -133,6 +133,15 @@ jobs:
             --work-dir build-llvm-project/rust-m2 \
             --online
 
+      - name: Verify Rust byte strings and FFI static library
+        run: |
+          set -euo pipefail
+          python3 -B tests/obfuscation/rust/test_string_data.py \
+            --opt build-llvm-project/bin/opt \
+            --clang build-llvm-project/bin/clang \
+            --rustc build-rust-1.99/build/x86_64-unknown-linux-gnu/stage1/bin/rustc \
+            --work-dir build-llvm-project/rust-m3
+
       - name: Verify portable obfuscation suites
         run: |
           set -euo pipefail
@@ -172,6 +181,7 @@ jobs:
             build-llvm-project/rust-m0/rust-m0-report.json
             build-llvm-project/rust-m0/*.ll
             build-llvm-project/rust-m2/*-report.json
+            build-llvm-project/rust-m3/*.ll
             build-llvm-project/portable-rust-m0/**/*.ll
             build-llvm-project/http-rust-m0/*.ll
           if-no-files-found: ignore
