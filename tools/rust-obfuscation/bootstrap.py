@@ -427,7 +427,7 @@ def main() -> int:
                 )
                 print(f"{system_search_variable}={env[system_search_variable]}", flush=True)
             subprocess.run(
-                [sys.executable, "x.py", "--config", str(config_path),
+                [sys.executable, "x.py", "--config", str(config_path), "--stage", "1",
                  "build", "compiler/rustc", "library/std", "library/proc_macro"],
                 cwd=source, env=env, check=True,
             )
