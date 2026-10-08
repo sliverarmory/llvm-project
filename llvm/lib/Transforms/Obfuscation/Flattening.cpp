@@ -15,10 +15,13 @@
 #include "llvm/Transforms/Obfuscation/Flattening.h"
 #include "llvm/Transforms/Obfuscation/CryptoUtils.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/IR/CFG.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/Transforms/Utils.h"
 #include "llvm/Transforms/Utils/LowerSwitch.h"
+#include <algorithm>
+#include <iterator>
 #include <memory>
 
 #define DEBUG_TYPE "flattening"
@@ -147,6 +150,12 @@ PreservedAnalyses FlatteningPass::run(Function &F,
     return flattenNormalEHBranches(F) ? PreservedAnalyses::none()
                                       : PreservedAnalyses::all();
   Instruction *EntryTerm = F.getEntryBlock().getTerminator();
+  // The legacy dispatcher moves the entry block outside its case table.
+  // Re-entering it from a loop would repeat the initial-state store.
+  if (!pred_empty(&F.getEntryBlock())) {
+    reportObfuscationSkip("fla", "function", F.getName(), "entry-backedge");
+    return PreservedAnalyses::all();
+  }
   if (!isa<BranchInst>(EntryTerm) && !isa<SwitchInst>(EntryTerm)) {
     reportObfuscationSkip("fla", "function", F.getName(),
                           "entry-terminator");
@@ -272,6 +281,7 @@ bool Flattening::flatten(Function *f) {
     br = cast<BranchInst>(insert->getTerminator());
   }
 
+  unsigned InitialIndex = 0;
   if ((br != NULL && br->isConditional()) ||
       insert->getTerminator()->getNumSuccessors() > 1) {
     BasicBlock::iterator i = insert->end();
@@ -283,8 +293,29 @@ bool Flattening::flatten(Function *f) {
 
     BasicBlock *tmpBB = insert->splitBasicBlock(i, "first");
     origBB.insert(origBB.begin(), tmpBB);
+  } else {
+    // An unconditional entry can branch to any original block. Resolve its
+    // case before mutating the CFG so an unsupported entry leaves no edits.
+    auto *InitialBranch = dyn_cast<BranchInst>(insert->getTerminator());
+    if (!InitialBranch || !InitialBranch->isUnconditional()) {
+      reportObfuscationSkip("fla", "function", f->getName(),
+                            "entry-not-unconditional");
+      return false;
+    }
+    auto InitialCase = std::find(origBB.begin(), origBB.end(),
+                                 InitialBranch->getSuccessor(0));
+    if (InitialCase == origBB.end()) {
+      reportObfuscationSkip("fla", "function", f->getName(),
+                            "entry-successor-unsupported");
+      return false;
+    }
+    InitialIndex = std::distance(origBB.begin(), InitialCase);
   }
 
+  // The first state must follow the entry's original successor. Optimized
+  // Rust often places its return block before the loop body in IR order, so
+  // assuming case zero can dispatch directly to the return with an
+  // uninitialized value.
   // Remove jump
   insert->getTerminator()->eraseFromParent();
 
@@ -293,7 +324,8 @@ bool Flattening::flatten(Function *f) {
       new AllocaInst(Type::getInt32Ty(f->getContext()), 0, "switchVar", insert);
   new StoreInst(
       ConstantInt::get(Type::getInt32Ty(f->getContext()),
-                       llvm::cryptoutils->scramble32(0, scrambling_key)),
+                       llvm::cryptoutils->scramble32(InitialIndex,
+                                                     scrambling_key)),
       switchVar, insert);
 
   // Create main loop

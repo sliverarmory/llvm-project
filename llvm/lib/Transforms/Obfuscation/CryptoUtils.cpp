@@ -17,6 +17,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Transforms/Obfuscation/CryptoUtils.h"
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringRef.h"
@@ -27,8 +28,11 @@
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/ManagedStatic.h"
 #include "llvm/Support/RandomNumberGenerator.h"
+#include "llvm/Support/SHA256.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <algorithm>
+#include <array>
 #include <cassert>
 #include <cstdio>
 #include <cstring>
@@ -56,6 +60,62 @@ ManagedStatic<CryptoUtils> cryptoutils;
 static cl::opt<std::string> ObfuscationTestSeed(
     "obf-test-seed", cl::Hidden, cl::value_desc("32 hexadecimal digits"),
     cl::desc("Fixed obfuscation seed for reproducible tests only"));
+
+namespace {
+struct TestRandomStream {
+  bool Active = false;
+  std::array<uint8_t, 32> Key{};
+  std::array<uint8_t, 32> Block{};
+  uint64_t Counter = 0;
+  size_t Offset = 32;
+};
+
+thread_local TestRandomStream CurrentTestStream;
+
+void hashFramed(SHA256 &Hash, StringRef Part) {
+  uint8_t Length[8];
+  uint64_t Size = Part.size();
+  for (unsigned I = 0; I != 8; ++I)
+    Length[I] = static_cast<uint8_t>(Size >> (56 - 8 * I));
+  Hash.update(ArrayRef<uint8_t>(Length));
+  Hash.update(Part);
+}
+} // namespace
+
+void llvm::clearObfuscationRandomContext() {
+  CurrentTestStream.Active = false;
+}
+
+void llvm::setObfuscationRandomContext(StringRef Pass, StringRef RawSymbol) {
+  CurrentTestStream.Active = false;
+  if (!ObfuscationTestSeed.getNumOccurrences())
+    return;
+
+  StringRef Hex(ObfuscationTestSeed.getValue());
+  Hex.consume_front("0x");
+  if (Hex.size() != 32)
+    report_fatal_error("invalid -obf-test-seed: expected 32 hexadecimal "
+                       "digits with optional 0x prefix");
+  std::array<uint8_t, 16> Seed{};
+  for (size_t I = 0; I != Seed.size(); ++I) {
+    unsigned High = hexDigitValue(Hex[2 * I]);
+    unsigned Low = hexDigitValue(Hex[2 * I + 1]);
+    if (High == ~0U || Low == ~0U)
+      report_fatal_error("invalid -obf-test-seed: expected 32 hexadecimal "
+                         "digits with optional 0x prefix");
+    Seed[I] = static_cast<uint8_t>((High << 4) | Low);
+  }
+
+  SHA256 Hash;
+  Hash.update("llvm-obfuscation-test-stream-v1");
+  Hash.update(ArrayRef<uint8_t>(Seed));
+  hashFramed(Hash, Pass);
+  hashFramed(Hash, RawSymbol);
+  CurrentTestStream.Key = Hash.final();
+  CurrentTestStream.Counter = 0;
+  CurrentTestStream.Offset = CurrentTestStream.Block.size();
+  CurrentTestStream.Active = true;
+}
 
 const uint32_t AES_RCON[10] = {
     0x01000000UL, 0x02000000UL, 0x04000000UL, 0x08000000UL, 0x10000000UL,
@@ -635,6 +695,32 @@ void CryptoUtils::get_bytes(char *buffer, const int len) {
   assert(len > 0 && "CryptoUtils::get_bytes len <= 0");
 
   statsGetBytes++;
+  if (CurrentTestStream.Active && ObfuscationTestSeed.getNumOccurrences()) {
+    int Written = 0;
+    while (Written < len) {
+      if (CurrentTestStream.Offset == CurrentTestStream.Block.size()) {
+        SHA256 Hash;
+        Hash.update(ArrayRef<uint8_t>(CurrentTestStream.Key));
+        uint8_t Counter[8];
+        for (unsigned I = 0; I != 8; ++I)
+          Counter[I] = static_cast<uint8_t>(
+              CurrentTestStream.Counter >> (56 - 8 * I));
+        Hash.update(ArrayRef<uint8_t>(Counter));
+        CurrentTestStream.Block = Hash.final();
+        ++CurrentTestStream.Counter;
+        CurrentTestStream.Offset = 0;
+      }
+      size_t Available = CurrentTestStream.Block.size() -
+                         CurrentTestStream.Offset;
+      size_t Amount = std::min<size_t>(Available, len - Written);
+      memcpy(buffer + Written,
+             CurrentTestStream.Block.data() + CurrentTestStream.Offset,
+             Amount);
+      CurrentTestStream.Offset += Amount;
+      Written += Amount;
+    }
+    return;
+  }
   std::lock_guard<std::mutex> Lock(Mutex);
 
   if (len > 0) {

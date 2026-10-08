@@ -71,6 +71,33 @@ def check_opt(opt: Path) -> None:
             raise AssertionError(f"{stage}: expected {expected}, got {actual}")
         print(f"PASS opt {stage}: {', '.join(actual) or 'no postlink rerun'}")
 
+    # Cargo selects packages before rustc runs. In this mode the selected
+    # package is rewritten before LTO merges modules, and its link-time
+    # pipeline cannot rewrite an unselected dependency or sysroot module.
+    prelink_stages = (
+        ("default<O0>", ALL),
+        ("default<O2>", ALL),
+        ("thinlto-pre-link<O0>", ALL),
+        ("thinlto-pre-link<O2>", ALL),
+        ("lto-pre-link<O2>", ALL),
+        ("thinlto<O0>", ()),
+        ("thinlto<O2>", ()),
+        ("lto<O0>", ()),
+        ("lto<O2>", ()),
+    )
+    for stage, expected in prelink_stages:
+        result = run(
+            str(opt), "-rust-obf-pipeline=all", "-rust-obf-prelink-only",
+            f"-passes={stage}", "-print-pipeline-passes=text",
+            "-disable-output", os.devnull,
+        )
+        actual = selected_passes(result.stdout)
+        if actual != expected:
+            raise AssertionError(
+                f"prelink-only {stage}: expected {expected}, got {actual}")
+        print(f"PASS opt prelink-only {stage}: "
+              f"{', '.join(actual) or 'no postlink rerun'}")
+
     for stage in ("default<O0>", "default<O2>", "thinlto<O2>", "lto<O2>"):
         result = run(
             str(opt), f"-passes={stage}", "-print-pipeline-passes=text",

@@ -4,9 +4,10 @@
 intercepts each rustc invocation. Package rules resolve through `cargo metadata`
 to exact manifest directories, so a workspace member and a registry dependency
 with similar crate names cannot be confused. The wrapper adds the milestone-1
-LLVM pipeline only to selected target crates. Cargo host build scripts and proc
-macros are excluded. It writes a JSON manifest from structured LLVM events
-after Cargo finishes.
+LLVM pipeline only to selected target crates. It schedules the late passes
+before LTO imports or merges crate modules, preserving package selection in
+Thin and fat LTO. Cargo host build scripts and proc macros are excluded. It
+writes a JSON manifest from structured LLVM events after Cargo finishes.
 
 Build the wrapper with a host Rust toolchain:
 
@@ -51,8 +52,13 @@ rust-obf-cargo --config obfuscation.json --report rust-obf-report.json -- build 
 launcher adds an explicit target triple when absent. This separates target
 crates from host build dependencies and proc macros. It uses a fresh target
 directory for each invocation, so the report cannot mistake a cached artifact
-for a newly transformed one. Milestone 5 will qualify incremental reuse and
-cross-crate LTO. If another `RUSTC_WRAPPER` or `RUSTC_WORKSPACE_WRAPPER` is
+for a newly transformed one. For an incremental build, pass
+`--reuse-target-dir /absolute/target/path` before `--`. Reuse is allowed only
+when the selected rules, seed, compiler and wrapper binary stamps, exact Cargo
+arguments, and workspace lockfile match the first build. A no-op cached build
+reports `no-selected-crate-compiled` and fails strict coverage; touching or
+changing a selected source makes Cargo compile it again and generates fresh
+effect events. If another `RUSTC_WRAPPER` or `RUSTC_WORKSPACE_WRAPPER` is
 already set, the launcher stops with an error; it does not silently skip that
 wrapper.
 
@@ -86,3 +92,16 @@ The event and target directories sit beside the requested report for audit.
 Treat the report as build evidence, not as proof that effects survived final
 linking. The focused Cargo regression runs the executable and inspects its
 linked output in addition to checking the report.
+
+The LTO gate builds a selected workspace library and a mirrored unselected
+library, then checks both in the linked app. It covers O2/O3, one/four codegen
+units, `lto="off"`, `lto=false`, ThinLTO, and fat LTO; it also checks the
+remaining selected pass families under Thin/Fat LTO and an incremental rebuild:
+
+```sh
+python3 tests/obfuscation/rust/test_lto.py \
+  --wrapper /path/to/rust-obf-cargo \
+  --rustc /path/to/custom-rust-1.99/bin/rustc \
+  --objdump build-llvm-project/bin/llvm-objdump \
+  --work-dir /tmp/rust-obf-lto
+```

@@ -28,7 +28,14 @@
 namespace llvm {
 
 class CryptoUtils;
+class StringRef;
 extern ManagedStatic<CryptoUtils> cryptoutils;
+
+// The fixed test seed uses a separate stream per selected raw symbol so CGU
+// scheduling and pass traversal order cannot change its obfuscation bytes.
+// With no test seed these calls do nothing; CryptoUtils keeps using entropy.
+void setObfuscationRandomContext(StringRef Pass, StringRef RawSymbol);
+void clearObfuscationRandomContext();
 
 #define BYTE(x, n) (((x) >> (8 * (n))) & 0xFF)
 

@@ -1,4 +1,5 @@
 #include "llvm/Transforms/Obfuscation/Utils.h"
+#include "llvm/Transforms/Obfuscation/CryptoUtils.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Demangle/Demangle.h"
@@ -188,6 +189,7 @@ std::string readAnnotate(Function *F) {
 }
 
 bool toObfuscate(bool flag, Function *f, std::string const &attribute) {
+  clearObfuscationRandomContext();
   std::string NegativeAttribute = "no" + attribute;
   bool Positive = false;
   bool Negative = false;
@@ -216,5 +218,6 @@ bool toObfuscate(bool flag, Function *f, std::string const &attribute) {
     reportObfuscationSkip(attribute, "function", f->getName(), "not-selected");
     return false;
   }
+  setObfuscationRandomContext(attribute, f->getName());
   return true;
 }

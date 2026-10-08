@@ -34,14 +34,25 @@ running those passes again after LTO. Rust's `PreLinkNoLTO` mode can also run
 the ThinLTO pre-link simplifier while writing embedded bitcode; its subsequent
 non-LTO optimization phase is the one that gets the late passes.
 
-This is once per selected module's intended LLVM pipeline stage. Multiple
-codegen units, separate rustc invocations, and imported or merged cross-crate
-code need the selection and LTO policy gates in milestones 2 and 5. In
-particular, this option alone is process-wide; do not assume that it isolates
-one crate from dependencies or the sysroot during LTO. External linker-plugin
-LTO is not qualified: the linker process must receive this LLVM option and
-use the corresponding PassBuilder callbacks, which this Rust toolchain
-workflow does not arrange.
+For exact Cargo package selection, `rust-obf-cargo` adds
+`-rust-obf-prelink-only`. This mode runs the six late passes in the selected
+crate's Thin/Fat pre-link optimizer-last callback, before LLVM assigns global
+GUIDs and writes bitcode. It skips those passes after LTO imports or merges
+modules, where the final app's process-wide LLVM options no longer identify
+which dependency supplied each function. In local ThinLTO, Rust builds a
+pre-link bitcode pipeline and then an ordinary object-code pipeline in the
+same `PassBuilder`; the callback schedules the selected passes in the first
+pipeline only. Without an LTO pre-link pipeline, the ordinary optimizer-last
+callback runs them once. Rust's `-C passes` appends passes after pre-link GUID
+assignment and is unsuitable for passes that add globals under Thin/Fat LTO.
+
+The unqualified `-rust-obf-pipeline` option remains process-wide; use the
+Cargo wrapper's package selection and pre-link mode for cross-crate LTO. The
+fixed test seed now derives a stream per pass and raw symbol, so parallel CGU
+execution order does not change selected bytes. Without a test seed, the
+entropy-backed generator is unchanged. External linker-plugin LTO remains
+outside this Rust toolchain workflow because its linker process does not
+receive the wrapper's package selection.
 
 Clang's existing `-mllvm -sobf`, `-split`, `-bcf`, `-fla`, `-sub`, `-constenc`,
 and `-gai` callbacks remain the legacy path. If the new option is supplied to

@@ -410,6 +410,7 @@
 #include "llvm/Transforms/Vectorize/SLPVectorizer.h"
 #include "llvm/Transforms/Vectorize/SandboxVectorizer/SandboxVectorizer.h"
 #include "llvm/Transforms/Vectorize/VectorCombine.h"
+#include <memory>
 #include <optional>
 
 using namespace llvm;
@@ -447,6 +448,14 @@ static cl::list<RustObfuscationPass> RustObfuscationPipeline(
                    "Encode selected integer constants"),
         clEnumValN(RustObfuscationPass::GlobalAccessIndirection,
                    "obf-global-access", "Indirect selected global accesses")));
+
+// A selected Rust dependency must be transformed while its crate identity is
+// still known. Once Thin/Fat LTO imports or merges modules, the final crate's
+// process-wide LLVM options cannot distinguish selected dependency code from
+// unselected dependencies or the sysroot.
+static cl::opt<bool> RustObfuscationPrelinkOnly(
+    "rust-obf-prelink-only", cl::init(false),
+    cl::desc("Run selected Rust obfuscation passes before LTO, not after it"));
 
 static bool isSelected(RustObfuscationPass Pass) {
   for (RustObfuscationPass Selected : RustObfuscationPipeline)
@@ -652,6 +661,11 @@ PassBuilder::PassBuilder(TargetMachine *TM, PipelineTuningOptions PTO,
   if (TM)
     TM->registerPassBuilderCallbacks(*this);
   if (isRustObfuscationPipelineEnabled()) {
+    // Rust's local ThinLTO path builds a pre-link pipeline to write embedded
+    // bitcode, followed by a non-LTO pipeline for its immediate object file.
+    // Both use this PassBuilder. Remember whether the pre-link callback was
+    // scheduled so the same module is not transformed in both pipelines.
+    auto ScheduledPrelink = std::make_shared<bool>(false);
     if (isSelected(RustObfuscationPass::String))
       registerPipelineStartEPCallback(
           [](ModulePassManager &MPM, OptimizationLevel) {
@@ -662,8 +676,19 @@ PassBuilder::PassBuilder(TargetMachine *TM, PipelineTuningOptions PTO,
                                               /*RustByteArrays=*/true));
           });
     registerOptimizerLastEPCallback(
-        [](ModulePassManager &MPM, OptimizationLevel Level,
+        [ScheduledPrelink](ModulePassManager &MPM, OptimizationLevel Level,
            ThinOrFullLTOPhase Phase) {
+          if (RustObfuscationPrelinkOnly) {
+            if (Phase == ThinOrFullLTOPhase::ThinLTOPreLink ||
+                Phase == ThinOrFullLTOPhase::FullLTOPreLink) {
+              *ScheduledPrelink = true;
+              addLateRustObfuscationPasses(MPM);
+            } else if (Phase == ThinOrFullLTOPhase::None &&
+                       !*ScheduledPrelink) {
+              addLateRustObfuscationPasses(MPM);
+            }
+            return;
+          }
           // Rust 1.99 uses buildO0DefaultPipeline for every pre-link O0
           // stage; its ThinLTO and full-LTO O0 backends have no matching
           // optimizer-last callback. For optimized builds, run on non-LTO
@@ -676,7 +701,7 @@ PassBuilder::PassBuilder(TargetMachine *TM, PipelineTuningOptions PTO,
     registerFullLinkTimeOptimizationLastEPCallback(
         [](ModulePassManager &MPM, OptimizationLevel Level) {
           // The O0 pre-link pipeline already ran these passes.
-          if (Level != OptimizationLevel::O0)
+          if (!RustObfuscationPrelinkOnly && Level != OptimizationLevel::O0)
             addLateRustObfuscationPasses(MPM);
         });
   }

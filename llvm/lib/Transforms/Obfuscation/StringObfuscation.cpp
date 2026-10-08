@@ -399,6 +399,7 @@ public:
       }
 
       auto *CDS = cast<ConstantDataSequential>(GV->getInitializer());
+      setObfuscationRandomContext("sobf", GV->getName());
       uint8_t Key = cryptoutils->get_uint8_t();
       uint8_t Step = static_cast<uint8_t>(cryptoutils->get_uint8_t() | 1U);
 
@@ -448,6 +449,12 @@ private:
   void addDecodeFunction(Module &M, const std::vector<EncodedGlobal> &GVars) {
     FunctionType *FuncTy =
         FunctionType::get(Type::getVoidTy(M.getContext()), {}, false);
+    std::string DecoderIdentity = "decoder";
+    for (const EncodedGlobal &GVar : GVars) {
+      StringRef Name = GVar.Var->getName();
+      DecoderIdentity += "/" + std::to_string(Name.size()) + ":" + Name.str();
+    }
+    setObfuscationRandomContext("sobf", DecoderIdentity);
     std::string Name =
         ".datadiv_decode" + std::to_string(cryptoutils->get_uint64_t());
     FunctionCallee Callee = M.getOrInsertFunction(Name, FuncTy);

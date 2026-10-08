@@ -67,12 +67,15 @@ struct Runtime {
     rules: Vec<ResolvedRule>,
     host: String,
     work_dir: PathBuf,
+    target_dir: PathBuf,
+    reused_target_dir: bool,
 }
 
 #[derive(Debug, Deserialize)]
 struct Metadata {
     packages: Vec<MetadataPackage>,
     workspace_members: Vec<String>,
+    workspace_root: PathBuf,
 }
 
 #[derive(Debug, Deserialize)]
@@ -134,6 +137,8 @@ struct BuildReport {
     rustc: PathBuf,
     cargo_command: Vec<String>,
     cargo_exit_code: i32,
+    target_dir: PathBuf,
+    reused_target_dir: bool,
     code_artifact: bool,
     coverage_status: String,
     strict_passed: bool,
@@ -338,6 +343,7 @@ fn launcher() -> io::Result<i32> {
     let args: Vec<OsString> = env::args_os().skip(1).collect();
     let mut config_path = None;
     let mut report_path = None;
+    let mut reuse_target_dir = None;
     let mut separator = None;
     let mut i = 0;
     while i < args.len() {
@@ -346,20 +352,21 @@ fn launcher() -> io::Result<i32> {
             separator = Some(i);
             break;
         }
-        if arg == "--config" || arg == "--report" {
+        if matches!(arg.as_ref(), "--config" | "--report" | "--reuse-target-dir") {
             let value = args
                 .get(i + 1)
                 .ok_or_else(|| fail(format!("{arg} needs a path")))?;
-            if arg == "--config" {
-                config_path = Some(PathBuf::from(value));
-            } else {
-                report_path = Some(PathBuf::from(value));
+            match arg.as_ref() {
+                "--config" => config_path = Some(PathBuf::from(value)),
+                "--report" => report_path = Some(PathBuf::from(value)),
+                "--reuse-target-dir" => reuse_target_dir = Some(PathBuf::from(value)),
+                _ => unreachable!(),
             }
             i += 2;
             continue;
         }
         return Err(fail(
-            "usage: rust-obf-cargo --config FILE --report FILE -- build [Cargo args]",
+            "usage: rust-obf-cargo --config FILE --report FILE [--reuse-target-dir DIR] -- build [Cargo args]",
         ));
     }
     let separator = separator.ok_or_else(|| fail("missing -- before Cargo command"))?;
@@ -411,10 +418,23 @@ fn launcher() -> io::Result<i32> {
         .clone()
         .unwrap_or_else(|| PathBuf::from("cargo"));
     let metadata = cargo_metadata(&cargo, cargo_args)?;
+    let lockfile = metadata.workspace_root.join("Cargo.lock");
     let rules = resolve_rules(&config, &metadata)?;
     let work_dir = unique_dir(&report_path.with_extension("rust-obf-events"))?;
     fs::create_dir(work_dir.join("invocations"))?;
     fs::create_dir(work_dir.join("events"))?;
+    let reused_target_dir = reuse_target_dir.is_some();
+    let target_dir = if let Some(path) = reuse_target_dir {
+        let absolute = if path.is_absolute() {
+            path
+        } else {
+            env::current_dir()?.join(path)
+        };
+        fs::create_dir_all(&absolute)?;
+        absolute.canonicalize()?
+    } else {
+        work_dir.join("target")
+    };
     let runtime = Runtime {
         config: Config {
             rustc: rustc.clone(),
@@ -423,10 +443,61 @@ fn launcher() -> io::Result<i32> {
         rules,
         host: host.clone(),
         work_dir: work_dir.clone(),
+        target_dir: target_dir.clone(),
+        reused_target_dir,
     };
+    let wrapper = env::current_exe()?.canonicalize()?;
+    if reused_target_dir {
+        // Cargo does not see the rustc flags added inside this wrapper when
+        // it fingerprints dependencies. Refuse to reuse artifacts built with
+        // a different selection, seed, wrapper, compiler, build profile, or
+        // dependency lockfile. A no-op reuse still yields no fresh coverage.
+        let stamp = |path: &Path| -> io::Result<(u64, u128)> {
+            let metadata = fs::metadata(path)?;
+            let modified = metadata
+                .modified()?
+                .duration_since(UNIX_EPOCH)
+                .map_err(io::Error::other)?
+                .as_nanos();
+            Ok((metadata.len(), modified))
+        };
+        let lock_data = match fs::read(&lockfile) {
+            Ok(data) => Some(data),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        let identity = serde_json::to_vec(&(
+            &runtime.config,
+            &runtime.rules,
+            cargo_args
+                .iter()
+                .map(|arg| arg.to_string_lossy().to_string())
+                .collect::<Vec<_>>(),
+            stamp(&rustc)?,
+            stamp(&wrapper)?,
+            lock_data,
+        ))
+        .map_err(io::Error::other)?;
+        let guard = target_dir.join(".rust-obf-target-identity");
+        if guard.exists() {
+            if fs::read(&guard)? != identity {
+                return Err(fail(format!(
+                    "{}: target was built with a different build identity; use a fresh directory",
+                    target_dir.display()
+                )));
+            }
+        } else {
+            if fs::read_dir(&target_dir)?.next().is_some() {
+                return Err(fail(format!(
+                    "{}: target is not empty and has no obfuscation identity",
+                    target_dir.display()
+                )));
+            }
+            fs::write(guard, identity)?;
+        }
+    }
     let runtime_path = work_dir.join("runtime.json");
     write_json(&runtime_path, &runtime)?;
-    let wrapper = env::current_exe()?.canonicalize()?;
     let mut command = Command::new(&cargo);
     command.args(cargo_args);
     if !cargo_args
@@ -440,7 +511,7 @@ fn launcher() -> io::Result<i32> {
         .env("RUSTC_WRAPPER", &wrapper)
         .env("RUST_OBF_WRAPPER_MODE", "1")
         .env("RUST_OBF_RUNTIME_CONFIG", &runtime_path)
-        .env("CARGO_TARGET_DIR", work_dir.join("target"))
+        .env("CARGO_TARGET_DIR", &target_dir)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
@@ -582,7 +653,13 @@ fn wrapper() -> io::Result<i32> {
     });
     if let Some((_, resolved)) = selected {
         let rule = &resolved.rule;
-        let mut llvm = format!("-rust-obf-pipeline={}", rule.passes.join(","));
+        // Apply a selected package's late passes before LTO imports/merges
+        // modules. The final app invocation is often unselected, and its
+        // post-link pipeline has no reliable package identity for imports.
+        let mut llvm = format!(
+            "-rust-obf-pipeline={} -rust-obf-prelink-only",
+            rule.passes.join(",")
+        );
         if let Some(seed) = &runtime.config.seed {
             llvm.push_str(&format!(" -obf-test-seed={seed}"));
         }
@@ -799,6 +876,8 @@ fn aggregate(
             .map(|arg| arg.to_string_lossy().to_string())
             .collect(),
         cargo_exit_code,
+        target_dir: runtime.target_dir.clone(),
+        reused_target_dir: runtime.reused_target_dir,
         code_artifact,
         coverage_status: if check {
             "no-protected-code-artifact"

@@ -31,8 +31,8 @@ def check_bcf_probability(clang, work_dir):
         "  ret i32 %a\n"
         "}\n", encoding="utf-8",
     )
-    # This deterministic draw is 99, so a 99% rate must skip the only block.
-    seed = "000000000000000000000000000000cd"
+    # The bcf/target test stream draws 99, so a 99% rate skips this block.
+    seed = "00000000000000000000000000000024"
     for probability, transformed in ((99, False), (100, True)):
         output = work_dir / f"bcf-probability-{probability}.ll"
         result = compile_ir(
