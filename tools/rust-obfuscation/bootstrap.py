@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Prepare or build a pinned stage-1 Rust compiler against this LLVM fork.
 
-Milestone 0 supports native macOS arm64 and Linux amd64. The source archive is
-verified before extraction; an existing git checkout must be at the pinned
-commit. `check` is read-only, `prepare` writes a separate bootstrap config,
-and `build` also starts the long Rust bootstrap.
+Milestone 0 supports native macOS arm64, Linux amd64/arm64, and Windows amd64
+(MSVC). The source archive is verified before extraction; an existing git
+checkout must be at the pinned commit. `check` is read-only, `prepare` writes
+a separate bootstrap config, and `build` also starts the long Rust bootstrap.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ import os
 import platform
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -62,7 +63,25 @@ def host_triple() -> str:
         return "aarch64-apple-darwin"
     if system == "Linux" and machine in ("x86_64", "amd64"):
         return "x86_64-unknown-linux-gnu"
-    raise RuntimeError(f"milestone 0 has no native bootstrap recipe for {system}/{machine}")
+    if system == "Linux" and machine in ("arm64", "aarch64"):
+        return "aarch64-unknown-linux-gnu"
+    if system == "Windows" and machine in ("x86_64", "amd64"):
+        return "x86_64-pc-windows-msvc"
+    raise RuntimeError(f"no native bootstrap recipe for {system}/{machine}")
+
+
+def check_msvc_environment(host: str) -> None:
+    if not host.endswith("windows-msvc"):
+        return
+    target_arch = os.environ.get("VSCMD_ARG_TGT_ARCH")
+    if target_arch and target_arch.lower() not in ("x64", "amd64"):
+        raise RuntimeError(f"Windows MSVC bootstrap needs vcvars64.bat, got {target_arch} target")
+    if (not shutil.which("cl.exe") or not shutil.which("link.exe")
+            or not os.environ.get("INCLUDE") or not os.environ.get("LIB")):
+        raise RuntimeError(
+            "Windows MSVC bootstrap needs a Visual Studio x64 developer command prompt "
+            "(vcvars64.bat): cl.exe, link.exe, INCLUDE, and LIB must be available"
+        )
 
 
 def check_fork() -> None:
@@ -102,9 +121,21 @@ def check_llvm(llvm_config: Path, host: str) -> None:
     if not cache.is_file():
         raise RuntimeError(f"cannot prove LLVM build source without {cache}")
     expected_source = (ROOT / "llvm").resolve()
-    source_line = f"CMAKE_HOME_DIRECTORY:INTERNAL={expected_source}"
-    if source_line not in cache.read_text().splitlines():
+    source_lines = [line.partition("=")[2] for line in cache.read_text().splitlines()
+                    if line.startswith("CMAKE_HOME_DIRECTORY:INTERNAL=")]
+    # CMake uses forward slashes in its cache even when Python uses Windows paths.
+    if len(source_lines) != 1 or Path(source_lines[0]).resolve() != expected_source:
         raise RuntimeError(f"{llvm_config} was not built from {expected_source}")
+
+
+def llvm_archive_target(path: Path) -> str | None:
+    """Return the Ninja target for a native static LLVM archive, if any."""
+    if platform.system() == "Windows":
+        if path.suffix.lower() == ".lib" and path.stem.startswith("LLVM"):
+            return path.stem
+    elif path.suffix == ".a" and path.stem.startswith("libLLVM"):
+        return path.stem.removeprefix("lib")
+    return None
 
 
 def ensure_llvm_libraries(llvm_config: Path, *, build: bool) -> None:
@@ -128,12 +159,11 @@ def ensure_llvm_libraries(llvm_config: Path, *, build: bool) -> None:
         if not missing:
             break
         for path in missing:
-            if (path.parent != libdir or not path.name.startswith("libLLVM")
-                    or path.suffix != ".a"):
+            if path.parent != libdir or not llvm_archive_target(path):
                 raise RuntimeError(f"unexpected llvm-config missing library: {path}")
         if not build or attempt:
             raise RuntimeError("Rust LLVM link libraries missing: " + ", ".join(map(str, missing)))
-        targets = sorted({path.stem.removeprefix("lib") for path in missing})
+        targets = sorted({target for path in missing if (target := llvm_archive_target(path))})
         print(f"building Rust LLVM link libraries: {' '.join(targets)}", flush=True)
         subprocess.run(["ninja", "-C", str(obj_root), *targets], check=True)
     else:
@@ -143,7 +173,7 @@ def ensure_llvm_libraries(llvm_config: Path, *, build: bool) -> None:
         llvm_config, "--link-static", "--libs", "--system-libs",
         *components, "--quote-paths"
     ))
-    lib_names = {Path(lib).name.removeprefix("lib").removesuffix(".a") for lib in libs}
+    lib_names = {name for lib in libs if (name := llvm_archive_target(Path(lib)))}
     lib_names.update(lib.removeprefix("-l") for lib in libs if lib.startswith("-l"))
     missing_libs = {"LLVMPasses", "LLVMObfuscation"} - lib_names
     if missing_libs:
@@ -179,9 +209,40 @@ def darwin_system_library_paths(llvm_config: Path, host: str) -> list[Path]:
     raise RuntimeError("LLVM needs -lzstd but neither CMake nor pkg-config found its library directory")
 
 
+def windows_system_library_paths(llvm_config: Path, host: str) -> list[Path]:
+    if not host.endswith("windows-msvc"):
+        return []
+    components = rust_llvm_components(llvm_config)
+    system_libs = shlex.split(run(
+        llvm_config, "--link-static", "--system-libs", *components, "--quote-paths"
+    ))
+    search_paths = []
+    for lib in system_libs:
+        path = Path(lib)
+        if path.is_absolute() and path.suffix.lower() == ".lib":
+            if not path.is_file():
+                raise RuntimeError(f"LLVM system import library is missing: {path}")
+            search_paths.append(path.parent.resolve())
+
+    # rustc_llvm/build.rs converts full MSVC import-library paths to bare
+    # rustc-link-lib names. Pass the original directories to the MSVC linker.
+    if "zstd.lib" in system_libs and not any((path / "zstd.lib").is_file() for path in search_paths):
+        cache = Path(run(llvm_config, "--obj-root")) / "CMakeCache.txt"
+        for line in cache.read_text().splitlines():
+            if line.startswith("zstd_LIBRARY:FILEPATH="):
+                path = Path(line.split("=", 1)[1])
+                if path.is_file():
+                    search_paths.append(path.parent.resolve())
+                break
+        if not any((path / "zstd.lib").is_file() for path in search_paths):
+            raise RuntimeError("LLVM needs zstd.lib but its CMake library path is unavailable")
+    return list(dict.fromkeys(search_paths))
+
+
 def missing_llvm_tools(llvm_config: Path) -> tuple[Path, list[str]]:
     bindir = Path(run(llvm_config, "--bindir"))
-    return bindir, [name for name in LLVM_TOOLS if not (bindir / name).is_file()]
+    extension = ".exe" if platform.system() == "Windows" else ""
+    return bindir, [name for name in LLVM_TOOLS if not (bindir / f"{name}{extension}").is_file()]
 
 
 def ensure_llvm_tools(llvm_config: Path, *, build: bool) -> None:
@@ -311,7 +372,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("check", "prepare", "build"))
     parser.add_argument("--rust-source", type=Path, default=ROOT / "build-rust-1.99")
-    parser.add_argument("--llvm-config", type=Path, default=ROOT / "build-llvm-project/bin/llvm-config")
+    llvm_config_name = "llvm-config.exe" if platform.system() == "Windows" else "llvm-config"
+    parser.add_argument("--llvm-config", type=Path, default=ROOT / "build-llvm-project/bin" / llvm_config_name)
     parser.add_argument("--archive", type=Path, default=ROOT / "build-rust-1.99-src.tar.xz")
     parser.add_argument("--cargo-home", type=Path,
                         help="writable Cargo cache (default: <rust-source>/build/obfuscation-cargo-home)")
@@ -319,12 +381,19 @@ def main() -> int:
     args = parser.parse_args()
     try:
         host = host_triple()
+        if args.action != "check":
+            check_msvc_environment(host)
         check_fork()
         llvm_config = args.llvm_config.resolve()
         check_llvm(llvm_config, host)
         ensure_llvm_libraries(llvm_config, build=args.action != "check")
         ensure_llvm_tools(llvm_config, build=args.action != "check")
-        system_search_paths = darwin_system_library_paths(llvm_config, host)
+        if host.endswith("windows-msvc"):
+            system_search_paths = windows_system_library_paths(llvm_config, host)
+            system_search_variable = "LIB"
+        else:
+            system_search_paths = darwin_system_library_paths(llvm_config, host)
+            system_search_variable = "LIBRARY_PATH"
         source = args.rust_source.resolve()
         if args.action != "check":
             fetch_rust_source(source, args.archive.resolve())
@@ -352,11 +421,11 @@ def main() -> int:
             env = os.environ.copy()
             env["CARGO_HOME"] = str(cargo_home)
             if system_search_paths:
-                existing = env.get("LIBRARY_PATH", "")
-                env["LIBRARY_PATH"] = os.pathsep.join(
+                existing = env.get(system_search_variable, "")
+                env[system_search_variable] = os.pathsep.join(
                     [*(str(path) for path in system_search_paths), *([existing] if existing else [])]
                 )
-                print(f"LIBRARY_PATH={env['LIBRARY_PATH']}", flush=True)
+                print(f"{system_search_variable}={env[system_search_variable]}", flush=True)
             subprocess.run(
                 [sys.executable, "x.py", "--config", str(config_path),
                  "build", "compiler/rustc", "library/std", "library/proc_macro"],

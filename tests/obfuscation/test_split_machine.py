@@ -79,7 +79,9 @@ def main():
         command = [*clang, "-O2", "-fno-discard-value-names", *flags, str(source)]
         run([*command, "-S", "-emit-llvm", "-o", str(ir_path)])
         run([opt, "-passes=verify", "-disable-output", str(ir_path)])
-        run([*command, "-o", str(executable)])
+        export = (["-Xlinker", "/EXPORT:transform_target"]
+                  if sys.platform == "win32" else [])
+        run([*command, *export, "-o", str(executable)])
         for a, b in CASES:
             actual = run([str(executable), str(a), str(b)], timeout=10)
             assert actual == expected(a, b), f"{name}({a}, {b}): {actual!r}"

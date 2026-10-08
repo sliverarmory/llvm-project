@@ -83,6 +83,13 @@ def compile_rust(rustc, source, ir_path, exe_path, *, opt_level,
         "-C", f"opt-level={opt_level}", "-C", "codegen-units=1",
         "-C", "panic=abort", "-C", "debuginfo=0",
     ]
+    if sys.platform == "win32":
+        # A linked PE need not retain a COFF symbol table. llvm-objdump reads
+        # its export table, which keeps the final-code checks on the executable.
+        exported = {"direct": "transform_target",
+                    "global_access": "global_target",
+                    "https_client": "summarize_checksum"}[source.stem]
+        command.extend(("-C", f"link-arg=/EXPORT:{exported}"))
     if pass_name:
         command.extend(("-C", f"passes={pass_name}"))
     if llvm_options:

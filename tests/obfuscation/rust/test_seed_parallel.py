@@ -75,10 +75,13 @@ def compile_branches(rustc, objdump, source, work_dir, pass_name, seed,
     if pass_name == "bcf":
         options.extend(("-bcf_prob=100", "-bcf_max_blocks=48",
                         "-bcf_max_growth=2048"))
+    exports = ([item for number in range(16)
+                for item in ("-C", f"link-arg=/EXPORT:probe_{number}")]
+               if os.name == "nt" else [])
     command = [str(rustc), "--edition=2024", "-C", "opt-level=2",
                "-C", "codegen-units=4", "-C", "lto=false",
-               "-C", "llvm-args=" + " ".join(options), str(source),
-               "-o", str(binary)]
+               "-C", "llvm-args=" + " ".join(options), *exports,
+               str(source), "-o", str(binary)]
     run(command, env={**os.environ, "RUST_OBF_EVENT_FILE": str(events)})
     records = [json.loads(line) for line in events.read_text().splitlines()]
     effects = {entry["raw_name"] for entry in records
@@ -91,9 +94,13 @@ def check_branches(rustc, objdump, work_dir):
     source = work_dir / "parallel.rs"
     branch_source(source)
     baseline = executable_path(work_dir, "baseline")
-    run([str(rustc), "--edition=2024", "-C", "opt-level=2",
-         "-C", "codegen-units=4", "-C", "lto=false",
-         str(source), "-o", str(baseline)])
+    exports = ([item for number in range(16)
+                for item in ("-C", f"link-arg=/EXPORT:probe_{number}")]
+               if os.name == "nt" else [])
+    baseline_command = [str(rustc), "--edition=2024", "-C", "opt-level=2",
+                        "-C", "codegen-units=4", "-C", "lto=false",
+                        *exports, str(source), "-o", str(baseline)]
+    run(baseline_command)
     expected = run([str(baseline)]).stdout
     assert expected == b"3363439960029110486\n", expected
 

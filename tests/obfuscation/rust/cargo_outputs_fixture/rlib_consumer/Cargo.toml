@@ -1,0 +1,7 @@
+[package]
+name = "obf-output-rlib-consumer"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+obf-output-rlib = { path = "../rlib" }

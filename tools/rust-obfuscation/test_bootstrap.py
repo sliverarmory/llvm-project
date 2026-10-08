@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import importlib.util
+import os
+import shlex
 import tempfile
 import unittest
 from pathlib import Path
@@ -103,6 +105,169 @@ class BootstrapPreflightTests(unittest.TestCase):
              mock.patch.object(bootstrap, "rust_llvm_components", return_value=["ipo"]):
             self.assertEqual(
                 bootstrap.darwin_system_library_paths(self.llvm_config, "aarch64-apple-darwin"),
+                [zstd_dir.resolve()],
+            )
+
+    def test_native_host_triples_include_linux_arm64_and_windows_msvc(self) -> None:
+        cases = (
+            ("Linux", "aarch64", "aarch64-unknown-linux-gnu"),
+            ("Linux", "arm64", "aarch64-unknown-linux-gnu"),
+            ("Windows", "AMD64", "x86_64-pc-windows-msvc"),
+        )
+        for system, machine, expected in cases:
+            with self.subTest(system=system, machine=machine), \
+                 mock.patch.object(bootstrap.platform, "system", return_value=system), \
+                 mock.patch.object(bootstrap.platform, "machine", return_value=machine):
+                self.assertEqual(bootstrap.host_triple(), expected)
+
+    def test_linux_arm64_accepts_aarch64_codegen_build(self) -> None:
+        self.llvm_config.parent.mkdir()
+        self.llvm_config.write_bytes(b"tool")
+        (self.root / "CMakeCache.txt").write_text(
+            f"CMAKE_HOME_DIRECTORY:INTERNAL={bootstrap.ROOT / 'llvm'}\n"
+        )
+
+        def fake_config(*args, **_kwargs):
+            if "--version" in args:
+                return bootstrap.PINS["llvm_version"]
+            if "--assertion-mode" in args:
+                return "ON"
+            if "--targets-built" in args:
+                return "AArch64 X86"
+            if "--obj-root" in args:
+                return str(self.root)
+            raise AssertionError(args)
+
+        with mock.patch.object(bootstrap, "run", side_effect=fake_config):
+            bootstrap.check_llvm(self.llvm_config, "aarch64-unknown-linux-gnu")
+
+    def test_windows_missing_libraries_build_native_lib_targets(self) -> None:
+        self.libdir = self.root / "LLVM Build" / "lib"
+        self.libdir.mkdir(parents=True)
+        self.absent = [self.libdir / "LLVMMCA.lib", self.libdir / "LLVMX86TargetMCA.lib"]
+        for name in ("LLVMPasses.lib", "LLVMObfuscation.lib"):
+            (self.libdir / name).write_bytes(b"archive")
+        calls = []
+
+        def quoted_paths(paths):
+            return " ".join(f'"{path}"' for path in paths)
+
+        def fake_config(*args, **_kwargs):
+            if "--libdir" in args:
+                return str(self.libdir)
+            if "--obj-root" in args:
+                return str(self.root)
+            if "--libfiles" in args:
+                missing = [path for path in self.absent if not path.exists()]
+                if missing:
+                    raise RuntimeError("llvm-config failed (1): " + "\n".join(
+                        f"llvm-config: error: missing: {path}" for path in missing))
+                return quoted_paths([*self.absent, self.libdir / "LLVMPasses.lib",
+                                     self.libdir / "LLVMObfuscation.lib"])
+            if "--libs" in args:
+                return quoted_paths([*self.absent, self.libdir / "LLVMPasses.lib",
+                                     self.libdir / "LLVMObfuscation.lib"])
+            raise AssertionError(args)
+
+        def fake_ninja(command, **_kwargs):
+            calls.append(command)
+            for target in command[3:]:
+                (self.libdir / f"{target}.lib").write_bytes(b"archive")
+
+        with mock.patch.object(bootstrap.platform, "system", return_value="Windows"), \
+             mock.patch.object(bootstrap, "run", side_effect=fake_config), \
+             mock.patch.object(bootstrap, "rust_llvm_components", return_value=["ipo", "x86"]), \
+             mock.patch.object(bootstrap.subprocess, "run", side_effect=fake_ninja):
+            bootstrap.ensure_llvm_libraries(self.llvm_config, build=True)
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(set(calls[0][3:]), {"LLVMMCA", "LLVMX86TargetMCA"})
+
+    def test_llvm_quote_paths_roundtrips_windows_backslashes(self) -> None:
+        # llvm::sys::printArg escapes each backslash inside quoted paths.
+        output = r'"C:\\LLVM Build\\lib\\LLVMObfuscation.lib"'
+        self.assertEqual(shlex.split(output), [r"C:\LLVM Build\lib\LLVMObfuscation.lib"])
+
+    def test_windows_missing_non_llvm_library_is_not_built(self) -> None:
+        def fake_config(*args, **_kwargs):
+            if "--libdir" in args:
+                return str(self.libdir)
+            if "--obj-root" in args:
+                return str(self.root)
+            if "--libfiles" in args:
+                raise RuntimeError(
+                    f"llvm-config failed (1): llvm-config: error: missing: {self.libdir / 'Other.lib'}"
+                )
+            raise AssertionError(args)
+
+        with mock.patch.object(bootstrap.platform, "system", return_value="Windows"), \
+             mock.patch.object(bootstrap, "run", side_effect=fake_config), \
+             mock.patch.object(bootstrap, "rust_llvm_components", return_value=["ipo", "x86"]), \
+             mock.patch.object(bootstrap.subprocess, "run") as ninja:
+            with self.assertRaisesRegex(RuntimeError, "unexpected llvm-config missing library"):
+                bootstrap.ensure_llvm_libraries(self.llvm_config, build=True)
+            ninja.assert_not_called()
+
+    def test_windows_llvm_tools_require_exe_files_but_ninja_uses_target_names(self) -> None:
+        bindir = self.root / "bin"
+        bindir.mkdir()
+        missing_target = bootstrap.LLVM_TOOLS[0]
+        for name in bootstrap.LLVM_TOOLS[1:]:
+            (bindir / f"{name}.exe").write_bytes(b"exe")
+
+        def fake_ninja(command, **_kwargs):
+            self.assertEqual(command, ["ninja", "-C", str(self.root), missing_target])
+            (bindir / f"{missing_target}.exe").write_bytes(b"exe")
+
+        with mock.patch.object(bootstrap.platform, "system", return_value="Windows"), \
+             mock.patch.object(bootstrap, "run", side_effect=lambda *_args: str(bindir)
+                               if "--bindir" in _args else str(self.root)), \
+             mock.patch.object(bootstrap.subprocess, "run", side_effect=fake_ninja):
+            bootstrap.ensure_llvm_tools(self.llvm_config, build=True)
+
+    def test_windows_msvc_requires_developer_environment_for_prepare(self) -> None:
+        with mock.patch.dict(os.environ, {"INCLUDE": "", "LIB": ""}), \
+             mock.patch.object(bootstrap.shutil, "which", return_value=None):
+            with self.assertRaisesRegex(RuntimeError, "vcvars64.bat"):
+                bootstrap.check_msvc_environment("x86_64-pc-windows-msvc")
+        with mock.patch.dict(os.environ, {"INCLUDE": "headers", "LIB": "libraries"}), \
+             mock.patch.object(bootstrap.shutil, "which", return_value="cl-or-link.exe"):
+            bootstrap.check_msvc_environment("x86_64-pc-windows-msvc")
+        with mock.patch.dict(os.environ, {"VSCMD_ARG_TGT_ARCH": "x86"}):
+            with self.assertRaisesRegex(RuntimeError, "got x86 target"):
+                bootstrap.check_msvc_environment("x86_64-pc-windows-msvc")
+
+    def test_windows_system_import_libraries_extend_msvc_lib_path(self) -> None:
+        zstd_dir = self.root / "vcpkg installed" / "lib"
+        zstd_dir.mkdir(parents=True)
+        zstd = zstd_dir / "zstd.lib"
+        zstd.write_bytes(b"import library")
+
+        with mock.patch.object(bootstrap, "run", return_value=f'"{zstd}" kernel32.lib'), \
+             mock.patch.object(bootstrap, "rust_llvm_components", return_value=["ipo"]):
+            self.assertEqual(
+                bootstrap.windows_system_library_paths(self.llvm_config, "x86_64-pc-windows-msvc"),
+                [zstd_dir.resolve()],
+            )
+
+    def test_windows_bare_zstd_library_uses_cmake_cache_path(self) -> None:
+        zstd_dir = self.root / "vcpkg" / "lib"
+        zstd_dir.mkdir(parents=True)
+        zstd = zstd_dir / "zstd.lib"
+        zstd.write_bytes(b"import library")
+        (self.root / "CMakeCache.txt").write_text(f"zstd_LIBRARY:FILEPATH={zstd}\n")
+
+        def fake_config(*args, **_kwargs):
+            if "--system-libs" in args:
+                return "zstd.lib kernel32.lib"
+            if "--obj-root" in args:
+                return str(self.root)
+            raise AssertionError(args)
+
+        with mock.patch.object(bootstrap, "run", side_effect=fake_config), \
+             mock.patch.object(bootstrap, "rust_llvm_components", return_value=["ipo"]):
+            self.assertEqual(
+                bootstrap.windows_system_library_paths(self.llvm_config, "x86_64-pc-windows-msvc"),
                 [zstd_dir.resolve()],
             )
 

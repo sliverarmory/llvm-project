@@ -1,0 +1,4 @@
+[package]
+name = "obf-output-bin"
+version.workspace = true
+edition.workspace = true

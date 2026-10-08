@@ -93,6 +93,8 @@ def compile_ir(clang: Path, opt: Path, work_dir: Path, level: int,
                "-fexceptions", "-fcxx-exceptions"]
     if target_name == "windows-msvc":
         command.append("--target=x86_64-pc-windows-msvc")
+    elif target_name == "itanium":
+        command.append("--target=x86_64-unknown-linux-gnu")
     passes = VARIANTS[variant]
     if passes:
         command.extend(("-mllvm", f"-rust-obf-pipeline={','.join(passes)}"))
@@ -116,9 +118,11 @@ def main() -> int:
     opt = args.opt.resolve()
     work_dir = args.work_dir.resolve()
     work_dir.mkdir(parents=True, exist_ok=True)
+    targets = (("native", "catchpad"), ("itanium", "landingpad")) \
+        if sys.platform == "win32" else \
+        (("native", "landingpad"), ("windows-msvc", "catchpad"))
     for level in (0, 2):
-        for target_name, pad in (("native", "landingpad"),
-                                 ("windows-msvc", "catchpad")):
+        for target_name, pad in targets:
             baseline = compile_ir(clang, opt, work_dir, level,
                                   target_name, "plain")
             for variant in ("bcf", "fla", "combined"):

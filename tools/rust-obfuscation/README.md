@@ -1,8 +1,10 @@
-# Rust milestone 0 bootstrap
+# Rust obfuscation toolchain bootstrap
 
 This is the pinned native stage-1 compiler bootstrap for
-[`RUST_OBFUSCATION_ROADMAP.md`](../../RUST_OBFUSCATION_ROADMAP.md). It currently
-supports macOS arm64 and Linux amd64. The script uses Rust 1.99.0 at commit
+`RUST_OBFUSCATION_ROADMAP.md` in the source checkout. It supports native macOS
+arm64, Linux amd64/arm64, and Windows amd64 (MSVC). Run the commands below from
+the source checkout; an extracted delivery archive does not contain the build
+scripts or LLVM source. The script uses Rust 1.99.0 at commit
 `b940084d7eb6a299eb4bfeb8e34901bc051e7ac4` and requires this fork's
 LLVM 23.1.3 source to descend from
 `d881479b157bad1536ce4d77fd06648f89c9fa64`. The exact Rust release

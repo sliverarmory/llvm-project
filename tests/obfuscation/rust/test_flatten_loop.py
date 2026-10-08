@@ -64,6 +64,8 @@ def check_case(rustc, opt, objdump, work, label, level, cgus, lto):
         command = [rustc, "--edition=2024", "-C", f"opt-level={level}",
                    "-C", f"codegen-units={cgus}", "-C", f"lto={lto}",
                    "-C", "panic=abort"]
+        if sys.platform == "win32":
+            command += ["-C", "link-arg=/EXPORT:flatten_loop"]
         if variant == "flattened":
             llvm = ("-rust-obf-pipeline=obf-fla -rust-obf-prelink-only "
                     f"-obf-only-functions=flatten_loop -obf-test-seed={SEED}")

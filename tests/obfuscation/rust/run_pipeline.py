@@ -66,7 +66,7 @@ def check_toolchain(rustc: Path) -> None:
 
 def check_case(rustc: Path, work_dir: Path, label: str, level: int,
                lto: str) -> None:
-    binary = work_dir / label
+    binary = work_dir / (label + (".exe" if sys.platform == "win32" else ""))
     options = [
         "-rust-obf-pipeline=obf-sub",
         "-obf-only-functions=pipeline_probe",

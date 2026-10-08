@@ -186,7 +186,7 @@ def parse_chunks(payload):
 
 def compile_rust(rustc, source, stem, *, level, llvm_options=(), crate_type=None):
     ir_path = stem.with_suffix(".ll")
-    artifact = stem.with_suffix(".a") if crate_type else stem
+    artifact = stem.with_suffix(".lib" if sys.platform == "win32" else ".a") if crate_type else stem
     if not crate_type and sys.platform == "win32":
         artifact = artifact.with_suffix(".exe")
     command = [str(rustc), "--edition=2021", "--crate-name", stem.name.replace("-", "_"),
@@ -194,11 +194,20 @@ def compile_rust(rustc, source, stem, *, level, llvm_options=(), crate_type=None
                "-C", "panic=abort", "-C", "debuginfo=0"]
     if crate_type:
         command.extend(("--crate-type", crate_type))
+        if sys.platform == "win32":
+            command.extend(("--print", "native-static-libs"))
     if llvm_options:
         command.extend(("-C", f"llvm-args={' '.join(llvm_options)}"))
     command.extend((f"--emit=llvm-ir={ir_path},link={artifact}", str(source)))
-    run(command, timeout=360)
-    return ir_path, artifact
+    result = run(command, timeout=360)
+    native_libs = []
+    if crate_type and sys.platform == "win32":
+        diagnostic = result.stderr.decode(errors="replace")
+        match = re.search(r"(?m)^note: native-static-libs: (.*)$", diagnostic)
+        require(match is not None,
+                f"rustc did not report staticlib native dependencies:\n{diagnostic}")
+        native_libs = match.group(1).split()
+    return ir_path, artifact, native_libs
 
 
 def check_rust(rustc, opt, clang, work):
@@ -208,9 +217,9 @@ def check_rust(rustc, opt, clang, work):
             f"expected the pinned Rust 1.99/LLVM 23 toolchain, got:\n{version}")
     source = ROOT / "string_data.rs"
     for level in (0, 2):
-        baseline_ir, baseline = compile_rust(
+        baseline_ir, baseline, _ = compile_rust(
             rustc, source, work / f"rust-O{level}-baseline", level=level)
-        encoded_ir, encoded = compile_rust(
+        encoded_ir, encoded, _ = compile_rust(
             rustc, source, work / f"rust-O{level}-encoded", level=level,
             llvm_options=("-rust-obf-pipeline=obf-string", f"-obf-test-seed={SEED}"))
         for path in (baseline_ir, encoded_ir):
@@ -230,7 +239,7 @@ def check_rust(rustc, opt, clang, work):
     for label, options in (("baseline", ()),
                            ("encoded", ("-rust-obf-pipeline=obf-string",
                                         f"-obf-test-seed={SEED}"))):
-        ir_path, library = compile_rust(
+        ir_path, library, native_libs = compile_rust(
             rustc, ffi_source, work / f"ffi-{label}", level=2,
             llvm_options=options, crate_type="staticlib")
         run([str(opt), "-passes=verify", "-disable-output", str(ir_path)])
@@ -242,7 +251,7 @@ def check_rust(rustc, opt, clang, work):
         executable = work / f"ffi-consumer-{label}"
         if sys.platform == "win32":
             executable = executable.with_suffix(".exe")
-        run([*clang, str(ROOT / "string_data_ffi.c"), str(library),
+        run([*clang, str(ROOT / "string_data_ffi.c"), str(library), *native_libs,
              "-o", str(executable)], timeout=360)
         run([str(executable)], timeout=15)
     print("PASS Rust staticlib: C consumer sees exact byte length and contents", flush=True)
