@@ -231,6 +231,50 @@ def check_eh(clang, opt, work_dir, level):
         print(f"[{level}] bogus control flow preserves {target} EH edges", flush=True)
 
 
+def check_cross_tu_strings(clang, clangxx, opt, work_dir, level):
+    fixture_dir = Path(__file__).resolve().parent
+    objects = []
+    for unit, private_marker in (
+        ("a", "cross-tu-private-a-marker"),
+        ("b", "cross-tu-private-b-marker"),
+    ):
+        stem = work_dir / f"{level}-odr-string-{unit}"
+        ir_path = stem.with_suffix(".ll")
+        object_path = stem.with_suffix(".o")
+        command = [
+            *clangxx, f"-{level}", "-std=c++17", "-mllvm", "-sobf",
+            str(fixture_dir / f"odr_string_{unit}.cpp"),
+        ]
+        run([*command, "-S", "-emit-llvm", "-o", str(ir_path)])
+        run([opt, "-passes=verify", "-disable-output", str(ir_path)])
+        run([*command, "-c", "-o", str(object_path)])
+        ir = ir_path.read_text(encoding="utf-8")
+        assert 'c"cross-tu-odr-marker\\00"' in ir, (
+            f"{level}/{unit}: linker-coalesced ODR string was encoded"
+        )
+        assert private_marker not in ir and ".datadiv_decode" in ir, (
+            f"{level}/{unit}: private literal was not encoded"
+        )
+        if unit == "a":
+            assert "cross-tu-export-marker" not in ir, (
+                f"{level}: exported string was not encoded"
+            )
+            assert re.search(r"(?m)^@exported_message\s*=", ir), (
+                f"{level}: exported string symbol was renamed"
+            )
+        objects.append(str(object_path))
+
+    executable = work_dir / f"{level}-odr-strings"
+    run([
+        *clang, f"-{level}", str(fixture_dir / "odr_string_main.c"),
+        *objects, "-o", str(executable),
+    ])
+    assert run([str(executable)], timeout=10) == "cross-tu strings passed\n", (
+        f"{level}: string decoding or exported symbol failed across translation units"
+    )
+    print(f"[{level}] cross-TU ODR, exported, and private strings passed", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--clang", type=Path, required=True)
@@ -249,6 +293,7 @@ def main():
         sdk = run(["xcrun", "--show-sdk-path"]).strip()
         clang.extend(("-isysroot", sdk))
     opt = str(args.opt.resolve())
+    clangxx = [str(args.clang.resolve().with_name("clang++")), *clang[1:]]
 
     for level in ("O0", "O2"):
         ir_by_variant = {}
@@ -287,6 +332,7 @@ def main():
         check_indirectbr(clang, opt, work_dir, level)
         check_musttail(clang, opt, work_dir, level)
         check_eh(clang, opt, work_dir, level)
+        check_cross_tu_strings(clang, clangxx, opt, work_dir, level)
 
 
 if __name__ == "__main__":

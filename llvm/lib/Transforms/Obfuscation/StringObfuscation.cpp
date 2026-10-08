@@ -81,6 +81,11 @@ static bool shouldEncodeGlobal(const GlobalVariable &GV) {
     return false;
   if (GV.isThreadLocal())
     return false;
+  // Multiple translation units can emit the same weak/ODR global with
+  // different keys. The linker keeps one definition but runs every decoder.
+  if (GV.isWeakForLinker() || GV.hasAvailableExternallyLinkage() ||
+      GV.hasComdat())
+    return false;
 
   StringRef Section = GV.getSection();
   if (Section == "llvm.metadata" || isObjCRuntimeMetadata(GV))
@@ -150,7 +155,7 @@ public:
 
       auto *DynGV = new GlobalVariable(
           M, GV->getValueType(),
-          /*isConstant=*/false, GV->getLinkage(), EncodedInit, GV->getName(),
+          /*isConstant=*/false, GV->getLinkage(), EncodedInit, "",
           /*InsertBefore=*/nullptr, GV->getThreadLocalMode(),
           GV->getType()->getAddressSpace());
       DynGV->copyAttributesFrom(GV);
@@ -158,6 +163,8 @@ public:
       DynGV->setInitializer(EncodedInit);
 
       GV->replaceAllUsesWith(DynGV);
+      // Keep externally visible symbols stable when replacing their storage.
+      DynGV->takeName(GV);
       ToDelete.push_back(GV);
       EncodedGlobals.push_back({DynGV, Key, Step, Size});
       ++GlobalsEncoded;
