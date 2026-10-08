@@ -414,6 +414,71 @@
 
 using namespace llvm;
 
+namespace {
+
+enum class RustObfuscationPass {
+  All,
+  String,
+  Split,
+  BogusControlFlow,
+  Flattening,
+  Substitution,
+  ConstantEncoding,
+  GlobalAccessIndirection,
+};
+
+// The list is a selection, not a scheduling order. The pipeline callbacks
+// always use the order documented in the Rust roadmap.
+static cl::list<RustObfuscationPass> RustObfuscationPipeline(
+    "rust-obf-pipeline", cl::CommaSeparated,
+    cl::desc("Opt in to the stage-aware Rust obfuscation pipeline; select "
+             "all or comma-separated pass names"),
+    cl::values(
+        clEnumValN(RustObfuscationPass::All, "all", "Select all seven passes"),
+        clEnumValN(RustObfuscationPass::String, "obf-string", "Encode strings"),
+        clEnumValN(RustObfuscationPass::Split, "obf-split", "Split basic blocks"),
+        clEnumValN(RustObfuscationPass::BogusControlFlow, "obf-bcf",
+                   "Insert bogus control flow"),
+        clEnumValN(RustObfuscationPass::Flattening, "obf-fla",
+                   "Flatten control flow"),
+        clEnumValN(RustObfuscationPass::Substitution, "obf-sub",
+                   "Substitute instructions"),
+        clEnumValN(RustObfuscationPass::ConstantEncoding, "obf-const",
+                   "Encode selected integer constants"),
+        clEnumValN(RustObfuscationPass::GlobalAccessIndirection,
+                   "obf-global-access", "Indirect selected global accesses")));
+
+static bool isSelected(RustObfuscationPass Pass) {
+  for (RustObfuscationPass Selected : RustObfuscationPipeline)
+    if (Selected == RustObfuscationPass::All || Selected == Pass)
+      return true;
+  return false;
+}
+
+static void addLateRustObfuscationPasses(ModulePassManager &MPM) {
+  if (isSelected(RustObfuscationPass::Split))
+    MPM.addPass(createModuleToFunctionPassAdaptor(
+        SplitBasicBlockPass(/*Flag=*/true)));
+  if (isSelected(RustObfuscationPass::BogusControlFlow))
+    MPM.addPass(BogusControlFlowPass(/*Flag=*/true));
+  if (isSelected(RustObfuscationPass::Flattening))
+    MPM.addPass(
+        createModuleToFunctionPassAdaptor(FlatteningPass(/*Flag=*/true)));
+  if (isSelected(RustObfuscationPass::Substitution))
+    MPM.addPass(
+        createModuleToFunctionPassAdaptor(SubstitutionPass(/*Flag=*/true)));
+  if (isSelected(RustObfuscationPass::ConstantEncoding))
+    MPM.addPass(ConstantEncodingPass(/*Flag=*/true));
+  if (isSelected(RustObfuscationPass::GlobalAccessIndirection))
+    MPM.addPass(GlobalAccessIndirectionPass(/*Flag=*/true));
+}
+
+} // namespace
+
+bool llvm::isRustObfuscationPipelineEnabled() {
+  return !RustObfuscationPipeline.empty();
+}
+
 cl::opt<std::optional<PrintPipelinePassesFormat>, false,
         PrintPipelinePassesFormatParser>
     llvm::PrintPipelinePasses(
@@ -586,6 +651,34 @@ PassBuilder::PassBuilder(TargetMachine *TM, PipelineTuningOptions PTO,
     : TM(TM), PTO(PTO), PGOOpt(PGOOpt), PIC(PIC), FS(std::move(FS)) {
   if (TM)
     TM->registerPassBuilderCallbacks(*this);
+  if (isRustObfuscationPipelineEnabled()) {
+    if (isSelected(RustObfuscationPass::String))
+      registerPipelineStartEPCallback(
+          [](ModulePassManager &MPM, OptimizationLevel) {
+            // Encode eligible strings before pre-link simplification can
+            // copy or fold plaintext, and before embedded bitcode is written.
+            // Link-time pipelines do not invoke this callback.
+            MPM.addPass(StringObfuscationPass(/*Flag=*/true));
+          });
+    registerOptimizerLastEPCallback(
+        [](ModulePassManager &MPM, OptimizationLevel Level,
+           ThinOrFullLTOPhase Phase) {
+          // Rust 1.99 uses buildO0DefaultPipeline for every pre-link O0
+          // stage; its ThinLTO and full-LTO O0 backends have no matching
+          // optimizer-last callback. For optimized builds, run on non-LTO
+          // codegen or after ThinLTO imports, never in Thin/Fat pre-link.
+          if (Level == OptimizationLevel::O0 ||
+              Phase == ThinOrFullLTOPhase::None ||
+              Phase == ThinOrFullLTOPhase::ThinLTOPostLink)
+            addLateRustObfuscationPasses(MPM);
+        });
+    registerFullLinkTimeOptimizationLastEPCallback(
+        [](ModulePassManager &MPM, OptimizationLevel Level) {
+          // The O0 pre-link pipeline already ran these passes.
+          if (Level != OptimizationLevel::O0)
+            addLateRustObfuscationPasses(MPM);
+        });
+  }
   if (PIC) {
     PIC->registerClassToPassNameCallback([this, PIC]() {
       // MSVC requires this to be captured if it's used inside decltype.
