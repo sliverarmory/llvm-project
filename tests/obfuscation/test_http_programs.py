@@ -108,6 +108,22 @@ def start_server(work_dir):
     return server, thread, certificate
 
 
+def objc_link_flags():
+    if sys.platform != "linux":
+        return ["-lobjc"]
+    # GNU libobjc's development symlink lives in GCC's versioned library
+    # directory. A separately built Clang may select another GCC toolchain and
+    # fail to find it through -lobjc alone.
+    for compiler in ("gcc", "gcc-13"):
+        try:
+            library = Path(run([compiler, "-print-file-name=libobjc.so"]).stdout.strip())
+        except FileNotFoundError:
+            continue
+        if library.is_file():
+            return [str(library.resolve())]
+    raise AssertionError("GNU Objective-C development library libobjc.so was not found")
+
+
 def target_body(ir):
     lines = ir.splitlines()
     for first, line in enumerate(lines):
@@ -199,6 +215,7 @@ def main():
     sysroot_flags = ["-isysroot", str(sysroot)] if sysroot else []
     curl_cflags = shlex.split(run(["pkg-config", "--cflags", "libcurl"]).stdout)
     curl_libs = shlex.split(run(["pkg-config", "--libs", "libcurl"]).stdout)
+    objc_link = objc_link_flags() if any(spec[2] for spec in SOURCES.values()) else []
 
     server, thread, certificate = start_server(work_dir)
     try:
@@ -210,7 +227,6 @@ def main():
                 if needs_objc and sys.platform == "linux"
                 else []
             )
-            objc_link = ["-lobjc"] if needs_objc else []
             for level in ("O0", "O2"):
                 ir_by_variant = {}
                 for name, options in VARIANTS.items():
@@ -227,7 +243,13 @@ def main():
                     print(f"[{language}/{level}] compile {name}", flush=True)
                     run([*common, "-S", "-emit-llvm", "-o", str(ir_path)])
                     run([opt, "-passes=verify", "-disable-output", str(ir_path)])
-                    run([*common, *curl_libs, *objc_link, "-o", str(executable)])
+                    run(
+                        [
+                            *common, *curl_libs,
+                            *(objc_link if needs_objc else ()),
+                            "-o", str(executable),
+                        ]
+                    )
                     ir_by_variant[name] = ir_path.read_text(encoding="utf-8")
                     for start_path, destination in REDIRECTS.items():
                         run_client(

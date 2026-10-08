@@ -39,7 +39,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release
 
       - name: Build clang and opt
-        run: cmake --build build-llvm-project --target clang opt --parallel 2
+        run: cmake --build build-llvm-project --target clang opt --parallel 4
 
       - name: Verify all custom transforms at O0 and O2
         run: |
