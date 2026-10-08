@@ -1,4 +1,7 @@
-# LLVM Obfuscator (LLVM v21)
+# LLVM Obfuscator (LLVM 23.1.3)
+
+Based on upstream [`llvmorg-23.1.3`](https://github.com/llvm/llvm-project/releases/tag/llvmorg-23.1.3)
+at commit `0d261d1ca552c95a8f007e061c787ac7132fbcbc`.
 
 ### Clang-exposed transforms
 
@@ -19,22 +22,57 @@
 
 ## Build
 
-From `/Users/moloch/git/llvm-obfuscator`:
+From the repository root:
 
 ```bash
-cmake -S llvm-project/llvm -B build-llvm-project \
+cmake -S llvm -B build-llvm-project \
   -DLLVM_ENABLE_PROJECTS=clang \
   -DCMAKE_BUILD_TYPE=Release
 
 cmake --build build-llvm-project --target clang opt -j8
 ```
 
-## Usage
+## Verify the transforms
 
-Compiler path used below:
+The smoke test compiles each transform separately and together at `-O0` and
+`-O2`. It checks emitted IR, verifies it with `opt`, and compares executable
+results with an independent oracle. It also checks function annotations.
 
 ```bash
-CLANG=/Users/moloch/git/llvm-obfuscator/build-llvm-project/bin/clang
+python3 tests/obfuscation/test_transforms.py \
+  --clang build-llvm-project/bin/clang \
+  --opt build-llvm-project/bin/opt \
+  --work-dir build-llvm-project/transform-smoke
+```
+
+The integration test builds HTTPS clients in C, C++, Objective-C, and
+Objective-C++. Each client follows a redirect, verifies a local TLS
+certificate, parses two different HTML pages, and reports the title, link
+count, and total path length. The test checks all five transforms separately
+and together at `-O0` and `-O2`, verifies each emitted IR module, and runs
+every executable. It needs `pkg-config`, OpenSSL, libcurl development files,
+and an Objective-C runtime with development files.
+
+```bash
+python3 tests/obfuscation/test_http_programs.py \
+  --clang build-llvm-project/bin/clang \
+  --opt build-llvm-project/bin/opt \
+  --work-dir build-llvm-project/http-integration
+```
+
+GitHub Actions runs both suites on Ubuntu. The release workflow runs them
+before packaging its Linux amd64 archive.
+
+The CI suite also compiles Objective-C and Objective-C++ metadata probes for
+the Apple, GNUstep, and GCC runtimes at both optimization levels. This guards
+class and selector registration while string obfuscation is enabled.
+
+## Usage
+
+Compiler path used below (from the repository root):
+
+```bash
+CLANG="$PWD/build-llvm-project/bin/clang"
 ```
 
 ### macOS note
@@ -135,7 +173,8 @@ Expected: no plaintext match.
 ### String obfuscation
 
 - obfuscates constant C-string globals (`ConstantDataSequential::isCString()`)
-- skips metadata and ObjC method-name sections
+- skips LLVM metadata, Objective-C runtime metadata, and constant-string
+  backing storage used before startup constructors run
 - uses per-byte rolling mask in decode
 - emits decode startup via `@llvm.global_ctors`
 

@@ -27,7 +27,7 @@
 #include "llvm/Transforms/Utils/Local.h" // For DemoteRegToStack and DemotePHIToStack
 
 namespace llvm {
-class FlatteningPass : public PassInfoMixin<FlatteningPass> {
+class FlatteningPass : public RequiredPassInfoMixin<FlatteningPass> {
 public:
   explicit FlatteningPass(bool Flag = false) : Flag(Flag) {}
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);

@@ -1,10 +1,22 @@
 #include "llvm/Transforms/Obfuscation/Utils.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/raw_ostream.h"
 #include <sstream>
 
 using namespace llvm;
+
+bool hasMustTailCall(const BasicBlock &BB) {
+  for (const Instruction &I : BB) {
+    if (const auto *Call = dyn_cast<CallInst>(&I)) {
+      if (Call->isMustTailCall())
+        return true;
+    }
+  }
+  return false;
+}
 
 // Shamefully borrowed from ../Scalar/RegToMem.cpp :(
 bool valueEscapes(Instruction *Inst) {
@@ -45,8 +57,22 @@ void fixStack(Function *f) {
         }
       }
     }
-    for (unsigned int i = 0; i != tmpReg.size(); ++i) {
-      DemoteRegToStack(*tmpReg.at(i), f->begin()->getTerminator());
+    for (Instruction *Inst : tmpReg) {
+      if (auto *AI = dyn_cast<AllocaInst>(Inst)) {
+        // Demoting a non-entry alloca replaces its uses with loads of the
+        // pointer. LLVM lifetime markers require the alloca itself as their
+        // operand, so discard these optional markers before that rewrite.
+        SmallVector<IntrinsicInst *, 4> LifetimeMarkers;
+        for (User *U : AI->users()) {
+          if (auto *II = dyn_cast<IntrinsicInst>(U)) {
+            if (II->isLifetimeStartOrEnd())
+              LifetimeMarkers.push_back(II);
+          }
+        }
+        for (IntrinsicInst *II : LifetimeMarkers)
+          II->eraseFromParent();
+      }
+      DemoteRegToStack(*Inst, f->begin()->getTerminator());
     }
 
     for (unsigned int i = 0; i != tmpPhi.size(); ++i) {

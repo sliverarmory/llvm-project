@@ -60,7 +60,9 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build zip
+          sudo apt-get install -y \
+            cmake ninja-build g++ zip python3 pkg-config openssl \
+            libcurl4-openssl-dev libobjc-13-dev
 
       - name: Install build dependencies (macOS)
         if: runner.os == 'macOS'
@@ -101,6 +103,30 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: cmake --build build-llvm-project --target clang opt --parallel
+
+      - name: Verify custom transforms before packaging (Linux amd64)
+        if: matrix.target == 'linux-amd64'
+        run: |
+          python3 tests/obfuscation/test_transforms.py \
+            --clang build-llvm-project/bin/clang \
+            --opt build-llvm-project/bin/opt \
+            --work-dir build-llvm-project/transform-smoke
+
+      - name: Verify real HTTPS clients before packaging (Linux amd64)
+        if: matrix.target == 'linux-amd64'
+        run: |
+          python3 tests/obfuscation/test_http_programs.py \
+            --clang build-llvm-project/bin/clang \
+            --opt build-llvm-project/bin/opt \
+            --work-dir build-llvm-project/http-integration
+
+      - name: Verify Objective-C metadata before packaging (Linux amd64)
+        if: matrix.target == 'linux-amd64'
+        run: |
+          python3 tests/obfuscation/test_objc_metadata.py \
+            --clang build-llvm-project/bin/clang \
+            --opt build-llvm-project/bin/opt \
+            --work-dir build-llvm-project/objc-metadata
 
       - name: Package archive (Linux/macOS)
         if: runner.os != 'Windows'

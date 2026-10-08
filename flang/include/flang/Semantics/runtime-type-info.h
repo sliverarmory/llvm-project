@@ -14,12 +14,10 @@
 #ifndef FORTRAN_SEMANTICS_RUNTIME_TYPE_INFO_H_
 #define FORTRAN_SEMANTICS_RUNTIME_TYPE_INFO_H_
 
-#include "flang/Common/reference.h"
 #include "flang/Semantics/symbol.h"
 #include <map>
 #include <set>
 #include <string>
-#include <vector>
 
 namespace llvm {
 class raw_ostream;
@@ -52,10 +50,15 @@ constexpr char procCompName[]{"proc"};
 
 SymbolVector CollectBindings(const Scope &dtScope);
 
+enum NonTbpDefinedIoFlags {
+  IsDtvArgPolymorphic = 1 << 0,
+  DefinedIoInteger8 = 1 << 1,
+};
+
 struct NonTbpDefinedIo {
   const Symbol *subroutine;
   common::DefinedIo definedIo;
-  bool isDtvArgPolymorphic;
+  std::uint8_t flags;
 };
 
 std::multimap<const Symbol *, NonTbpDefinedIo>

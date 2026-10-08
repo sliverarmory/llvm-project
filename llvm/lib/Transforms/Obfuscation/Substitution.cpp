@@ -54,7 +54,10 @@ static Constant *getRandomIntConstant(Type *Ty) {
     return nullptr;
 
   unsigned BitWidth = cast<IntegerType>(ScalarTy)->getBitWidth();
-  APInt Value(BitWidth, llvm::cryptoutils->get_uint64_t());
+  // APInt requires the initial value to fit its bit width. Truncate the
+  // random word explicitly for i1..i63, and extend it for wider integers.
+  APInt Value(64, llvm::cryptoutils->get_uint64_t());
+  Value = Value.zextOrTrunc(BitWidth);
   return Constant::getIntegerValue(Ty, Value);
 }
 

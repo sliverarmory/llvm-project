@@ -25,7 +25,7 @@
 #include "llvm/Transforms/Obfuscation/CryptoUtils.h"
 
 namespace llvm {
-class SubstitutionPass : public PassInfoMixin<SubstitutionPass> {
+class SubstitutionPass : public RequiredPassInfoMixin<SubstitutionPass> {
 public:
   explicit SubstitutionPass(bool Flag = false) : Flag(Flag) {}
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);

@@ -14,7 +14,6 @@
 #define _OBFUSCATION_BOGUSCONTROLFLOW_H_
 
 #include "llvm/ADT/Statistic.h"
-#include "llvm/CodeGen/ISDOpcodes.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
@@ -35,10 +34,11 @@
 #include "llvm/Transforms/Utils/Cloning.h"
 
 namespace llvm {
-class BogusControlFlowPass : public PassInfoMixin<BogusControlFlowPass> {
+class BogusControlFlowPass
+    : public RequiredPassInfoMixin<BogusControlFlowPass> {
 public:
   explicit BogusControlFlowPass(bool Flag = false) : Flag(Flag) {}
-  PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
+  PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM);
 
 private:
   bool Flag = false;

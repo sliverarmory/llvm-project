@@ -96,6 +96,7 @@
 
 #include "llvm/Transforms/Obfuscation/BogusControlFlow.h"
 #include "llvm/Transforms/Obfuscation/Utils.h"
+#include "llvm/IR/IntrinsicInst.h"
 #include <memory>
 
 // Stats
@@ -155,15 +156,42 @@ struct BogusControlFlow : public FunctionPass {
     }
     // If fla annotations
     if (toObfuscate(flag, &F, "bcf")) {
-      bogus(F);
-      doF(*F.getParent());
+      // The bogus paths clone calls and introduce cycles. Convergence control
+      // tokens constrain both placement and cycles, so this rewriter cannot
+      // safely transform functions that use them.
+      if (F.isConvergent())
+        return false;
+      // Splitting or cloning EH and indirect control flow blocks can break
+      // unwind edges or produce invalid terminators. Leave such functions
+      // untouched rather than partially rewriting their CFG.
+      for (BasicBlock &BB : F) {
+        if (BB.isEHPad())
+          return false;
+        for (Instruction &I : BB) {
+          if (isa<ConvergenceControlInst>(I))
+            return false;
+          if (auto *Call = dyn_cast<CallBase>(&I)) {
+            if (Call->isConvergent() ||
+                Call->countOperandBundlesOfType(
+                    LLVMContext::OB_convergencectrl))
+              return false;
+          }
+        }
+        Instruction *Term = BB.getTerminator();
+        if (!isa<BranchInst>(Term) && !isa<SwitchInst>(Term) &&
+            !isa<ReturnInst>(Term) && !isa<UnreachableInst>(Term))
+          return false;
+      }
+      if (!bogus(F))
+        return false;
+      doF(F);
       return true;
     }
 
     return false;
   } // end of runOnFunction()
 
-  void bogus(Function &F) {
+  bool bogus(Function &F) {
     // For statistics and debug
     ++NumFunction;
     int NumBasicBlocks = 0;
@@ -209,7 +237,9 @@ struct BogusControlFlow : public FunctionPass {
       while (!basicBlocks.empty()) {
         NumBasicBlocks++;
         // Basic Blocks' selection
-        if ((int)llvm::cryptoutils->get_range(100) <= ObfProbRate) {
+        BasicBlock *basicBlock = basicBlocks.front();
+        if ((int)llvm::cryptoutils->get_range(100) <= ObfProbRate &&
+            !hasMustTailCall(*basicBlock)) {
           DEBUG_WITH_TYPE("opt", errs() << "bcf: Block " << NumBasicBlocks
                                         << " selected. \n");
           hasBeenModified = true;
@@ -217,7 +247,6 @@ struct BogusControlFlow : public FunctionPass {
           NumAddedBasicBlocks += 3;
           FinalNumBasicBlocks += 3;
           // Add bogus flow to the given Basic Block (see description)
-          BasicBlock *basicBlock = basicBlocks.front();
           addBogusFlow(basicBlock, F);
         } else {
           DEBUG_WITH_TYPE("opt", errs() << "bcf: Block " << NumBasicBlocks
@@ -243,6 +272,7 @@ struct BogusControlFlow : public FunctionPass {
       }
       firstTime = false;
     } while (--NumObfTimes > 0);
+    return hasBeenModified;
   }
 
   /* addBogusFlow
@@ -560,104 +590,76 @@ struct BogusControlFlow : public FunctionPass {
 
   /* doFinalization
    *
-   * Overwrite FunctionPass method to apply the transformations to the whole
-   * module. This part obfuscate all the always true predicates of the module.
+   * Obfuscate the always true predicates inserted into this function.
    * More precisely, the condition which predicate is FCMP_TRUE.
-   * It also remove all the functions' basic blocks' and instructions' names.
    */
-  bool doF(Module &M) {
+  bool doF(Function &F) {
     // In this part we extract all always-true predicate and replace them with
     // opaque predicate: For this, we declare two global values: x and y, and
     // replace the FCMP_TRUE predicate with (y < 10 || x * (x + 1) % 2 == 0) A
-    // better way to obfuscate the predicates would be welcome. In the meantime
-    // we will erase the name of the basic blocks, the instructions and the
-    // functions.
+    // better way to obfuscate the predicates would be welcome.
     DEBUG_WITH_TYPE("gen", errs() << "bcf: Starting doFinalization...\n");
 
-    //  The global values
-    Twine *varX = new Twine("x");
-    Twine *varY = new Twine("y");
-    Value *x1 = ConstantInt::get(Type::getInt32Ty(M.getContext()), 0, false);
-    Value *y1 = ConstantInt::get(Type::getInt32Ty(M.getContext()), 0, false);
-
-    GlobalVariable *x =
-        new GlobalVariable(M, Type::getInt32Ty(M.getContext()), false,
-                           GlobalValue::CommonLinkage, (Constant *)x1, *varX);
-    GlobalVariable *y =
-        new GlobalVariable(M, Type::getInt32Ty(M.getContext()), false,
-                           GlobalValue::CommonLinkage, (Constant *)y1, *varY);
-
-    std::vector<Instruction *> toEdit, toDelete;
+    Module &M = *F.getParent();
+    std::vector<BranchInst *> toEdit;
     BinaryOperator *op, *op1 = NULL;
     LoadInst *opX, *opY;
     ICmpInst *condition, *condition2;
-    // Looking for the conditions and branches to transform
-    for (Module::iterator mi = M.begin(), me = M.end(); mi != me; ++mi) {
-      for (Function::iterator fi = mi->begin(), fe = mi->end(); fi != fe;
-           ++fi) {
-        // fi->setName("");
-        Instruction *tbb = fi->getTerminator();
-        if (tbb->getOpcode() == Instruction::Br) {
-          BranchInst *br = (BranchInst *)(tbb);
-          if (br->isConditional()) {
-            FCmpInst *cond = (FCmpInst *)br->getCondition();
-            unsigned opcode = cond->getOpcode();
-            if (opcode == Instruction::FCmp) {
-              if (cond->getPredicate() == FCmpInst::FCMP_TRUE) {
-                DEBUG_WITH_TYPE("gen",
-                                errs() << "bcf: an always true predicate !\n");
-                toDelete.push_back(cond); // The condition
-                toEdit.push_back(tbb);    // The branch using the condition
-              }
-            }
-          }
-        }
-        /*
-        for (BasicBlock::iterator bi = fi->begin(), be = fi->end() ; bi != be;
-        ++bi){ bi->setName(""); // setting the basic blocks' names
-        }
-        */
+    // Look only at this function. A function pass must not rewrite other
+    // functions while their analyses may be cached by the new pass manager.
+    for (BasicBlock &BB : F) {
+      auto *Br = dyn_cast<BranchInst>(BB.getTerminator());
+      if (!Br || !Br->isConditional())
+        continue;
+      auto *Cond = dyn_cast<FCmpInst>(Br->getCondition());
+      if (Cond && Cond->getPredicate() == FCmpInst::FCMP_TRUE) {
+        DEBUG_WITH_TYPE("gen",
+                        errs() << "bcf: an always true predicate !\n");
+        toEdit.push_back(Br);
       }
     }
+    if (toEdit.empty())
+      return false;
+
+    // Create the opaque predicate globals only when this function needs them.
+    auto *Zero = ConstantInt::get(Type::getInt32Ty(M.getContext()), 0);
+    GlobalVariable *x = new GlobalVariable(
+        M, Zero->getType(), false, GlobalValue::CommonLinkage, Zero, "x");
+    GlobalVariable *y = new GlobalVariable(
+        M, Zero->getType(), false, GlobalValue::CommonLinkage, Zero, "y");
+
     // Replacing all the branches we found
-    for (std::vector<Instruction *>::iterator i = toEdit.begin();
-         i != toEdit.end(); ++i) {
+    for (BranchInst *Br : toEdit) {
+      auto *OldCond = cast<FCmpInst>(Br->getCondition());
       // if y < 10 || x*(x+1) % 2 == 0
-      opX = new LoadInst(x->getValueType(), x, "", (*i));
-      opY = new LoadInst(y->getValueType(), y, "", (*i));
+      opX = new LoadInst(x->getValueType(), x, "", Br);
+      opY = new LoadInst(y->getValueType(), y, "", Br);
 
       op = BinaryOperator::Create(
           Instruction::Sub, (Value *)opX,
           ConstantInt::get(Type::getInt32Ty(M.getContext()), 1, false), "",
-          (*i));
+          Br);
       op1 =
-          BinaryOperator::Create(Instruction::Mul, (Value *)opX, op, "", (*i));
+          BinaryOperator::Create(Instruction::Mul, (Value *)opX, op, "", Br);
       op = BinaryOperator::Create(
           Instruction::URem, op1,
           ConstantInt::get(Type::getInt32Ty(M.getContext()), 2, false), "",
-          (*i));
+          Br);
       condition = new ICmpInst(
-          (*i), ICmpInst::ICMP_EQ, op,
+          Br, ICmpInst::ICMP_EQ, op,
           ConstantInt::get(Type::getInt32Ty(M.getContext()), 0, false));
       condition2 = new ICmpInst(
-          (*i), ICmpInst::ICMP_SLT, opY,
+          Br, ICmpInst::ICMP_SLT, opY,
           ConstantInt::get(Type::getInt32Ty(M.getContext()), 10, false));
       op1 = BinaryOperator::Create(Instruction::Or, (Value *)condition,
-                                   (Value *)condition2, "", (*i));
+                                   (Value *)condition2, "", Br);
 
-      BranchInst::Create(((BranchInst *)*i)->getSuccessor(0),
-                         ((BranchInst *)*i)->getSuccessor(1), (Value *)op1,
-                         ((BranchInst *)*i)->getParent());
+      BranchInst::Create(Br->getSuccessor(0), Br->getSuccessor(1), op1, Br);
       DEBUG_WITH_TYPE("gen", errs() << "bcf: Erase branch instruction:"
-                                    << *((BranchInst *)*i) << "\n");
-      (*i)->eraseFromParent(); // erase the branch
-    }
-    // Erase all the associated conditions we found
-    for (std::vector<Instruction *>::iterator i = toDelete.begin();
-         i != toDelete.end(); ++i) {
-      DEBUG_WITH_TYPE("gen", errs() << "bcf: Erase condition instruction:"
-                                    << *((Instruction *)*i) << "\n");
-      (*i)->eraseFromParent();
+                                    << *Br << "\n");
+      Br->eraseFromParent();
+      if (OldCond->use_empty())
+        OldCond->eraseFromParent();
     }
 
     // Only for debug
@@ -682,10 +684,16 @@ Pass *llvm::createBogus() { return new BogusControlFlow(); }
 
 Pass *llvm::createBogus(bool flag) { return new BogusControlFlow(flag); }
 
-PreservedAnalyses BogusControlFlowPass::run(Function &F,
-                                            FunctionAnalysisManager &AM) {
+PreservedAnalyses BogusControlFlowPass::run(Module &M,
+                                            ModuleAnalysisManager &AM) {
   (void)AM;
+  if (!Flag && !M.getGlobalVariable("llvm.global.annotations"))
+    return PreservedAnalyses::all();
+
   std::unique_ptr<Pass> Legacy(createBogus(Flag));
-  bool Changed = static_cast<FunctionPass *>(Legacy.get())->runOnFunction(F);
+  auto *LegacyFunctionPass = static_cast<FunctionPass *>(Legacy.get());
+  bool Changed = false;
+  for (Function &F : M)
+    Changed |= LegacyFunctionPass->runOnFunction(F);
   return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }
