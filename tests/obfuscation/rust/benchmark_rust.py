@@ -190,8 +190,9 @@ def median(samples):
 def checkout_state():
     head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=SOURCE.parents[3],
                           capture_output=True, text=True, timeout=10, check=True).stdout.strip()
-    status = subprocess.run(["git", "status", "--porcelain"], cwd=SOURCE.parents[3],
-                            capture_output=True, text=True, timeout=10, check=True).stdout
+    status = subprocess.run(["git", "status", "--porcelain", "--untracked-files=no"],
+                            cwd=SOURCE.parents[3], capture_output=True, text=True,
+                            timeout=60, check=True).stdout
     return head, bool(status)
 
 
@@ -360,7 +361,7 @@ def main():
             "Peak memory is the top-level rustc process's OS-reported maximum, excluding any separately spawned linker process; Windows uses peak working set and Unix uses ru_maxrss.",
             "Runs share the host with other work, use warm filesystem caches, and are not CPU-pinned; ratios are descriptive, not confidence intervals.",
             "The fixed seed makes this one code shape repeatable; it is not a production entropy recommendation.",
-            "Checkout HEAD and dirty state describe the measurement environment, not an attestation of which source was linked into rustc.",
+            "Checkout HEAD and tracked-file dirty state describe the measurement environment, not an attestation of which source was linked into rustc.",
         ],
     }
     path = work / "benchmark-report.json"
