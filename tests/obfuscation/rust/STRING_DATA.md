@@ -34,6 +34,11 @@ and skip events when `RUST_OBF_EVENT_FILE` is set. Relevant reasons include:
 `string_data.ll` checks ASCII, UTF-8, embedded NUL, arbitrary bytes, and
 Rust-style static/const descriptors. `string_data_skips.ll` covers exported,
 weak, metadata, early-initialization, mixed-selection, and other exclusions.
+The focused test also builds two modules defining the same weak byte array,
+requires `weak-or-comdat` from each pass invocation, and links them with
+`string_data_weak_consumer.c`. The consumer checks that both readers resolve
+to one allocation with exact bytes. ELF and COFF use an explicit COMDAT group;
+Mach-O uses its weak-definition coalescing because it cannot lower COMDAT IR.
 `string_data_indirect_ctor.ll` checks the conservative priority-zero indirect
 call exclusion. The focused test also runs the pass twice to verify that it
 does not register a second decoder.

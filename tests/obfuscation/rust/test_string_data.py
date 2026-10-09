@@ -29,6 +29,7 @@ RUST_CHUNKS = (
     b"m3-bytes-\0\xff\x80",
     b"m3-ffi-\0\xfe",
 )
+WEAK_MARKER = b"rust-weak-shared-74b2"
 SKIPS = {
     "exported": "non-local",
     "weak": "weak-or-comdat",
@@ -202,8 +203,93 @@ def check_unnamed_literal(opt, work):
     print("PASS opt unnamed Rust byte array: stable exact name and collision safety", flush=True)
 
 
+def check_weak_comdat(opt, clang, work):
+    """Link two duplicate definitions after both receive an explicit skip."""
+    # Mach-O supports weak coalescing but cannot lower an explicit LLVM COMDAT.
+    # ELF and COFF exercise the same weak_odr definition with a COMDAT group.
+    comdat = sys.platform != "darwin"
+    declaration = "$rust_weak_shared = comdat any\n" if comdat else ""
+    group = ", comdat($rust_weak_shared)" if comdat else ""
+    sources = {}
+    encoded = {}
+    for suffix in ("a", "b"):
+        source = work / f"weak-{suffix}.ll"
+        source.write_text(
+            f'source_filename = "string-data-weak-{suffix}"\n'
+            f"{declaration}"
+            f'@rust_weak_shared = weak_odr constant [{len(WEAK_MARKER)} x i8] '
+            f'c"{WEAK_MARKER.decode()}"{group}, align 1\n\n'
+            f'define i32 @read_{suffix}(i32 %index) {{\n'
+            'entry:\n'
+            '  %offset = zext i32 %index to i64\n'
+            '  %address = getelementptr inbounds i8, ptr @rust_weak_shared, i64 %offset\n'
+            '  %byte = load volatile i8, ptr %address, align 1\n'
+            '  %wide = zext i8 %byte to i32\n'
+            '  ret i32 %wide\n'
+            '}\n\n'
+            f'define ptr @weak_address_{suffix}() {{\n'
+            'entry:\n'
+            '  ret ptr @rust_weak_shared\n'
+            '}\n', encoding="utf-8")
+        sources[suffix] = source
+        output = work / f"weak-{suffix}-encoded.ll"
+        events = work / f"weak-{suffix}-events.jsonl"
+        events.unlink(missing_ok=True)
+        result = run([
+            str(opt), f"-obf-test-seed={SEED}", "-sobf-rust-bytes",
+            "-sobf-only-globals=rust_weak_shared", "-obf-report-skips",
+            "-passes=obf-string,verify", "-S", str(source), "-o", str(output),
+        ], env={**os.environ, "RUST_OBF_EVENT_FILE": str(events)})
+        records = [json.loads(line) for line in events.read_text().splitlines()]
+        skips = [entry for entry in records
+                 if entry.get("event") == "skip" and entry.get("kind") == "global"
+                 and entry.get("raw_name") == "rust_weak_shared"]
+        require(len(skips) == 1 and skips[0].get("reason") == "weak-or-comdat"
+                and 'symbol="rust_weak_shared" reason=weak-or-comdat'
+                in result.stderr.decode(),
+                f"{suffix}: duplicate definition lacked a precise weak/COMDAT skip")
+        require(not any(entry.get("event") == "effect" and
+                        entry.get("raw_name") == "rust_weak_shared"
+                        for entry in records),
+                f"{suffix}: duplicate definition was reported transformed")
+        ir = output.read_bytes()
+        require(WEAK_MARKER in ir and b"@rust_weak_shared = weak_odr constant" in ir
+                and b".datadiv_decode" not in ir,
+                f"{suffix}: skipped duplicate definition changed in IR")
+        encoded[suffix] = output
+
+    consumer = work / ("weak-consumer.obj" if sys.platform == "win32" else
+                       "weak-consumer.o")
+    run([*clang, "-O0", "-c", str(ROOT / "string_data_weak_consumer.c"),
+         "-o", str(consumer)])
+    require(WEAK_MARKER not in consumer.read_bytes(),
+            "C consumer contains the weak marker and would mask the final-data check")
+    for level in ("O0", "O2"):
+        for label, modules in (("baseline", sources), ("encoded", encoded)):
+            objects = []
+            for suffix in ("a", "b"):
+                obj = work / f"weak-{suffix}-{label}-{level}"
+                obj = obj.with_suffix(".obj" if sys.platform == "win32" else ".o")
+                run([*clang, "-x", "ir", f"-{level}", "-c",
+                     str(modules[suffix]), "-o", str(obj)])
+                require(WEAK_MARKER in obj.read_bytes(),
+                        f"{suffix}/{label}/{level}: object lost skipped weak bytes")
+                objects.append(obj)
+            executable = work / f"weak-{label}-{level}"
+            if sys.platform == "win32":
+                executable = executable.with_suffix(".exe")
+            run([*clang, str(consumer), *(str(obj) for obj in objects),
+                 "-o", str(executable)])
+            run([str(executable)], timeout=15)
+            require(WEAK_MARKER in executable.read_bytes(),
+                    f"{label}/{level}: linked artifact lost skipped weak bytes")
+    print("PASS duplicate weak/COMDAT data: both skips, linked coalescing, exact bytes",
+          flush=True)
+
+
 def check_opt(opt, clang, work):
     check_unnamed_literal(opt, work)
+    check_weak_comdat(opt, clang, work)
     fixture = ROOT / "string_data.ll"
     legacy = work / "legacy.ll"
     run([str(opt), f"-obf-test-seed={SEED}", "-passes=obf-string,verify",
