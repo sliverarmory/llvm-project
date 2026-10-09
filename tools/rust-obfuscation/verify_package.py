@@ -151,26 +151,29 @@ def main():
              "--opt", opt, "--clang", args.clang.resolve(), "--rustc", rustc,
              "--work-dir", work / "string-data"])
         run([sys.executable, ROOT / "tests/obfuscation/rust/run_eh_regions.py",
-             "--rustc", rustc, "--opt", opt,
+             "--rustc", rustc, "--opt", opt, "--objdump", objdump,
              "--work-dir", work / "eh-regions"])
         run([sys.executable, ROOT / "tests/obfuscation/rust/test_flatten_loop.py",
              "--rustc", rustc, "--opt", opt, "--objdump", objdump,
              "--work-dir", work / "flatten-loop"])
         cargo_command = [sys.executable, ROOT / "tests/obfuscation/rust/test_cargo.py",
                          "--wrapper", wrapper, "--rustc", rustc,
-                         "--objdump", objdump, "--work-dir", work / "cargo"]
+                         "--opt", opt, "--objdump", objdump,
+                         "--work-dir", work / "cargo"]
         if args.online:
             cargo_command.append("--online")
         run(cargo_command)
         run([sys.executable, ROOT / "tests/obfuscation/rust/test_lto.py",
-             "--wrapper", wrapper, "--rustc", rustc, "--objdump", objdump,
+             "--wrapper", wrapper, "--rustc", rustc, "--opt", opt,
+             "--objdump", objdump,
              "--work-dir", work / "lto"], timeout=1800)
         run([sys.executable, ROOT / "tests/obfuscation/rust/test_seed_parallel.py",
              "--rustc", rustc, "--objdump", objdump,
              "--work-dir", work / "seed-parallel"], timeout=900)
         run([sys.executable,
              ROOT / "tests/obfuscation/rust/test_cargo_outputs.py",
-             "--wrapper", wrapper, "--rustc", rustc, "--objdump", objdump,
+             "--wrapper", wrapper, "--rustc", rustc, "--opt", opt,
+             "--objdump", objdump,
              "--cc", args.clang.resolve(),
              "--work-dir", work / "cargo-outputs"], timeout=900)
     if args.benchmark:

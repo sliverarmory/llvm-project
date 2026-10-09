@@ -768,9 +768,27 @@ fn aggregate(
                 "obf-global-access" => "gai",
                 _ => unreachable!(),
             };
+            let global_pass = matches!(pass.as_str(), "obf-string" | "obf-global-access");
+            let primary_kind = if global_pass { "global" } else { "function" };
             let related: Vec<_> = events
                 .iter()
-                .filter(|event| event.pass == short_pass)
+                .filter(|event| event.pass == short_pass && event.kind == primary_kind)
+                .collect();
+            let function_events: Vec<_> = events
+                .iter()
+                .filter(|event| event.pass == short_pass && event.kind == "function")
+                .collect();
+            let matched_functions: BTreeSet<_> = function_events
+                .iter()
+                .filter(|event| {
+                    !matches!(event.reason.as_deref(), Some("not-selected" | "not-found"))
+                })
+                .map(|event| event.raw_name.as_str())
+                .collect();
+            let transformed_functions: BTreeSet<_> = function_events
+                .iter()
+                .filter(|event| event.event == "effect")
+                .map(|event| event.raw_name.as_str())
                 .collect();
             let matched: BTreeSet<_> = related
                 .iter()
@@ -784,25 +802,22 @@ fn aggregate(
                 .filter(|event| event.event == "effect")
                 .map(|event| event.raw_name.as_str())
                 .collect();
-            let skipped: BTreeSet<_> = related
+            let skipped: BTreeSet<_> = events
                 .iter()
                 .filter(|event| {
-                    event.event == "skip" && event.reason.as_deref() != Some("not-selected")
+                    event.pass == short_pass
+                        && event.event == "skip"
+                        && event.reason.as_deref() != Some("not-selected")
                 })
-                .map(|event| event.raw_name.as_str())
+                .map(|event| (event.kind.as_str(), event.raw_name.as_str()))
                 .collect();
-            let global_pass = matches!(pass.as_str(), "obf-string" | "obf-global-access");
-            let unmatched_functions = if global_pass {
-                Vec::new()
-            } else {
-                resolved
-                    .rule
-                    .functions
-                    .iter()
-                    .filter(|name| !matched.contains(name.as_str()))
-                    .cloned()
-                    .collect()
-            };
+            let unmatched_functions: Vec<_> = resolved
+                .rule
+                .functions
+                .iter()
+                .filter(|name| !matched_functions.contains(name.as_str()))
+                .cloned()
+                .collect();
             let unmatched_globals = if !global_pass {
                 Vec::new()
             } else {
@@ -817,13 +832,11 @@ fn aggregate(
             if transformed.is_empty()
                 || !unmatched_functions.is_empty()
                 || !unmatched_globals.is_empty()
-                || (!global_pass
-                    && !resolved.rule.functions.is_empty()
-                    && resolved
-                        .rule
-                        .functions
-                        .iter()
-                        .any(|name| !transformed.contains(name.as_str())))
+                || resolved
+                    .rule
+                    .functions
+                    .iter()
+                    .any(|name| !transformed_functions.contains(name.as_str()))
                 || (global_pass
                     && !resolved.rule.globals.is_empty()
                     && resolved

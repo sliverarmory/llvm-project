@@ -2,6 +2,7 @@
 
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/ADT/StringRef.h"
@@ -16,10 +17,13 @@
 #include "llvm/IR/Operator.h"
 #include "llvm/Pass.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Support/MD5.h"
+#include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Obfuscation/CryptoUtils.h"
 #include "llvm/Transforms/Obfuscation/StringObfuscation.h"
 #include "llvm/Transforms/Obfuscation/Utils.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
+#include <algorithm>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -104,6 +108,17 @@ static bool isNamedForEncoding(StringRef Name) {
   return false;
 }
 
+static std::string reportableGlobalName(const GlobalVariable &GV) {
+  if (GV.hasName())
+    return GV.getName().str();
+  // Unsafe anonymous globals remain unnamed in IR. Their printed operand
+  // slots still let reports distinguish individual skipped allocations.
+  std::string Operand;
+  raw_string_ostream Stream(Operand);
+  GV.printAsOperand(Stream, /*PrintType=*/false);
+  return Stream.str();
+}
+
 static bool hasByteArrayInitializer(const GlobalVariable &GV) {
   if (!GV.hasInitializer())
     return false;
@@ -183,7 +198,8 @@ static void collectEarlyCtorReaders(
 // a read from a priority-zero constructor would observe the encoded bytes.
 static StringRef rustByteUseSkipReason(
     GlobalVariable &GV, const SmallPtrSetImpl<const Function *> &EarlyReaders,
-    bool HasIndirectEarlyCall) {
+    bool HasIndirectEarlyCall,
+    SmallPtrSetImpl<const Function *> &RuntimeReaders) {
   if (HasIndirectEarlyCall)
     return "early-ctor-indirect-call";
 
@@ -237,20 +253,45 @@ static StringRef rustByteUseSkipReason(
       if (isa<PtrToIntInst>(I) || isa<ICmpInst>(I) ||
           isa<ReturnInst>(I)) {
         HasRuntimeUse = true;
+        // An address conversion, comparison, or return does not read the
+        // protected bytes. It keeps the allocation live, but cannot prove a
+        // selected function consumed its contents.
         continue;
       }
-      if (const auto *SI = dyn_cast<StoreInst>(I)) {
+      if (auto *SI = dyn_cast<StoreInst>(I)) {
         if (SI->getPointerOperand() == V)
           return "written-before-decode";
         if (!isa<AllocaInst>(getUnderlyingObject(SI->getPointerOperand())))
           return "pointer-escapes";
         HasRuntimeUse = true;
+        // Rust slices often put the byte pointer in a stack descriptor that
+        // black_box makes opaque. Follow an unambiguous direct load from that
+        // slot rather than crediting the pointer store as a byte read.
+        Value *Slot = SI->getPointerOperand();
+        if (isa<AllocaInst>(Slot)) {
+          bool OtherStore = false;
+          for (User *SlotUser : Slot->users())
+            if (auto *OtherSI = dyn_cast<StoreInst>(SlotUser);
+                OtherSI && OtherSI != SI &&
+                OtherSI->getPointerOperand() == Slot)
+              OtherStore = true;
+          if (!OtherStore)
+            for (User *SlotUser : Slot->users())
+              if (auto *SlotLoad = dyn_cast<LoadInst>(SlotUser);
+                  SlotLoad && SlotLoad->getPointerOperand() == Slot &&
+                  SlotLoad->getType()->isPointerTy())
+                Pending.push_back(SlotLoad);
+        }
         continue;
       }
-      if (const auto *LI = dyn_cast<LoadInst>(I)) {
+      if (auto *LI = dyn_cast<LoadInst>(I)) {
         if (LI->isAtomic() || LI->isVolatile())
           return "atomic-or-volatile";
         HasRuntimeUse = true;
+        if (LI->getType()->isPointerTy() || LI->getType()->isAggregateType())
+          Pending.push_back(LI);
+        else
+          RuntimeReaders.insert(F);
         continue;
       }
       if (const auto *CB = dyn_cast<CallBase>(I)) {
@@ -266,6 +307,7 @@ static StringRef rustByteUseSkipReason(
             return "unsupported-intrinsic-use";
         }
         HasRuntimeUse = true;
+        RuntimeReaders.insert(F);
         continue;
       }
       if (isa<GetElementPtrInst>(I) || isa<BitCastInst>(I) ||
@@ -284,7 +326,9 @@ static StringRef rustByteUseSkipReason(
 static StringRef stringSkipReason(
     GlobalVariable &GV, bool RustByteArrays,
     const SmallPtrSetImpl<const Function *> &EarlyReaders,
-    bool HasIndirectEarlyCall) {
+    bool HasIndirectEarlyCall,
+    SmallPtrSetImpl<const Function *> &RuntimeReaders,
+    bool CheckSelection) {
   if (GV.hasMetadata("obf.sobf"))
     return "already-encoded";
   if (GV.hasMetadata("obf.constenc"))
@@ -313,7 +357,7 @@ static StringRef stringSkipReason(
   } else if (!hasCStringInitializer(GV)) {
     return "not-c-string";
   }
-  if (!isNamedForEncoding(GV.getName()))
+  if (CheckSelection && !isNamedForEncoding(GV.getName()))
     return "not-selected";
 
   const auto *CDS = cast<ConstantDataSequential>(GV.getInitializer());
@@ -333,7 +377,7 @@ static StringRef stringSkipReason(
     if (GV.hasMetadataOtherThanDebugLocAndGuid())
       return "metadata";
     if (StringRef Reason = rustByteUseSkipReason(
-            GV, EarlyReaders, HasIndirectEarlyCall);
+            GV, EarlyReaders, HasIndirectEarlyCall, RuntimeReaders);
         !Reason.empty())
       return Reason;
   }
@@ -382,19 +426,51 @@ public:
     if (RustByteArrays)
       collectEarlyCtorReaders(M, EarlyReaders, HasIndirectEarlyCall);
 
-    for (Module::global_iterator GI = M.global_begin(), GE = M.global_end();
-         GI != GE; ++GI) {
-      GlobalVariable *GV = &*GI;
+    // rustc often creates private literal allocations without an LLVM name.
+    // Derive stable names for safe, eligible arrays before applying exact
+    // selection. Only selected arrays are renamed. The module digest
+    // distinguishes codegen units; the ordinal and symbol-table check
+    // distinguish allocations within one unit.
+    MD5 ModuleHash;
+    ModuleHash.update(M.getModuleIdentifier());
+    SmallString<32> ModuleDigest = ModuleHash.final().digest();
+    std::string SyntheticPrefix = ".rust.obf.bytes.";
+    SyntheticPrefix += ModuleDigest.str().str();
+    SyntheticPrefix += '.';
+    uint64_t SyntheticOrdinal = 0;
+
+    SmallVector<GlobalVariable *, 16> OriginalGlobals;
+    for (GlobalVariable &GV : M.globals())
+      OriginalGlobals.push_back(&GV);
+    for (GlobalVariable *GV : OriginalGlobals) {
       // Ordinary non-string globals are outside this pass. An explicitly
       // named global is still reported if it cannot be encoded safely.
       if (!(RustByteArrays ? hasByteArrayInitializer(*GV)
                            : hasCStringInitializer(*GV)) &&
           (OnlyStringGlobals.empty() || !isNamedForEncoding(GV->getName())))
         continue;
-      if (StringRef Reason = stringSkipReason(
-              *GV, RustByteArrays, EarlyReaders, HasIndirectEarlyCall);
-          !Reason.empty()) {
-        reportObfuscationSkip("sobf", "global", GV->getName(), Reason);
+      SmallPtrSet<const Function *, 16> RuntimeReaders;
+      const bool NeedsSyntheticName = RustByteArrays && GV->getName().empty();
+      StringRef Reason = stringSkipReason(
+          *GV, RustByteArrays, EarlyReaders, HasIndirectEarlyCall,
+          RuntimeReaders, /*CheckSelection=*/!NeedsSyntheticName);
+      std::string Candidate;
+      if (Reason.empty() && NeedsSyntheticName) {
+        do {
+          Candidate = SyntheticPrefix + std::to_string(SyntheticOrdinal++);
+        } while (M.getNamedValue(Candidate));
+        if (!isNamedForEncoding(Candidate))
+          Reason = "not-selected";
+        else {
+          GV->setName(Candidate);
+          Changed = true;
+        }
+      }
+      if (!Reason.empty()) {
+        reportObfuscationSkip("sobf", "global",
+                              Candidate.empty() ? reportableGlobalName(*GV)
+                                                : Candidate,
+                              Reason);
         continue;
       }
 
@@ -428,6 +504,15 @@ public:
       ToDelete.push_back(GV);
       EncodedGlobals.push_back({DynGV, Key, Step, Size});
       reportObfuscationEffect("sobf", "global", DynGV->getName());
+      // A global effect alone cannot prove that each explicitly selected
+      // function used eligible data. Report its runtime readers only after
+      // the array has actually been encoded.
+      SmallVector<StringRef, 16> ReaderNames;
+      for (const Function *Reader : RuntimeReaders)
+        ReaderNames.push_back(Reader->getName());
+      std::sort(ReaderNames.begin(), ReaderNames.end());
+      for (StringRef Name : ReaderNames)
+        reportObfuscationEffect("sobf", "function", Name);
       ++GlobalsEncoded;
       Changed = true;
     }

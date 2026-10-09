@@ -18,6 +18,8 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/TargetParser/Triple.h"
 #include "llvm/Transforms/Obfuscation/Utils.h"
+#include <cstdint>
+#include <map>
 #include <string>
 
 using namespace llvm;
@@ -214,6 +216,7 @@ PreservedAnalyses GlobalAccessIndirectionPass::run(Module &M,
                            ? createPointerHelper(M, *GV, *Slot, Marker)
                            : nullptr;
 
+    std::map<std::string, uint64_t> FunctionSites;
     for (const AccessSite &Site : Sites) {
       IRBuilder<> Builder(Site.Inst);
       Value *Pointer;
@@ -229,8 +232,11 @@ PreservedAnalyses GlobalAccessIndirectionPass::run(Module &M,
         Pointer = Load;
       }
       Site.Inst->setOperand(Site.PointerOperand, Pointer);
+      ++FunctionSites[Site.Inst->getFunction()->getName().str()];
     }
     reportObfuscationEffect("gai", "global", GV->getName(), Sites.size());
+    for (const auto &[Name, Count] : FunctionSites)
+      reportObfuscationEffect("gai", "function", Name, Count);
     Changed = true;
   }
 

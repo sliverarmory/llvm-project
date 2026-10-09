@@ -5,7 +5,9 @@ the pinned Rust 1.99/LLVM 23 compiler. The workspace has no external packages,
 so `--locked --offline` works on a fresh host. The selected rules use one
 deterministic seed. Each rule must report an effect on its exported probe. The
 runner then executes both builds and compares the probe's final linked machine
-instructions, rather than treating a Cargo report as final-code proof.
+instructions, rather than treating a Cargo report as final-code proof. It also
+verifies the LLVM bitcode saved by those same Cargo builds with this fork's
+`opt`.
 
 | Selected target | Consumer and final-code witness |
 | --- | --- |
@@ -22,12 +24,13 @@ compiler:
 python3 tests/obfuscation/rust/test_cargo_outputs.py \
   --rustc build-rust-1.99/build/<host>/stage1/bin/rustc \
   --wrapper build-llvm-project/cargo-wrapper-target/release/rust-obf-cargo \
+  --opt build-llvm-project/bin/opt \
   --objdump build-llvm-project/bin/llvm-objdump \
   --cc clang \
   --work-dir build-llvm-project/rust-output-acceptance
 ```
 
-The runner sets `RUSTFLAGS=-C prefer-dynamic` for both builds. A Rust `dylib`
+The runner sets `-C prefer-dynamic -C save-temps=yes` for both builds. A Rust `dylib`
 linked into a Rust executable needs the same dynamic Rust standard library;
 the ordinary static-`std` mode fails with `cannot satisfy dependencies so std
 only shows up once`. The runner adds the selected target directory and dynamic

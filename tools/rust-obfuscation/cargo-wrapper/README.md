@@ -71,6 +71,19 @@ monomorphizations, closure bodies, and async state-machine methods matching a
 crate-wide rule are considered separately. An exact raw function selector
 names one emitted symbol only. Inlined code that no longer has a function at
 the pipeline stage cannot be selected by name and is reported as unmatched.
+Eligible unnamed private Rust byte arrays receive collision-safe synthetic
+LLVM names of the form `.rust.obf.bytes.<module-digest>.<ordinal>` before
+`globals` selection and effect reporting. Discover those exact names in a
+report for the same pinned compiler, source, optimization, and codegen-unit
+configuration before using them as selectors; they are not stable source-level
+identifiers. Unsafe or ineligible unnamed globals are not renamed. When a
+global pass also has `functions`, strict mode requires an effect event for
+each selected function and each selected global. Skipped unnamed globals keep
+their printable LLVM `@N` operand slot in the report so separate exclusions
+remain distinguishable.
+`skipped_symbols` counts distinct skipped kind/name pairs, including protected
+EH blocks and module-level skips; `matched_symbols` and `transformed_symbols`
+count the pass's selected functions or globals.
 `targets` use Cargo target names (hyphens and underscores compare equally).
 `crate_types` accepts `bin`, `rlib`, `dylib`, `cdylib`, and `staticlib`. An
 empty target or type list accepts all non-host targets in that package.
@@ -90,18 +103,21 @@ unmatched selectors. `cargo check` explicitly reports
 
 The event and target directories sit beside the requested report for audit.
 Treat the report as build evidence, not as proof that effects survived final
-linking. The focused Cargo regression runs the executable and inspects its
-linked output in addition to checking the report.
+linking. The focused Cargo regression verifies the emitted bitcode with this
+fork's `opt`, runs the executable, and inspects linked code, including a
+selected registry dependency.
 
 The LTO gate builds a selected workspace library and a mirrored unselected
 library, then checks both in the linked app. It covers O2/O3, one/four codegen
 units, `lto="off"`, `lto=false`, ThinLTO, and fat LTO; it also checks the
-remaining selected pass families under Thin/Fat LTO and an incremental rebuild:
+remaining selected pass families under Thin/Fat LTO, verifies the emitted
+bitcode, and exercises an incremental rebuild:
 
 ```sh
 python3 tests/obfuscation/rust/test_lto.py \
   --wrapper /path/to/rust-obf-cargo \
   --rustc /path/to/custom-rust-1.99/bin/rustc \
+  --opt build-llvm-project/bin/opt \
   --objdump build-llvm-project/bin/llvm-objdump \
   --work-dir /tmp/rust-obf-lto
 ```

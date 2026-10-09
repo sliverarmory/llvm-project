@@ -58,7 +58,12 @@ static bool flattenNormalEHBranches(Function &F) {
 
   SmallVector<BranchInst *, 32> Candidates;
   for (BasicBlock &BB : F) {
-    if (Protected.contains(&BB) || hasMustTailCall(BB))
+    if (Protected.contains(&BB)) {
+      reportObfuscationSkip("fla", "block", BB.getNameOrAsOperand(),
+                            "protected-eh-region");
+      continue;
+    }
+    if (hasMustTailCall(BB))
       continue;
     auto *Br = dyn_cast<BranchInst>(BB.getTerminator());
     if (!Br || !Br->isConditional() ||

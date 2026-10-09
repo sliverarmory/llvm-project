@@ -214,6 +214,12 @@ struct BogusControlFlow : public FunctionPass {
           return false;
         }
       }
+      // Report protected blocks once before the per-round candidate walk.
+      // Their identities remain visible even when ordinary blocks are cloned.
+      for (BasicBlock &BB : F)
+        if (ProtectedEHBlocks.contains(&BB))
+          reportObfuscationSkip("bcf", "block", BB.getNameOrAsOperand(),
+                                "protected-eh-region");
       bool HadCandidate = false;
       if (!bogus(F, ProtectedEHBlocks, HadCandidate)) {
         reportObfuscationSkip("bcf", "function", F.getName(),

@@ -14,6 +14,8 @@ FIXTURE = Path(__file__).resolve().parent / "cargo_fixture"
 MEMBER = "rust-obf-member"
 REGISTRY = "adler2"
 EXPECTED = "23109:23109:1.5:292160369\n"
+STRING_MARKER = b"m2-member-text-secret-75b13a"
+INLINE_MARKER = b"m2-inline-secret-04b1a8"
 
 
 def run(command, *, env=None, code=0, timeout=240):
@@ -24,6 +26,31 @@ def run(command, *, env=None, code=0, timeout=240):
             f"expected exit {code}, got {result.returncode}: {command!r}\n"
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}")
     return result
+
+
+def saved_ir_env(base=None):
+    env = dict(os.environ if base is None else base)
+    if "CARGO_ENCODED_RUSTFLAGS" in env:
+        prior = env["CARGO_ENCODED_RUSTFLAGS"]
+        env["CARGO_ENCODED_RUSTFLAGS"] = (
+            prior + ("\x1f" if prior else "") + "-C\x1fsave-temps=yes")
+    else:
+        env["RUSTFLAGS"] = (env.get("RUSTFLAGS", "") +
+                            " -C save-temps=yes").strip()
+    return env
+
+
+def verify_emitted_ir(opt, target_dir, host, crates):
+    deps = target_dir / host / "release" / "deps"
+    bitcode = sorted(deps.glob("*.rcgu.bc"))
+    assert bitcode, f"Cargo emitted no saved LLVM IR in {deps}"
+    for crate in crates:
+        name = crate.replace("-", "_")
+        assert any(path.name.startswith((name + "-", name + "."))
+                   for path in bitcode), (crate, bitcode)
+    for path in bitcode:
+        run([str(opt), "-passes=verify", "-disable-output", str(path)],
+            timeout=30)
 
 
 def host_triple(rustc):
@@ -74,6 +101,15 @@ def registry_rule():
             "crate_types": ["rlib"], "passes": ["obf-sub"]}
 
 
+def string_rule(*, global_name=None, functions=None):
+    rule = {"name": MEMBER, "source": "workspace", "targets": ["rust-obf-member"],
+            "crate_types": ["rlib"], "passes": ["obf-string"],
+            "functions": functions or ["member_value"]}
+    if global_name:
+        rule["globals"] = [global_name]
+    return rule
+
+
 def cargo_args(offline):
     args = ["build", "--release", "--locked", "--manifest-path",
             str(FIXTURE / "Cargo.toml"), "-p", "rust-obf-app"]
@@ -104,16 +140,23 @@ def assert_selection(report, selected):
             assert invocation["status"] == "unselected", invocation
 
 
-def build_with_wrapper(wrapper, rustc, cargo, work_dir, rules, label, *, offline=True,
-                       strict=True, expected_code=0):
+def build_with_wrapper(wrapper, rustc, cargo, opt, host, work_dir, rules, label,
+                       *, offline=True, strict=True, expected_code=0,
+                       extra_env=None):
     config_path = work_dir / f"{label}-config.json"
     report_path = work_dir / f"{label}-report.json"
     config_path.write_text(json.dumps(config(rustc, rules, strict=strict, cargo=cargo), indent=2) + "\n")
     command = [str(wrapper), "--config", str(config_path), "--report",
                str(report_path), "--", *cargo_args(offline)]
-    result = run(command, code=expected_code, timeout=600)
+    env = saved_ir_env()
+    env.update(extra_env or {})
+    result = run(command, env=env, code=expected_code, timeout=600)
     assert report_path.exists(), result.stderr
-    return json.loads(report_path.read_text()), result
+    report = json.loads(report_path.read_text())
+    if expected_code == 0:
+        verify_emitted_ir(opt, Path(report["target_dir"]), host,
+                          (rule["name"] for rule in rules))
+    return report, result
 
 
 def main():
@@ -122,26 +165,30 @@ def main():
     parser.add_argument("--rustc", type=Path, required=True)
     parser.add_argument("--cargo", default="cargo")
     parser.add_argument("--objdump", type=Path, required=True)
+    parser.add_argument("--opt", type=Path, required=True)
     parser.add_argument("--work-dir", type=Path, required=True)
     parser.add_argument("--online", action="store_true",
                         help="allow Cargo to fetch the pinned registry crates")
     args = parser.parse_args()
     wrapper = args.wrapper.resolve()
     rustc = args.rustc.resolve()
+    opt = args.opt.resolve()
     work_dir = args.work_dir.resolve()
     work_dir.mkdir(parents=True, exist_ok=True)
     host = host_triple(rustc)
-    env = os.environ.copy()
+    env = saved_ir_env()
     env["RUSTC"] = str(rustc)
     env["CARGO_TARGET_DIR"] = str(work_dir / "baseline-target")
     baseline = [args.cargo, *cargo_args(not args.online), "--target", host]
     run(baseline, env=env, timeout=600)
+    verify_emitted_ir(opt, Path(env["CARGO_TARGET_DIR"]), host,
+                      (MEMBER, REGISTRY))
     ordinary = executable(Path(env["CARGO_TARGET_DIR"]), host)
     assert run([str(ordinary)]).stdout == EXPECTED
 
     # The wrapper owns its fresh target directory, so these are independent
     # builds even when Cargo fingerprints would otherwise reuse dependencies.
-    report, _ = build_with_wrapper(wrapper, rustc, args.cargo, work_dir,
+    report, _ = build_with_wrapper(wrapper, rustc, args.cargo, opt, host, work_dir,
                                    [member_rule(), registry_rule()], "both",
                                    offline=not args.online)
     assert_selection(report, [MEMBER, REGISTRY])
@@ -153,21 +200,125 @@ def main():
         machine_instructions(args.objdump, executable(both_dir, host), "member_value"), \
         "selected workspace function has unchanged final machine code"
 
-    registry_only, _ = build_with_wrapper(wrapper, rustc, args.cargo, work_dir,
+    registry_only, _ = build_with_wrapper(wrapper, rustc, args.cargo, opt, host, work_dir,
                                           [registry_rule()], "registry-only",
                                           offline=not args.online)
     assert_selection(registry_only, [REGISTRY])
     assert all(item["package_id"] is None for item in registry_only["invocations"]
                if item["crate_name"] == "rust_obf_member")
+    registry_binary = executable(Path(registry_only["target_dir"]), host)
+    assert run([str(registry_binary)]).stdout == EXPECTED
+    registry_effects = [event for event in selected_packages(registry_only)[REGISTRY]["events"]
+                        if event["event"] == "effect" and event["pass"] == "sub"
+                        and event["kind"] == "function"]
+    assert registry_effects, "selected registry package has no function effect"
+    if sys.platform == "win32":
+        # PE binaries need an explicit export for llvm-objdump to identify a
+        # linked Rust function reliably. Discover its exact mangled name from
+        # the first selected build, then export it from both fresh binaries.
+        assert len(registry_effects) == 1, registry_effects
+        symbol = registry_effects[0]["raw_name"]
+        exported_env = saved_ir_env()
+        exported_env.update({
+            "RUSTC": str(rustc),
+            "CARGO_TARGET_DIR": str(work_dir / "registry-exported-baseline"),
+            "RUST_OBF_TEST_EXPORT_SYMBOL": symbol,
+        })
+        run(baseline, env=exported_env, timeout=600)
+        exported_baseline = executable(Path(exported_env["CARGO_TARGET_DIR"]), host)
+        verify_emitted_ir(opt, Path(exported_env["CARGO_TARGET_DIR"]), host,
+                          (MEMBER, REGISTRY))
+        assert run([str(exported_baseline)]).stdout == EXPECTED
+        exported_report, _ = build_with_wrapper(
+            wrapper, rustc, args.cargo, opt, host, work_dir,
+            [registry_rule()], "registry-exported", offline=not args.online,
+            extra_env={"RUST_OBF_TEST_EXPORT_SYMBOL": symbol})
+        assert_selection(exported_report, [REGISTRY])
+        exported_binary = executable(Path(exported_report["target_dir"]), host)
+        assert run([str(exported_binary)]).stdout == EXPECTED
+        assert any(event["event"] == "effect" and event["raw_name"] == symbol
+                   for event in selected_packages(exported_report)[REGISTRY]["events"])
+        assert machine_instructions(args.objdump, exported_baseline, symbol) != \
+            machine_instructions(args.objdump, exported_binary, symbol), \
+            "selected registry function has unchanged final machine code"
+    else:
+        assert any(machine_instructions(args.objdump, ordinary, event["raw_name"]) !=
+                   machine_instructions(args.objdump, registry_binary, event["raw_name"])
+                   for event in registry_effects), \
+            "selected registry function has unchanged final machine code"
+    assert machine_instructions(args.objdump, ordinary, "member_value") == \
+        machine_instructions(args.objdump, registry_binary, "member_value"), \
+        "unselected workspace function changed in the registry-only build"
 
-    member_only, _ = build_with_wrapper(wrapper, rustc, args.cargo, work_dir,
+    # Discover the Rust allocation's raw LLVM name through a successful
+    # function-scoped build, then require that exact global and function in a
+    # second build. A third build proves that one real effect cannot hide an
+    # additional, nonexistent function selector in strict mode.
+    string_discovery, _ = build_with_wrapper(
+        wrapper, rustc, args.cargo, opt, host, work_dir,
+        [string_rule()], "string-discovery",
+        offline=not args.online)
+    assert_selection(string_discovery, [MEMBER])
+    string_globals = [event["raw_name"] for event in
+                      selected_packages(string_discovery)[MEMBER]["events"]
+                      if event["event"] == "effect" and event["pass"] == "sobf"
+                      and event["kind"] == "global"
+                      and event["raw_name"].endswith("MEMBER_TEXT")]
+    assert len(string_globals) == 1, string_globals
+    global_name = string_globals[0]
+    anonymous_globals = [event["raw_name"] for event in
+                         selected_packages(string_discovery)[MEMBER]["events"]
+                         if event["event"] == "effect" and event["pass"] == "sobf"
+                         and event["kind"] == "global"
+                         and event["raw_name"].startswith(".rust.obf.bytes.")]
+    assert len(anonymous_globals) == 1, anonymous_globals
+    anonymous_name = anonymous_globals[0]
+    assert INLINE_MARKER in ordinary.read_bytes()
+    for label in ("anonymous-exact-first", "anonymous-exact-repeat"):
+        anonymous_report, _ = build_with_wrapper(
+            wrapper, rustc, args.cargo, opt, host, work_dir,
+            [string_rule(global_name=anonymous_name)], label,
+            offline=not args.online)
+        assert_selection(anonymous_report, [MEMBER])
+        events = selected_packages(anonymous_report)[MEMBER]["events"]
+        assert [event["raw_name"] for event in events
+                if event["event"] == "effect" and event["pass"] == "sobf"
+                and event["kind"] == "global"] == [anonymous_name], events
+        anonymous_binary = executable(Path(anonymous_report["target_dir"]), host)
+        assert run([str(anonymous_binary)]).stdout == EXPECTED
+        assert INLINE_MARKER not in anonymous_binary.read_bytes()
+        assert STRING_MARKER in anonymous_binary.read_bytes()
+    selected_string, _ = build_with_wrapper(
+        wrapper, rustc, args.cargo, opt, host, work_dir,
+        [string_rule(global_name=global_name)], "string-exact",
+        offline=not args.online)
+    assert_selection(selected_string, [MEMBER])
+    string_summary = selected_packages(selected_string)[MEMBER]["pass_summary"]["obf-string"]
+    assert string_summary["unmatched_functions"] == []
+    assert string_summary["unmatched_globals"] == []
+    string_binary = executable(Path(selected_string["target_dir"]), host)
+    assert run([str(string_binary)]).stdout == EXPECTED
+    assert STRING_MARKER in ordinary.read_bytes()
+    assert STRING_MARKER not in string_binary.read_bytes()
+    string_unmatched, _ = build_with_wrapper(
+        wrapper, rustc, args.cargo, opt, host, work_dir,
+        [string_rule(global_name=global_name,
+                     functions=["member_value", "definitely_absent"])],
+        "string-unmatched", offline=not args.online, expected_code=2)
+    skipped_summary = selected_packages(string_unmatched)[MEMBER]["pass_summary"]["obf-string"]
+    assert skipped_summary["transformed_symbols"] > 0, skipped_summary
+    assert skipped_summary["unmatched_globals"] == [], skipped_summary
+    assert skipped_summary["unmatched_functions"] == ["definitely_absent"], skipped_summary
+    assert not string_unmatched["strict_passed"]
+
+    member_only, _ = build_with_wrapper(wrapper, rustc, args.cargo, opt, host, work_dir,
                                         [member_rule()], "member-only",
                                         offline=not args.online)
     assert_selection(member_only, [MEMBER])
     assert all(item["package_id"] is None for item in member_only["invocations"]
                if item["crate_name"] == "adler2")
 
-    unmatched, _ = build_with_wrapper(wrapper, rustc, args.cargo, work_dir,
+    unmatched, _ = build_with_wrapper(wrapper, rustc, args.cargo, opt, host, work_dir,
                                        [member_rule("definitely_absent")], "unmatched",
                                        offline=not args.online, expected_code=2)
     summary = unmatched["packages"][0]["pass_summary"]["obf-split"]

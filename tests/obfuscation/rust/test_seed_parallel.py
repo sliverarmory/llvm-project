@@ -129,7 +129,8 @@ def check_branches(rustc, objdump, work_dir):
 
 def encoded_globals(ir, records):
     names = {entry["raw_name"] for entry in records
-             if entry["event"] == "effect" and entry["pass"] == "sobf"}
+             if entry["event"] == "effect" and entry["pass"] == "sobf"
+             and entry["kind"] == "global"}
     assert len(names) >= 5, names
     values = {}
     for name in names:

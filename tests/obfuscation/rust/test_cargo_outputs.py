@@ -67,7 +67,9 @@ def env_for(rustc, sysroot, host, target_dir):
     env["RUSTC"] = str(rustc)
     # A Rust dylib consumed by a Rust executable must share the dynamically
     # linked Rust sysroot; the default static std fails with duplicate crates.
-    env["RUSTFLAGS"] = "-C prefer-dynamic"
+    # Save the exact Cargo invocation's LLVM IR for the independent opt gate.
+    env["RUSTFLAGS"] = "-C prefer-dynamic -C save-temps=yes"
+    env.pop("CARGO_ENCODED_RUSTFLAGS", None)
     env["CARGO_TARGET_DIR"] = str(target_dir)
     paths = [sysroot / "lib" / "rustlib" / host / "lib",
              sysroot / "bin", sysroot / "lib",
@@ -112,6 +114,20 @@ def machine_instructions(objdump, path, symbol):
     instructions = re.findall(r"(?m)^\s*[0-9a-f]+:\s+([a-z][a-z0-9_.]*)\b", output)
     assert instructions, (path, symbol, output[:2000])
     return instructions
+
+
+def verify_emitted_ir(opt, target_dir, host):
+    deps = target_dir / host / "release" / "deps"
+    bitcode = sorted(deps.glob("*.rcgu.bc"))
+    assert bitcode, f"Cargo emitted no saved LLVM IR in {deps}"
+    for name in OUTPUTS:
+        crate = name.replace("-", "_")
+        assert any(path.name.startswith((crate + "-", crate + "."))
+                   for path in bitcode), (
+            name, bitcode)
+    for path in bitcode:
+        run([str(opt), "-passes=verify", "-disable-output", str(path)],
+            timeout=30)
 
 
 def compile_c(cc, source, output, *, library=None, native_libs=()):
@@ -162,17 +178,17 @@ def check_runtime(root, host, sysroot, target_dir, cc, native_libs):
     cdylib = artifact(directory, "obf-output-cdylib", "cdylib")
     staticlib = artifact(directory, "obf-output-staticlib", "staticlib")
     assert cdylib.is_file() and staticlib.is_file(), (cdylib, staticlib)
-    if cc:
-        extension = ".exe" if sys.platform == "win32" else ""
-        dynamic_exe = target_dir / ("cdylib-c-consumer" + extension)
-        static_exe = target_dir / ("staticlib-c-consumer" + extension)
-        compile_c(cc, FIXTURE / "cdylib_consumer.c", dynamic_exe)
-        compile_c(cc, FIXTURE / "staticlib_consumer.c", static_exe,
-                  library=staticlib, native_libs=native_libs)
-        observed["cdylib-c-consumer"] = run(
-            [str(dynamic_exe), str(cdylib)], env=env, timeout=30).stdout
-        observed["staticlib-c-consumer"] = run(
-            [str(static_exe)], env=env, timeout=30).stdout
+    extension = ".exe" if sys.platform == "win32" else ""
+    dynamic_exe = target_dir / ("cdylib-c-consumer" + extension)
+    static_exe = target_dir / ("staticlib-c-consumer" + extension)
+    compile_c(cc, FIXTURE / "cdylib_consumer.c", dynamic_exe)
+    compile_c(cc, FIXTURE / "staticlib_consumer.c", static_exe,
+              library=staticlib, native_libs=native_libs)
+    observed["cdylib-c-consumer"] = run(
+        [str(dynamic_exe), str(cdylib)], env=env, timeout=30).stdout
+    observed["staticlib-c-consumer"] = run(
+        [str(static_exe)], env=env, timeout=30).stdout
+    assert set(observed) == set(EXPECTED), (observed, EXPECTED)
     for name, output in observed.items():
         assert output == EXPECTED[name], (name, output, EXPECTED[name])
     return observed
@@ -200,8 +216,15 @@ def check_report(report):
         assert package["compiled"] >= 1, (name, package)
         summary = package["pass_summary"][pass_name]
         assert summary["transformed_symbols"] > 0 and summary["transformed_sites"] > 0, (name, summary)
-        assert any(event["event"] == "effect" and event["raw_name"] == symbol
-                   for event in package["events"]), (name, symbol, package["events"])
+        short_pass = "sub" if pass_name == "obf-sub" else "split"
+        effects = [event for event in package["events"]
+                   if event["event"] == "effect" and event["pass"] == short_pass]
+        names = [event["raw_name"] for event in effects]
+        assert names.count(symbol) == 1 and len(names) == len(set(names)), (
+            name, symbol, effects)
+        assert len(effects) == summary["transformed_symbols"], (name, summary, effects)
+        assert sum(event["count"] for event in effects) == summary["transformed_sites"], (
+            name, summary, effects)
         assert any(invocation["crate_name"] == name.replace("-", "_")
                    and kind in invocation["crate_type"]
                    and invocation["status"] == "selected"
@@ -217,7 +240,7 @@ def check_report(report):
         assert any(witness in name for name in names), (witness, sorted(names))
 
 
-def check_final_effects(objdump, host, baseline, selected, cc):
+def check_final_effects(objdump, host, baseline, selected):
     before_dir = baseline / host / "release"
     after_dir = selected / host / "release"
     result = {}
@@ -227,8 +250,6 @@ def check_final_effects(objdump, host, baseline, selected, cc):
             before = artifact(before_dir, "obf-output-rlib-consumer", "bin")
             after = artifact(after_dir, "obf-output-rlib-consumer", "bin")
         elif kind == "staticlib":
-            if not cc:
-                continue
             # The archive is intermediate until the C consumer links it.
             suffix = ".exe" if sys.platform == "win32" else ""
             before = baseline / ("staticlib-c-consumer" + suffix)
@@ -259,6 +280,7 @@ def main():
     parser.add_argument("--rustc", type=Path, required=True)
     parser.add_argument("--wrapper", type=Path, required=True)
     parser.add_argument("--objdump", type=Path, required=True)
+    parser.add_argument("--opt", type=Path, required=True)
     parser.add_argument("--cargo", default="cargo")
     parser.add_argument("--cc", default="clang")
     parser.add_argument("--work-dir", type=Path, required=True)
@@ -266,18 +288,18 @@ def main():
     rustc = args.rustc.resolve()
     wrapper = args.wrapper.resolve()
     objdump = args.objdump.resolve()
+    opt = args.opt.resolve()
     host, sysroot, version = toolchain(rustc)
     cc = shutil.which(args.cc)
-    if not cc and sys.platform != "win32":
-        raise AssertionError(f"C compiler unavailable: {args.cc}")
     if not cc:
-        print("SKIP C consumers on Windows: clang driver unavailable", flush=True)
+        raise AssertionError(f"C compiler unavailable: {args.cc}")
     work = args.work_dir.resolve() / ("run-" + uuid.uuid4().hex[:12])
     work.mkdir(parents=True)
     native_libs = native_static_libs(rustc, work)
     baseline = work / "baseline"
     baseline_env = env_for(rustc, sysroot, host, baseline)
     run([args.cargo, *cargo_args(host)], env=baseline_env)
+    verify_emitted_ir(opt, baseline, host)
     ordinary = check_runtime(rustc, host, sysroot, baseline, cc, native_libs)
 
     config_path = work / "obfuscation.json"
@@ -289,14 +311,14 @@ def main():
     report = json.loads(report_path.read_text())
     check_report(report)
     selected = selected_target_dir(report)
+    verify_emitted_ir(opt, selected, host)
     protected = check_runtime(rustc, host, sysroot, selected, cc, native_libs)
-    assert protected == ordinary == {key: value for key, value in EXPECTED.items()
-                                       if cc or key not in ("cdylib-c-consumer", "staticlib-c-consumer")}
-    final = check_final_effects(objdump, host, baseline, selected, cc)
+    assert protected == ordinary == EXPECTED
+    final = check_final_effects(objdump, host, baseline, selected)
     (work / "acceptance-result.json").write_text(json.dumps({
         "host": host, "rustc": version, "runtime": protected,
         "final_effects": final,
-        "skips": [] if cc else ["Windows C consumers require a clang-compatible driver"],
+        "skips": [],
     }, indent=2) + "\n")
     print(f"PASS Cargo output acceptance: {work}", flush=True)
 

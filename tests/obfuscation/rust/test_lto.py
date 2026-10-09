@@ -64,6 +64,30 @@ def llvm_tool_path(objdump, name):
     return objdump.with_name(name + suffix)
 
 
+def saved_ir_env(base=None):
+    """Keep the IR from the actual Cargo invocation for independent verification."""
+    env = dict(os.environ if base is None else base)
+    if "CARGO_ENCODED_RUSTFLAGS" in env:
+        prior = env["CARGO_ENCODED_RUSTFLAGS"]
+        env["CARGO_ENCODED_RUSTFLAGS"] = (
+            prior + ("\x1f" if prior else "") + "-C\x1fsave-temps=yes")
+    else:
+        env["RUSTFLAGS"] = (env.get("RUSTFLAGS", "") +
+                            " -C save-temps=yes").strip()
+    return env
+
+
+def verify_emitted_ir(opt, target_dir, host, *, selected_crate):
+    deps = target_dir / host / "release" / "deps"
+    bitcode = sorted(deps.glob("*.rcgu.bc"))
+    assert bitcode, f"Cargo emitted no saved LLVM IR in {deps}"
+    assert any(path.name.startswith(selected_crate + "-") for path in bitcode), (
+        selected_crate, bitcode)
+    for path in bitcode:
+        run([str(opt), "-passes=verify", "-disable-output", str(path)],
+            timeout=30)
+
+
 def instructions(objdump, binary, symbol):
     raw = "_" + symbol if platform.system() == "Darwin" else symbol
     dump = run([str(objdump), f"--disassemble-symbols={raw}",
@@ -96,17 +120,20 @@ def config(rustc, pass_name, seed=SEED, global_name=None):
             "strict": True, "packages": [rule(pass_name, global_name)]}
 
 
-def baseline(cargo, rustc, host, manifest, work_dir, label, lto, cgu, level):
+def baseline(cargo, rustc, host, opt, manifest, work_dir, label, lto, cgu,
+             level):
     target = work_dir / label / "baseline-target"
-    env = {**os.environ, "RUSTC": str(rustc), "CARGO_TARGET_DIR": str(target)}
+    env = saved_ir_env({**os.environ, "RUSTC": str(rustc),
+                        "CARGO_TARGET_DIR": str(target)})
     run([cargo, *cargo_args(manifest, lto, cgu, level), "--target", host],
         env=env)
+    verify_emitted_ir(opt, target, host, selected_crate="rust_obf_lto_chosen")
     binary = app_path(target, host)
     assert run([str(binary)], timeout=30).stdout == EXPECTED, binary
     return binary
 
 
-def selected(wrapper, rustc, host, manifest, work_dir, label, pass_name,
+def selected(wrapper, rustc, host, opt, manifest, work_dir, label, pass_name,
              lto, cgu, level, *, reuse_target=None, seed=SEED,
              expected_code=0, global_name=None):
     directory = work_dir / label
@@ -120,9 +147,12 @@ def selected(wrapper, rustc, host, manifest, work_dir, label, pass_name,
     if reuse_target:
         command.extend(("--reuse-target-dir", str(reuse_target)))
     command.extend(("--", *cargo_args(manifest, lto, cgu, level)))
-    result = run(command, code=expected_code)
+    result = run(command, env=saved_ir_env(), code=expected_code)
     report = json.loads(report_path.read_text())
     binary = app_path(Path(report["target_dir"]), host)
+    if expected_code == 0:
+        verify_emitted_ir(opt, Path(report["target_dir"]), host,
+                          selected_crate="rust_obf_lto_chosen")
     return report, binary, result
 
 
@@ -132,6 +162,25 @@ def check_report(report, pass_name):
     summary = package["pass_summary"][pass_name]
     assert summary["transformed_symbols"] > 0, summary
     assert summary["transformed_sites"] > 0, summary
+    short_pass = {"obf-string": "sobf", "obf-split": "split",
+                  "obf-bcf": "bcf", "obf-fla": "fla", "obf-sub": "sub",
+                  "obf-const": "constenc",
+                  "obf-global-access": "gai"}[pass_name]
+    primary_kind = ("global" if pass_name in
+                    ("obf-string", "obf-global-access") else "function")
+    effects = [event for event in package["events"]
+               if event["event"] == "effect" and event["pass"] == short_pass
+               and event["kind"] == primary_kind]
+    assert len(effects) == 1 and summary["transformed_symbols"] == 1, (
+        pass_name, effects, summary)
+    assert effects[0]["count"] == summary["transformed_sites"], (
+        pass_name, effects, summary)
+    if pass_name not in ("obf-string", "obf-global-access"):
+        assert effects[0]["raw_name"] == "lto_chosen", effects
+    elif pass_name == "obf-global-access":
+        assert effects[0]["raw_name"] and effects[0]["kind"] == "global", effects
+    else:
+        assert effects[0]["kind"] == "global", effects
     selected_invocations = [item for item in report["invocations"]
                             if item["status"] == "selected"]
     assert len(selected_invocations) == 1, selected_invocations
@@ -173,7 +222,7 @@ def private_state_name(llvm_ar, llvm_dis, ordinary, work_dir):
     return found.pop()
 
 
-def check_incremental(wrapper, rustc, host, objdump, work_dir):
+def check_incremental(wrapper, rustc, host, opt, objdump, work_dir):
     directory = work_dir / "incremental"
     fixture = directory / "fixture"
     if fixture.exists():
@@ -181,13 +230,13 @@ def check_incremental(wrapper, rustc, host, objdump, work_dir):
     shutil.copytree(FIXTURE, fixture)
     manifest = fixture / "Cargo.toml"
     target = directory / "target"
-    first, binary, _ = selected(wrapper, rustc, host, manifest, work_dir,
+    first, binary, _ = selected(wrapper, rustc, host, opt, manifest, work_dir,
                                 "incremental/first", "obf-sub", "thin", 4,
                                 2, reuse_target=target)
     check_report(first, "obf-sub")
     first_code = instructions(objdump, binary, "lto_chosen")
 
-    cached, _, _ = selected(wrapper, rustc, host, manifest, work_dir,
+    cached, _, _ = selected(wrapper, rustc, host, opt, manifest, work_dir,
                             "incremental/cached", "obf-sub", "thin", 4,
                             2, reuse_target=target, expected_code=2)
     assert not cached["code_artifact"] and not cached["strict_passed"]
@@ -196,7 +245,7 @@ def check_incremental(wrapper, rustc, host, objdump, work_dir):
     source = fixture / "chosen/src/lib.rs"
     future = time.time() + 3
     os.utime(source, (future, future))
-    rebuilt, binary, _ = selected(wrapper, rustc, host, manifest, work_dir,
+    rebuilt, binary, _ = selected(wrapper, rustc, host, opt, manifest, work_dir,
                                   "incremental/rebuilt", "obf-sub", "thin",
                                   4, 2, reuse_target=target)
     check_report(rebuilt, "obf-sub")
@@ -218,12 +267,14 @@ def main():
     parser.add_argument("--wrapper", type=Path, required=True)
     parser.add_argument("--rustc", type=Path, required=True)
     parser.add_argument("--objdump", type=Path, required=True)
+    parser.add_argument("--opt", type=Path, required=True)
     parser.add_argument("--work-dir", type=Path, required=True)
     parser.add_argument("--cargo", default="cargo")
     args = parser.parse_args()
     wrapper = args.wrapper.resolve()
     rustc = args.rustc.resolve()
     objdump = args.objdump.resolve()
+    opt = args.opt.resolve()
     llvm_ar = llvm_tool_path(objdump, "llvm-ar")
     llvm_dis = llvm_tool_path(objdump, "llvm-dis")
     work_dir = args.work_dir.resolve()
@@ -236,11 +287,11 @@ def main():
         for cgu in (1, 4):
             for level in (2, 3):
                 label = f"{lto}-cgu{cgu}-O{level}"
-                ordinary = baseline(args.cargo, rustc, host, manifest,
+                ordinary = baseline(args.cargo, rustc, host, opt, manifest,
                                     work_dir, label, lto, cgu, level)
                 baselines[(lto, cgu, level)] = ordinary
                 report, transformed, _ = selected(
-                    wrapper, rustc, host, manifest, work_dir,
+                    wrapper, rustc, host, opt, manifest, work_dir,
                     label + "/sub", "obf-sub", lto, cgu, level)
                 check_report(report, "obf-sub")
                 assert run([str(transformed)], timeout=30).stdout == EXPECTED
@@ -251,7 +302,7 @@ def main():
         ordinary = baselines[(lto, 4, 2)]
         for pass_name in ("obf-split", "obf-bcf", "obf-fla", "obf-const"):
             report, transformed, _ = selected(
-                wrapper, rustc, host, manifest, work_dir,
+                wrapper, rustc, host, opt, manifest, work_dir,
                 f"{lto}-cgu4-O2/{pass_name}", pass_name, lto, 4, 2)
             check_report(report, pass_name)
             assert run([str(transformed)], timeout=30).stdout == EXPECTED
@@ -259,7 +310,7 @@ def main():
             print(f"PASS {lto} {pass_name}: final code and plain isolation")
 
         report, transformed, _ = selected(
-            wrapper, rustc, host, manifest, work_dir,
+            wrapper, rustc, host, opt, manifest, work_dir,
             f"{lto}-cgu4-O2/obf-string", "obf-string", lto, 4, 2)
         check_report(report, "obf-string")
         assert run([str(transformed)], timeout=30).stdout == EXPECTED
@@ -271,7 +322,7 @@ def main():
 
         state = private_state_name(llvm_ar, llvm_dis, ordinary, work_dir)
         report, transformed, _ = selected(
-            wrapper, rustc, host, manifest, work_dir,
+            wrapper, rustc, host, opt, manifest, work_dir,
             f"{lto}-cgu4-O2/obf-global-access", "obf-global-access",
             lto, 4, 2, global_name=state)
         check_report(report, "obf-global-access")
@@ -279,7 +330,7 @@ def main():
         check_machine(objdump, ordinary, transformed, symbol="lto_global")
         print(f"PASS {lto} obf-global-access: final code and plain isolation")
 
-    check_incremental(wrapper, rustc, host, objdump, work_dir)
+    check_incremental(wrapper, rustc, host, opt, objdump, work_dir)
 
 
 if __name__ == "__main__":

@@ -6,6 +6,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
 static DROP_ORDER: AtomicUsize = AtomicUsize::new(0);
 static BRANCH_TRACE: AtomicUsize = AtomicUsize::new(0);
+// This single-threaded scalar is accessed only by the EH function. It gives
+// global-access indirection an otherwise eligible candidate whose personality
+// makes inserting its helper call unsafe.
+static mut EH_STATE: i32 = 0;
 
 struct Guard(usize);
 
@@ -20,6 +24,12 @@ impl Drop for Guard {
 #[inline(never)]
 pub extern "C-unwind" fn eh_probe(seed: i32, mode: u8) -> i32 {
     let _outer = Guard(2);
+    // Keep ordinary loads and stores of a private scalar in the protected
+    // function at O0 and O2 without changing the output oracle.
+    unsafe {
+        let state = std::ptr::read(&raw const EH_STATE);
+        std::ptr::write(&raw mut EH_STATE, std::hint::black_box(state.wrapping_add(1)));
+    }
     // Different observable atomic operations keep a normal branch before
     // the invokes and cleanup pads at both O0 and O2.
     let base = if seed & 1 == 0 {

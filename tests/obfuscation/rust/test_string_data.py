@@ -67,7 +67,143 @@ def clang_prefix(clang, sysroot):
     return prefix
 
 
+def check_unnamed_literal(opt, work):
+    marker = b"m3-synthetic-unnamed"
+    source = work / "rust-unnamed.ll"
+    body = (f'@0 = private unnamed_addr constant [{len(marker)} x i8] '
+            f'c"{marker.decode()}", align 1\n\n'
+            'define i8 @read() {\nentry:\n'
+            '  %first = load i8, ptr @0, align 1\n'
+            '  ret i8 %first\n}\n')
+    source.write_text('source_filename = "rust-unnamed-literal"\n' + body)
+
+    def transform(label, selected=None):
+        output = work / f"unnamed-{label}.ll"
+        event_file = work / f"unnamed-{label}.jsonl"
+        event_file.unlink(missing_ok=True)
+        env = {**os.environ, "RUST_OBF_EVENT_FILE": str(event_file)}
+        command = [str(opt), f"-obf-test-seed={SEED}", "-sobf-rust-bytes",
+                   "-obf-only-functions=read"]
+        if selected:
+            command.append(f"-sobf-only-globals={selected}")
+        run([*command, "-passes=obf-string,verify", "-S", str(source),
+             "-o", str(output)], env=env)
+        records = [json.loads(line) for line in event_file.read_text().splitlines()]
+        return output.read_bytes(), records
+
+    encoded, records = transform("all")
+    globals_encoded = [entry["raw_name"] for entry in records
+                       if entry["event"] == "effect" and entry["kind"] == "global"]
+    require(len(globals_encoded) == 1 and
+            globals_encoded[0].startswith(".rust.obf.bytes."),
+            f"unnamed allocation lacked one synthetic name: {globals_encoded!r}")
+    name = globals_encoded[0]
+    require(marker not in encoded and
+            not any(entry["event"] == "skip" and entry["raw_name"] == name
+                    for entry in records),
+            "encoded allocation retained plaintext or was also reported skipped")
+    require(any(entry["event"] == "effect" and entry["kind"] == "function"
+                and entry["raw_name"] == "read" for entry in records),
+            "selected reader lacked a function effect event")
+
+    exact, exact_records = transform("exact", name)
+    require(marker not in exact and
+            [entry["raw_name"] for entry in exact_records
+             if entry["event"] == "effect" and entry["kind"] == "global"] == [name],
+            "exact synthetic global selection changed or missed the allocation")
+    excluded, excluded_records = transform("excluded", "definitely_absent")
+    require(marker in excluded and b'@0 = private unnamed_addr constant' in excluded and
+            name.encode() not in excluded and
+            any(entry["raw_name"] == name and entry.get("reason") == "not-selected"
+                for entry in excluded_records),
+            "unselected synthetic global was renamed, encoded, or lost its skip reason")
+
+    # The source path and module ID stay fixed. An existing symbol with the
+    # generated name must force a distinct, repeatable name for @0.
+    source.write_text('source_filename = "rust-unnamed-literal"\n'
+                      f'@{name} = private constant [1 x i8] c"Z", align 1\n' + body)
+    collided, collision_records = transform("collision")
+    collision_names = [entry["raw_name"] for entry in collision_records
+                       if entry["event"] == "effect" and entry["kind"] == "global"]
+    require(len(collision_names) == 1 and collision_names[0] != name and
+            collision_names[0].startswith(name.rsplit(".", 1)[0] + ".") and
+            marker not in collided,
+            f"synthetic name collision was not resolved: {collision_names!r}")
+    other = b"m3-other-unnamed"
+    source.write_text(
+        'source_filename = "rust-unnamed-literal"\n'
+        f'@0 = private unnamed_addr constant [{len(marker)} x i8] '
+        f'c"{marker.decode()}", align 1\n'
+        f'@1 = private unnamed_addr constant [{len(other)} x i8] '
+        f'c"{other.decode()}", align 1\n\n'
+        'define i8 @read() {\nentry:\n'
+        '  %first = load i8, ptr @0, align 1\n'
+        '  %second = load i8, ptr @1, align 1\n'
+        '  %total = add i8 %first, %second\n'
+        '  ret i8 %total\n}\n')
+    two_first, first_records = transform("two-first")
+    two_repeat, repeat_records = transform("two-repeat")
+    first_names = [entry["raw_name"] for entry in first_records
+                   if entry["event"] == "effect" and entry["kind"] == "global"]
+    repeat_names = [entry["raw_name"] for entry in repeat_records
+                    if entry["event"] == "effect" and entry["kind"] == "global"]
+    require(len(first_names) == 2 and len(set(first_names)) == 2 and
+            all(item.startswith(".rust.obf.bytes.") for item in first_names) and
+            first_names == repeat_names and two_first == two_repeat,
+            f"two unnamed allocations did not receive stable unique names: {first_names!r}")
+    one_selected, one_records = transform("two-exact", first_names[0])
+    require(marker not in one_selected and other in one_selected and
+            re.search(rb'(?m)^@\d+ = private unnamed_addr constant',
+                      one_selected) and
+            [entry["raw_name"] for entry in one_records
+             if entry["event"] == "effect" and entry["kind"] == "global"] ==
+            [first_names[0]],
+            "exact selection of one of two unnamed allocations was not isolated")
+    source.write_text(
+        'source_filename = "rust-unnamed-literal"\n'
+        '@0 = private constant [3 x i8] c"abc", section ".unsafe", align 1\n'
+        '@1 = private constant [3 x i8] c"def", section ".unsafe", align 1\n\n'
+        'define i8 @read() {\nentry:\n'
+        '  %first = load i8, ptr @0, align 1\n'
+        '  %second = load i8, ptr @1, align 1\n'
+        '  %total = add i8 %first, %second\n'
+        '  ret i8 %total\n}\n')
+    unsafe_ir, unsafe_records = transform("unsafe")
+    unsafe_skips = {entry["raw_name"]: entry.get("reason")
+                    for entry in unsafe_records if entry["event"] == "skip"
+                    and entry["kind"] == "global"}
+    require(unsafe_skips == {"@0": "explicit-section", "@1": "explicit-section"}
+            and b'@0 = private constant' in unsafe_ir
+            and b'@1 = private constant' in unsafe_ir,
+            f"unsafe unnamed globals were renamed or collapsed: {unsafe_skips!r}")
+
+    # A function that only converts the allocation address does not read its
+    # bytes. The global can be encoded, but it must not earn a function effect
+    # that would satisfy a strict function selector.
+    source.write_text(
+        'source_filename = "rust-unnamed-literal"\n'
+        '@0 = private constant [3 x i8] c"abc", align 1\n\n'
+        'define i64 @address_only() {\nentry:\n'
+        '  %address = ptrtoint ptr @0 to i64\n'
+        '  ret i64 %address\n}\n')
+    address_output = work / "address-only.ll"
+    address_events = work / "address-only.jsonl"
+    address_events.unlink(missing_ok=True)
+    run([str(opt), f"-obf-test-seed={SEED}", "-sobf-rust-bytes",
+         "-obf-only-functions=address_only", "-passes=obf-string,verify",
+         "-S", str(source), "-o", str(address_output)],
+        env={**os.environ, "RUST_OBF_EVENT_FILE": str(address_events)})
+    address_records = [json.loads(line) for line in address_events.read_text().splitlines()]
+    require(any(entry["event"] == "effect" and entry["kind"] == "global"
+                for entry in address_records) and
+            not any(entry["event"] == "effect" and entry["kind"] == "function"
+                    for entry in address_records),
+            "address-only function was credited with reading protected bytes")
+    print("PASS opt unnamed Rust byte array: stable exact name and collision safety", flush=True)
+
+
 def check_opt(opt, clang, work):
+    check_unnamed_literal(opt, work)
     fixture = ROOT / "string_data.ll"
     legacy = work / "legacy.ll"
     run([str(opt), f"-obf-test-seed={SEED}", "-passes=obf-string,verify",
@@ -101,7 +237,8 @@ def check_opt(opt, clang, work):
     effects = [json.loads(line) for line in events.read_text().splitlines()
                if line.strip()]
     encoded = {e["raw_name"] for e in effects
-               if e.get("event") == "effect" and e.get("pass") == "sobf"}
+               if e.get("event") == "effect" and e.get("pass") == "sobf"
+               and e.get("kind") == "global"}
     require(encoded == {"ascii", "utf8", "nul", "bytes"},
             f"unexpected byte-array effects: {encoded!r}")
 
@@ -117,7 +254,8 @@ def check_opt(opt, clang, work):
     repeat_records = [json.loads(line) for line in repeat_events.read_text().splitlines()
                       if line.strip()]
     repeat_effects = [record for record in repeat_records
-                      if record.get("event") == "effect"]
+                      if record.get("event") == "effect"
+                      and record.get("kind") == "global"]
     require(repeat_ir.count("define private void @.datadiv_decode") == 1 and
             len(repeat_effects) == 4,
             "repeated Rust string pass generated another decoder or effect")
