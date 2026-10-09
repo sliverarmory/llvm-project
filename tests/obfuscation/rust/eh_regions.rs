@@ -71,6 +71,14 @@ fn main() {
         }));
         let value = match outcome {
             Ok(number) => number.to_string(),
+            Err(payload) if mode == 1 => {
+                let message = payload
+                    .downcast_ref::<&str>()
+                    .copied()
+                    .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                    .expect("explicit panic payload must be text");
+                format!("panic:{message}")
+            }
             Err(_) => "panic".to_string(),
         };
         println!(

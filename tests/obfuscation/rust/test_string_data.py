@@ -460,6 +460,12 @@ def check_rust(rustc, opt, clang, work):
 
     ffi_source = ROOT / "string_data_ffi.rs"
     ffi_marker = b"m3-ffi-library-\0\xfe\x80"
+    consumer = work / ("ffi-consumer.obj" if sys.platform == "win32" else
+                       "ffi-consumer.o")
+    run([*clang, "-O2", "-c", str(ROOT / "string_data_ffi.c"),
+         "-o", str(consumer)])
+    require(ffi_marker not in consumer.read_bytes(),
+            "C consumer contains the Rust FFI marker and masks final-data checks")
     for label, options in (("baseline", ()),
                            ("encoded", ("-rust-obf-pipeline=obf-string",
                                         f"-obf-test-seed={SEED}"))):
@@ -475,10 +481,13 @@ def check_rust(rustc, opt, clang, work):
         executable = work / f"ffi-consumer-{label}"
         if sys.platform == "win32":
             executable = executable.with_suffix(".exe")
-        run([*clang, str(ROOT / "string_data_ffi.c"), str(library), *native_libs,
+        run([*clang, str(consumer), str(library), *native_libs,
              "-o", str(executable)], timeout=360)
         run([str(executable)], timeout=15)
-    print("PASS Rust staticlib: C consumer sees exact byte length and contents", flush=True)
+        require((ffi_marker in executable.read_bytes()) == (label == "baseline"),
+                f"Rust FFI {label} final executable plaintext witness failed")
+    print("PASS Rust staticlib: C consumer sees exact bytes; final plaintext absent",
+          flush=True)
 
 
 def main():

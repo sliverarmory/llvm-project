@@ -54,7 +54,7 @@ skip or abort-mode effect.
 For every variant, the test verifies emitted IR with `opt`, disassembles the
 linked `eh_probe`, compares EH pad and invoke counts and the exact invoke
 unwind destinations, and checks exact runtime output for successful calls,
-caught explicit panic, checked arithmetic overflow, and the count and order
+caught explicit panic payload text, checked arithmetic overflow, and the count and order
 of both `Drop` handlers. Every variant with a non-string pass effect must
 change the linked function's opcode sequence from its baseline. Under
 `panic=abort`, every variant's uncaught panic must exit unsuccessfully. The

@@ -35,7 +35,7 @@ EH_OPCODES = ("landingpad", "cleanuppad", "catchpad", "catchswitch",
 EXPECTED_UNWIND = (
     "6:0:29:2:33:3\n"
     "7:0:46:2:33:5\n"
-    "6:1:panic:2:33:3\n"
+    "6:1:panic:explicit unwind witness:2:33:3\n"
     "2147483647:2:panic:2:33:5\n"
 )
 EXPECTED_ABORT = "6:0:29:2:33:3\n7:0:46:2:33:5\n"

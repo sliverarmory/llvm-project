@@ -46,7 +46,9 @@ does not register a second decoder.
 fixture is consumed by `string_data_ffi.c`. The test checks that each selected
 plaintext marker appears in a baseline final artifact and is absent from the
 obfuscated artifact. The C harness holds its expected bytes as numeric values
-and the archive is checked before linking the harness.
+XOR-encoded behind volatile reads so it cannot supply the plaintext witness.
+The test checks the harness object, Rust archive, and linked C executable:
+only the baseline archive and executable may contain the marker.
 
 Run the portable test with:
 
