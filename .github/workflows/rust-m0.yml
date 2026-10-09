@@ -118,11 +118,14 @@ jobs:
       - name: Build LLVM tools and obfuscation unit tests
         run: cmake --build build-llvm-project --target clang opt llvm-objdump llvm-config ObfuscationTests --parallel 4
 
-      - name: Check LLVM, bootstrap, and package unit tests
-        run: |
-          python -c "import subprocess; subprocess.run(['build-llvm-project/unittests/Transforms/Obfuscation/ObfuscationTests${{ matrix.exe }}'], check=True)"
-          python -B -m unittest discover -s tools/rust-obfuscation -p test_bootstrap.py -v
-          python -B -m unittest discover -s tools/rust-obfuscation -p test_package.py -v
+      - name: Check LLVM obfuscation unit tests
+        run: python -c "import subprocess; subprocess.run(['build-llvm-project/unittests/Transforms/Obfuscation/ObfuscationTests${{ matrix.exe }}'], check=True)"
+
+      - name: Check Rust bootstrap unit tests
+        run: python -B -m unittest discover -s tools/rust-obfuscation -p test_bootstrap.py -v
+
+      - name: Check Rust package unit tests
+        run: python -B -m unittest discover -s tools/rust-obfuscation -p test_package.py -v
 
       - name: Fetch pinned Rust 1.99 source
         run: git clone --depth 1 --branch 1.99.0 --filter=blob:none https://github.com/rust-lang/rust.git build-rust-1.99
@@ -135,10 +138,11 @@ jobs:
           CARGO_TARGET_DIR: ${{ github.workspace }}/build-llvm-project/cargo-wrapper-target
         run: cargo build --locked --release --manifest-path tools/rust-obfuscation/cargo-wrapper/Cargo.toml
 
-      - name: Verify LLVM pipeline and native/cross-target EH IR
-        run: |
-          python -B tests/obfuscation/rust/test_pipeline.py --opt build-llvm-project/bin/opt${{ matrix.exe }} --clang build-llvm-project/bin/clang${{ matrix.exe }}
-          python -B tests/obfuscation/test_eh_regions.py --clang build-llvm-project/bin/clang${{ matrix.exe }} --opt build-llvm-project/bin/opt${{ matrix.exe }} --work-dir build-llvm-project/eh-ir
+      - name: Verify LLVM obfuscation pipeline
+        run: python -B tests/obfuscation/rust/test_pipeline.py --opt build-llvm-project/bin/opt${{ matrix.exe }} --clang build-llvm-project/bin/clang${{ matrix.exe }}
+
+      - name: Verify native and cross-target EH IR
+        run: python -B tests/obfuscation/test_eh_regions.py --clang build-llvm-project/bin/clang${{ matrix.exe }} --opt build-llvm-project/bin/opt${{ matrix.exe }} --work-dir build-llvm-project/eh-ir
 
       - name: Package pinned native Rust toolchain
         run: python -B tools/rust-obfuscation/package.py --stage1 build-rust-1.99/build/${{ matrix.host }}/stage1 --rust-source build-rust-1.99 --wrapper build-llvm-project/cargo-wrapper-target/release/rust-obf-cargo${{ matrix.exe }} --opt build-llvm-project/bin/opt${{ matrix.exe }} --objdump build-llvm-project/bin/llvm-objdump${{ matrix.exe }} --output build-llvm-project/rust-obfuscation-${{ matrix.platform }}.${{ matrix.extension }}
