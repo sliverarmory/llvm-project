@@ -46,6 +46,15 @@ pipeline only. Without an LTO pre-link pipeline, the ordinary optimizer-last
 callback runs them once. Rust's `-C passes` appends passes after pre-link GUID
 assignment and is unsuitable for passes that add globals under Thin/Fat LTO.
 
+The M5 Cargo gate also tests Rust's local ThinLTO path at O2 and O3 with
+`lto=false` and four requested codegen units. Two selected functions are
+defined in separate modules of the protected `rlib`. The gate requires them
+in distinct saved CGUs of that crate, verifies each CGU's
+`thin-lto-after-pm.bc` with `opt`, checks one BCF effect per function, and
+compares both functions' linked machine code and runtime output with an
+ordinary build. Codegen units emitted only by the unselected application do
+not satisfy this gate.
+
 The unqualified `-rust-obf-pipeline` option remains process-wide; use the
 Cargo wrapper's package selection and pre-link mode for cross-crate LTO. The
 fixed test seed now derives a stream per pass and raw symbol, so parallel CGU

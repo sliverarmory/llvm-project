@@ -19,6 +19,7 @@ MARKER = "m5-selected-string-583d29"
 EXPECTED = ("207605:207605\n161426:161426\n207623:207623\n"
             "161440:161440\n" + MARKER + "\n12\n")
 CHOSEN = "rust-obf-lto-chosen"
+LOCAL_THIN_SYMBOLS = ("lto_chosen", "lto_local_thin_probe")
 
 
 def run(command, *, env=None, code=0, timeout=600):
@@ -64,28 +65,59 @@ def llvm_tool_path(objdump, name):
     return objdump.with_name(name + suffix)
 
 
-def saved_ir_env(base=None):
+def saved_ir_env(base=None, *, bcf_prob=None):
     """Keep the IR from the actual Cargo invocation for independent verification."""
     env = dict(os.environ if base is None else base)
+    flags = ["-C", "save-temps=yes"]
+    if bcf_prob is not None:
+        flags.extend(("-C", f"llvm-args=-bcf_prob={bcf_prob}"))
     if "CARGO_ENCODED_RUSTFLAGS" in env:
         prior = env["CARGO_ENCODED_RUSTFLAGS"]
         env["CARGO_ENCODED_RUSTFLAGS"] = (
-            prior + ("\x1f" if prior else "") + "-C\x1fsave-temps=yes")
+            prior + ("\x1f" if prior else "") + "\x1f".join(flags))
     else:
         env["RUSTFLAGS"] = (env.get("RUSTFLAGS", "") +
-                            " -C save-temps=yes").strip()
+                            " " + " ".join(flags)).strip()
     return env
 
 
-def verify_emitted_ir(opt, target_dir, host, *, selected_crate):
+def verify_emitted_ir(opt, target_dir, host, *, selected_crate,
+                      require_local_thin=False):
     deps = target_dir / host / "release" / "deps"
     bitcode = sorted(deps.glob("*.rcgu.bc"))
     assert bitcode, f"Cargo emitted no saved LLVM IR in {deps}"
-    assert any(path.name.startswith(selected_crate + "-") for path in bitcode), (
-        selected_crate, bitcode)
+    selected_bitcode = [path for path in bitcode
+                        if path.name.startswith(selected_crate + "-")]
+    assert selected_bitcode, (selected_crate, bitcode)
     for path in bitcode:
         run([str(opt), "-passes=verify", "-disable-output", str(path)],
             timeout=30)
+    if require_local_thin:
+        assert selected_crate == "rust_obf_lto_chosen", selected_crate
+        cgus = {match.group(1) for path in selected_bitcode
+                if (match := re.search(r"-cgu\.(\d+)\.rcgu\.bc$", path.name))}
+        assert len(cgus) >= 2, (
+            "protected crate did not emit multiple CGUs", selected_bitcode)
+        llvm_dis = llvm_tool_path(opt, "llvm-dis")
+        assert llvm_dis.is_file(), llvm_dis
+        locations = {}
+        for path in selected_bitcode:
+            # Save-temps exposes the local ThinLTO optimizer output for each
+            # selected-crate CGU. App-only CGUs cannot satisfy this gate.
+            optimized = path.with_name(path.name.replace(
+                ".rcgu.bc", ".rcgu.thin-lto-after-pm.bc"))
+            assert optimized.is_file(), (
+                "selected CGU missed local ThinLTO", path, optimized)
+            run([str(opt), "-passes=verify", "-disable-output",
+                 str(optimized)], timeout=30)
+            ir = run([str(llvm_dis), "-o", "-", str(path)], timeout=30).stdout
+            for symbol in LOCAL_THIN_SYMBOLS:
+                if re.search(rf"(?m)^define\b[^\n]*@{symbol}\(", ir):
+                    assert symbol not in locations, (symbol, locations, path)
+                    locations[symbol] = path
+        assert set(locations) == set(LOCAL_THIN_SYMBOLS), locations
+        assert len(set(locations.values())) == len(LOCAL_THIN_SYMBOLS), (
+            "protected symbols share a CGU", locations)
 
 
 def instructions(objdump, binary, symbol):
@@ -100,13 +132,16 @@ def instructions(objdump, binary, symbol):
     return [re.sub(r"0x[0-9a-f]+(?= <)", "ADDR", line) for line in lines]
 
 
-def rule(pass_name, global_name=None):
+def rule(pass_name, global_name=None, *, local_thin=False):
     item = {"name": CHOSEN, "source": "workspace",
             "targets": [CHOSEN], "crate_types": ["rlib"],
             "passes": [pass_name]}
     if pass_name != "obf-string":
-        item["functions"] = ["lto_global" if pass_name == "obf-global-access"
-                             else "lto_chosen"]
+        item["functions"] = (list(LOCAL_THIN_SYMBOLS) if local_thin else
+                             ["lto_global" if pass_name == "obf-global-access"
+                              else "lto_chosen"])
+    if local_thin:
+        assert pass_name == "obf-bcf", pass_name
     if pass_name == "obf-const":
         item["constants"] = ["i64:0x5a17"]
     if pass_name == "obf-global-access":
@@ -115,19 +150,21 @@ def rule(pass_name, global_name=None):
     return item
 
 
-def config(rustc, pass_name, seed=SEED, global_name=None):
+def config(rustc, pass_name, seed=SEED, global_name=None, *, local_thin=False):
     return {"version": 1, "rustc": str(rustc), "seed": seed,
-            "strict": True, "packages": [rule(pass_name, global_name)]}
+            "strict": True, "packages": [rule(pass_name, global_name,
+                                                local_thin=local_thin)]}
 
 
 def baseline(cargo, rustc, host, opt, manifest, work_dir, label, lto, cgu,
-             level):
+             level, *, local_thin=False):
     target = work_dir / label / "baseline-target"
     env = saved_ir_env({**os.environ, "RUSTC": str(rustc),
                         "CARGO_TARGET_DIR": str(target)})
     run([cargo, *cargo_args(manifest, lto, cgu, level), "--target", host],
         env=env)
-    verify_emitted_ir(opt, target, host, selected_crate="rust_obf_lto_chosen")
+    verify_emitted_ir(opt, target, host, selected_crate="rust_obf_lto_chosen",
+                      require_local_thin=local_thin)
     binary = app_path(target, host)
     assert run([str(binary)], timeout=30).stdout == EXPECTED, binary
     return binary
@@ -135,28 +172,31 @@ def baseline(cargo, rustc, host, opt, manifest, work_dir, label, lto, cgu,
 
 def selected(wrapper, rustc, host, opt, manifest, work_dir, label, pass_name,
              lto, cgu, level, *, reuse_target=None, seed=SEED,
-             expected_code=0, global_name=None):
+             expected_code=0, global_name=None, local_thin=False):
     directory = work_dir / label
     directory.mkdir(parents=True, exist_ok=True)
     config_path = directory / "config.json"
-    config_path.write_text(json.dumps(config(rustc, pass_name, seed,
-                                              global_name)) + "\n")
+    config_path.write_text(json.dumps(config(
+        rustc, pass_name, seed, global_name, local_thin=local_thin)) + "\n")
     report_path = directory / "report.json"
     command = [str(wrapper), "--config", str(config_path),
                "--report", str(report_path)]
     if reuse_target:
         command.extend(("--reuse-target-dir", str(reuse_target)))
     command.extend(("--", *cargo_args(manifest, lto, cgu, level)))
-    result = run(command, env=saved_ir_env(), code=expected_code)
+    result = run(command, env=saved_ir_env(
+        {**os.environ, "RUSTC": str(rustc)},
+        bcf_prob=100 if local_thin else None), code=expected_code)
     report = json.loads(report_path.read_text())
     binary = app_path(Path(report["target_dir"]), host)
     if expected_code == 0:
         verify_emitted_ir(opt, Path(report["target_dir"]), host,
-                          selected_crate="rust_obf_lto_chosen")
+                          selected_crate="rust_obf_lto_chosen",
+                          require_local_thin=local_thin)
     return report, binary, result
 
 
-def check_report(report, pass_name):
+def check_report(report, pass_name, *, local_thin=False):
     assert report["code_artifact"] and report["strict_passed"], report
     package, = report["packages"]
     summary = package["pass_summary"][pass_name]
@@ -171,12 +211,20 @@ def check_report(report, pass_name):
     effects = [event for event in package["events"]
                if event["event"] == "effect" and event["pass"] == short_pass
                and event["kind"] == primary_kind]
-    assert len(effects) == 1 and summary["transformed_symbols"] == 1, (
+    expected_names = set(LOCAL_THIN_SYMBOLS) if local_thin else None
+    expected_count = len(expected_names) if expected_names else 1
+    assert len(effects) == expected_count and \
+           summary["transformed_symbols"] == expected_count, (
         pass_name, effects, summary)
-    assert effects[0]["count"] == summary["transformed_sites"], (
+    assert sum(effect["count"] for effect in effects) == \
+           summary["transformed_sites"], (
         pass_name, effects, summary)
+    if local_thin:
+        assert pass_name == "obf-bcf", pass_name
+        assert {effect["raw_name"] for effect in effects} == expected_names, effects
     if pass_name not in ("obf-string", "obf-global-access"):
-        assert effects[0]["raw_name"] == "lto_chosen", effects
+        if not local_thin:
+            assert effects[0]["raw_name"] == "lto_chosen", effects
     elif pass_name == "obf-global-access":
         assert effects[0]["raw_name"] and effects[0]["kind"] == "global", effects
     else:
@@ -287,8 +335,10 @@ def main():
         for cgu in (1, 4):
             for level in (2, 3):
                 label = f"{lto}-cgu{cgu}-O{level}"
+                local_thin = lto == "false" and cgu == 4
                 ordinary = baseline(args.cargo, rustc, host, opt, manifest,
-                                    work_dir, label, lto, cgu, level)
+                                    work_dir, label, lto, cgu, level,
+                                    local_thin=local_thin)
                 baselines[(lto, cgu, level)] = ordinary
                 report, transformed, _ = selected(
                     wrapper, rustc, host, opt, manifest, work_dir,
@@ -296,7 +346,23 @@ def main():
                 check_report(report, "obf-sub")
                 assert run([str(transformed)], timeout=30).stdout == EXPECTED
                 check_machine(objdump, ordinary, transformed)
-                print(f"PASS {label}: one selected effect, final code, plain isolation")
+                print(f"PASS {label}: one selected effect, final code, "
+                      "plain isolation")
+
+    # lto=false invokes Rust's intra-crate ThinLTO. Exercise two independently
+    # protected CGUs of the selected rlib, not only the application's CGUs.
+    for level in (2, 3):
+        ordinary = baselines[("false", 4, level)]
+        report, transformed, _ = selected(
+            wrapper, rustc, host, opt, manifest, work_dir,
+            f"false-cgu4-O{level}/local-thin-bcf", "obf-bcf", "false", 4,
+            level, local_thin=True)
+        check_report(report, "obf-bcf", local_thin=True)
+        assert run([str(transformed)], timeout=30).stdout == EXPECTED
+        for symbol in LOCAL_THIN_SYMBOLS:
+            check_machine(objdump, ordinary, transformed, symbol=symbol)
+        print(f"PASS false-cgu4-O{level}: two protected CGUs traverse local "
+              "ThinLTO, two final-code effects, plain isolation")
 
     for lto in ("thin", "fat"):
         ordinary = baselines[(lto, 4, 2)]
