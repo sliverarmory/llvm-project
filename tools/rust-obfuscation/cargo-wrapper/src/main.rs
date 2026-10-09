@@ -127,6 +127,8 @@ struct RuleReport {
     package_id: String,
     rule: Rule,
     compiled: usize,
+    unmatched_targets: Vec<String>,
+    unmatched_crate_types: Vec<String>,
     pass_summary: BTreeMap<String, PassSummary>,
     events: Vec<Event>,
 }
@@ -222,11 +224,25 @@ fn validate(config: &Config) -> io::Result<()> {
                 rule.name
             )));
         }
+        if !rule.globals.is_empty()
+            && !rule
+                .passes
+                .iter()
+                .any(|pass| matches!(pass.as_str(), "obf-string" | "obf-global-access"))
+        {
+            return Err(fail(format!(
+                "{}: globals require obf-string or obf-global-access",
+                rule.name
+            )));
+        }
         if rule.passes.iter().any(|p| p == "obf-const") && rule.constants.is_empty() {
             return Err(fail(format!(
                 "{}: obf-const needs typed constants",
                 rule.name
             )));
+        }
+        if !rule.constants.is_empty() && !rule.passes.iter().any(|pass| pass == "obf-const") {
+            return Err(fail(format!("{}: constants require obf-const", rule.name)));
         }
         if rule.crate_types.iter().any(|kind| {
             !matches!(
@@ -746,6 +762,28 @@ fn aggregate(
             .iter()
             .filter(|item| item.rule_index == Some(index))
             .collect();
+        let matched_targets: BTreeSet<_> = selected
+            .iter()
+            .filter_map(|item| item.crate_name.as_deref())
+            .collect();
+        let unmatched_targets: Vec<_> = resolved
+            .rule
+            .targets
+            .iter()
+            .filter(|name| !matched_targets.contains(name.replace('-', "_").as_str()))
+            .cloned()
+            .collect();
+        let matched_crate_types: BTreeSet<_> = selected
+            .iter()
+            .flat_map(|item| item.crate_type.iter().map(String::as_str))
+            .collect();
+        let unmatched_crate_types: Vec<_> = resolved
+            .rule
+            .crate_types
+            .iter()
+            .filter(|kind| !matched_crate_types.contains(kind.as_str()))
+            .cloned()
+            .collect();
         let mut events = Vec::new();
         for item in &selected {
             if let Some(path) = &item.event_file {
@@ -863,13 +901,16 @@ fn aggregate(
                 },
             );
         }
-        if selected.is_empty() {
+        if selected.is_empty() || !unmatched_targets.is_empty() || !unmatched_crate_types.is_empty()
+        {
             strict_passed = false;
         }
         reports.push(RuleReport {
             package_id: resolved.package_id.clone(),
             rule: resolved.rule.clone(),
             compiled: selected.len(),
+            unmatched_targets,
+            unmatched_crate_types,
             pass_summary,
             events,
         });

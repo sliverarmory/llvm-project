@@ -86,12 +86,18 @@ EH blocks and module-level skips; `matched_symbols` and `transformed_symbols`
 count the pass's selected functions or globals.
 `targets` use Cargo target names (hyphens and underscores compare equally).
 `crate_types` accepts `bin`, `rlib`, `dylib`, `cdylib`, and `staticlib`. An
-empty target or type list accepts all non-host targets in that package.
+empty target or type list accepts all non-host targets in that package. In
+strict mode, every explicit target and crate type must compile at least once;
+the per-package `unmatched_targets` and `unmatched_crate_types` report fields
+identify requests that did not compile. A successful transform in one target
+does not satisfy a different requested target or crate type.
 
 `obf-global-access` requires nonempty `globals`; `obf-const` requires typed
 `constants` such as `i32:0x5a17`. String and global-access passes can share a
-`globals` list. When both `functions` and `globals` are set, the Rust string
-pass requires every direct runtime reader of a selected global to be among
+`globals` list. A rule with `globals` but neither global pass, or with
+`constants` but no constant pass, is rejected because those selectors would
+otherwise be ignored. When both `functions` and `globals` are set, the Rust
+string pass requires every direct runtime reader of a selected global to be among
 the selected functions; otherwise it records `function-not-selected` and
 preserves that global. Unsafe or unsupported symbols are preserved and appear as
 skips, with a reason. `strict: true` exits 2 when a selected package/target,

@@ -127,6 +127,8 @@ def assert_selection(report, selected):
     assert set(packages) == set(selected), packages.keys()
     assert report["code_artifact"] and report["strict_passed"], report
     for name in selected:
+        assert packages[name]["unmatched_targets"] == [], (name, packages[name])
+        assert packages[name]["unmatched_crate_types"] == [], (name, packages[name])
         pass_name = packages[name]["rule"]["passes"][0]
         summary = packages[name]["pass_summary"][pass_name]
         assert summary["transformed_symbols"] > 0, (name, summary)
@@ -318,6 +320,39 @@ def main():
     assert all(item["package_id"] is None for item in member_only["invocations"]
                if item["crate_name"] == "adler2")
 
+    # Each explicitly requested target and crate type needs its own compiled
+    # witness. A real rlib effect must not hide an absent target or dylib.
+    incomplete_rule = member_rule()
+    incomplete_rule["targets"].append("definitely-absent-target")
+    incomplete_rule["crate_types"].append("dylib")
+    incomplete, _ = build_with_wrapper(
+        wrapper, rustc, args.cargo, opt, host, work_dir,
+        [incomplete_rule], "incomplete-target-and-type",
+        offline=not args.online, expected_code=2)
+    incomplete_package = selected_packages(incomplete)[MEMBER]
+    assert incomplete["code_artifact"] and not incomplete["strict_passed"], incomplete
+    assert incomplete_package["pass_summary"]["obf-split"]["transformed_symbols"] > 0
+    assert incomplete_package["unmatched_targets"] == ["definitely-absent-target"]
+    assert incomplete_package["unmatched_crate_types"] == ["dylib"]
+
+    # A selector for a pass family absent from the rule must be rejected at
+    # configuration time rather than silently counted as strict success.
+    for field, selector, diagnostic in (
+            ("globals", "definitely_absent_global",
+             "globals require obf-string or obf-global-access"),
+            ("constants", "i32:0x5a17", "constants require obf-const")):
+        invalid_rule = member_rule()
+        invalid_rule[field] = [selector]
+        invalid_config = work_dir / f"unused-{field}-config.json"
+        invalid_report = work_dir / f"unused-{field}-report.json"
+        invalid_config.write_text(json.dumps(config(
+            rustc, [invalid_rule], cargo=args.cargo)) + "\n")
+        result = run([str(wrapper), "--config", str(invalid_config),
+                      "--report", str(invalid_report), "--",
+                      *cargo_args(not args.online)], code=1)
+        assert diagnostic in result.stderr, result.stderr
+        assert not invalid_report.exists(), invalid_report
+
     unmatched, _ = build_with_wrapper(wrapper, rustc, args.cargo, opt, host, work_dir,
                                        [member_rule("definitely_absent")], "unmatched",
                                        offline=not args.online, expected_code=2)
@@ -339,7 +374,7 @@ def main():
     assert not checked["code_artifact"]
     assert checked["coverage_status"] == "no-protected-code-artifact"
     assert "cargo check produced no protected code artifact" in result.stderr
-    print("PASS: Cargo workspace and registry selection, host filtering, strict unmatched, check report")
+    print("PASS: Cargo workspace and registry selection, host filtering, strict selectors, check report")
 
 
 if __name__ == "__main__":
