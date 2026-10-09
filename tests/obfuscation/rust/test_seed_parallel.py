@@ -32,6 +32,29 @@ def run(command, *, env=None):
     return result
 
 
+def saved_bitcode(binary):
+    return sorted(binary.parent.glob(f"{binary.stem}.*.rcgu.bc"))
+
+
+def clear_saved_ir(binary):
+    # A reused --work-dir must not let a previous invocation satisfy the gate.
+    for path in saved_bitcode(binary):
+        path.unlink()
+
+
+def verify_emitted_ir(opt, binary):
+    # rustc's saved .rcgu.bc files come from the same invocation that links
+    # this executable, including every codegen unit.
+    bitcode = saved_bitcode(binary)
+    assert bitcode, f"no saved LLVM IR for {binary}"
+    cgus = {match.group(1) for path in bitcode
+            if (match := re.search(r"-cgu\.(\d+)\.rcgu\.bc$", path.name))}
+    assert len(cgus) >= 2, f"{binary} did not emit multiple codegen units: {bitcode}"
+    for path in bitcode:
+        run([str(opt), "-passes=verify", "-disable-output", str(path)])
+    return bitcode
+
+
 def branch_source(path):
     parts = []
     for number in range(16):
@@ -64,9 +87,10 @@ def instruction_hashes(objdump, binary):
     return hashes
 
 
-def compile_branches(rustc, objdump, source, work_dir, pass_name, seed,
+def compile_branches(rustc, opt, objdump, source, work_dir, pass_name, seed,
                      suffix):
     binary = executable_path(work_dir, f"{pass_name}-{suffix}")
+    clear_saved_ir(binary)
     events = work_dir / f"{pass_name}-{suffix}.jsonl"
     events.unlink(missing_ok=True)
     options = [f"-rust-obf-pipeline=obf-{pass_name}",
@@ -80,27 +104,36 @@ def compile_branches(rustc, objdump, source, work_dir, pass_name, seed,
                if os.name == "nt" else [])
     command = [str(rustc), "--edition=2024", "-C", "opt-level=2",
                "-C", "codegen-units=4", "-C", "lto=false",
+               "-C", "save-temps=yes",
                "-C", "llvm-args=" + " ".join(options), *exports,
                str(source), "-o", str(binary)]
     run(command, env={**os.environ, "RUST_OBF_EVENT_FILE": str(events)})
+    verify_emitted_ir(opt, binary)
     records = [json.loads(line) for line in events.read_text().splitlines()]
-    effects = {entry["raw_name"] for entry in records
-               if entry["event"] == "effect" and entry["pass"] == pass_name}
-    assert effects == {f"probe_{i}" for i in range(16)}, effects
+    effects = [entry for entry in records
+               if entry["event"] == "effect" and entry["pass"] == pass_name
+               and entry["kind"] == "function"]
+    names = [entry["raw_name"] for entry in effects]
+    assert len(names) == 16 and set(names) == {f"probe_{i}" for i in range(16)}, (
+        pass_name, effects)
+    assert all(entry["count"] > 0 for entry in effects), effects
     return run([str(binary)]).stdout, instruction_hashes(objdump, binary)
 
 
-def check_branches(rustc, objdump, work_dir):
+def check_branches(rustc, opt, objdump, work_dir):
     source = work_dir / "parallel.rs"
     branch_source(source)
     baseline = executable_path(work_dir, "baseline")
+    clear_saved_ir(baseline)
     exports = ([item for number in range(16)
                 for item in ("-C", f"link-arg=/EXPORT:probe_{number}")]
                if os.name == "nt" else [])
     baseline_command = [str(rustc), "--edition=2024", "-C", "opt-level=2",
                         "-C", "codegen-units=4", "-C", "lto=false",
+                        "-C", "save-temps=yes",
                         *exports, str(source), "-o", str(baseline)]
     run(baseline_command)
+    verify_emitted_ir(opt, baseline)
     expected = run([str(baseline)]).stdout
     assert expected == b"3363439960029110486\n", expected
 
@@ -109,14 +142,14 @@ def check_branches(rustc, objdump, work_dir):
         first = None
         for number in range(3):
             output, witness = compile_branches(
-                rustc, objdump, source, work_dir, pass_name, SEED,
+                rustc, opt, objdump, source, work_dir, pass_name, SEED,
                 f"fixed-{number}")
             assert output == expected, (pass_name, output)
             if first is not None:
                 assert witness == first, f"{pass_name}: fixed seed drifted"
             first = witness
         output, changed = compile_branches(
-            rustc, objdump, source, work_dir, pass_name, OTHER_SEED,
+            rustc, opt, objdump, source, work_dir, pass_name, OTHER_SEED,
             "other-seed")
         assert output == expected
         changed_code = any(changed[name] != first[name] for name in first)
@@ -128,53 +161,67 @@ def check_branches(rustc, objdump, work_dir):
 
 
 def encoded_globals(ir, records):
-    names = {entry["raw_name"] for entry in records
-             if entry["event"] == "effect" and entry["pass"] == "sobf"
-             and entry["kind"] == "global"}
-    assert len(names) >= 5, names
-    values = {}
-    for name in names:
-        match = re.search(r"(?m)^@" + re.escape(name) +
-                          r' = .*? c"([^"]+)"', ir)
-        assert match, name
-        values[name] = match.group(1)
+    effects = [entry for entry in records
+               if entry["event"] == "effect" and entry["pass"] == "sobf"
+               and entry["kind"] == "global"]
+    assert len(effects) >= 5 and all(entry["count"] > 0 for entry in effects), effects
+    # Anonymous Rust byte arrays have empty event names before IR printing.
+    # Match only globals tagged by the string pass in every saved CGU module.
+    rows = []
+    for line in ir.splitlines():
+        if not line.startswith("@") or "!obf.sobf" not in line:
+            continue
+        match = re.match(r'^@([^ ]+) = .*? c"([^"]+)"', line)
+        assert match, line
+        rows.append(match.groups())
+    values = dict(rows)
+    assert len(rows) == len(effects) and len(values) == len(rows), (
+        len(rows), effects, rows)
     decoder = re.findall(r"\.datadiv_decode\d+", ir)
     assert decoder, "string decoder missing"
     return values, sorted(set(decoder))
 
 
-def compile_strings(rustc, work_dir, seed, suffix):
+def compile_strings(rustc, opt, work_dir, seed, suffix):
     binary = executable_path(work_dir, f"strings-{suffix}")
-    llvm_ir = binary.with_suffix(".ll")
+    clear_saved_ir(binary)
     events = work_dir / f"strings-{suffix}.jsonl"
     events.unlink(missing_ok=True)
     run([str(rustc), "--edition=2024", "-C", "opt-level=2",
          "-C", "codegen-units=4", "-C", "lto=false",
+         "-C", "save-temps=yes",
          "-C", "llvm-args=-rust-obf-pipeline=obf-string "
                f"-rust-obf-prelink-only -obf-test-seed={seed}",
-         f"--emit=llvm-ir={llvm_ir},link", str(SOURCE), "-o", str(binary)],
+         str(SOURCE), "-o", str(binary)],
         env={**os.environ, "RUST_OBF_EVENT_FILE": str(events)})
+    bitcode = verify_emitted_ir(opt, binary)
+    llvm_dis = opt.with_name("llvm-dis" + (".exe" if os.name == "nt" else ""))
+    assert llvm_dis.is_file() and os.access(llvm_dis, os.X_OK), llvm_dis
+    ir = "\n".join(run([str(llvm_dis), "-o", "-", str(path)]).stdout.decode()
+                   for path in bitcode)
     assert all(marker not in binary.read_bytes() for marker in MARKERS)
     records = [json.loads(line) for line in events.read_text().splitlines()]
-    return run([str(binary)]).stdout, encoded_globals(
-        llvm_ir.read_text(), records)
+    return run([str(binary)]).stdout, encoded_globals(ir, records)
 
 
-def check_strings(rustc, work_dir):
+def check_strings(rustc, opt, work_dir):
     baseline = executable_path(work_dir, "strings-baseline")
+    clear_saved_ir(baseline)
     run([str(rustc), "--edition=2024", "-C", "opt-level=2",
          "-C", "codegen-units=4", "-C", "lto=false",
+         "-C", "save-temps=yes",
          str(SOURCE), "-o", str(baseline)])
+    verify_emitted_ir(opt, baseline)
     expected = run([str(baseline)]).stdout
     first = None
     for number in range(3):
-        output, witness = compile_strings(rustc, work_dir, SEED,
+        output, witness = compile_strings(rustc, opt, work_dir, SEED,
                                           f"fixed-{number}")
         assert output == expected
         if first is not None:
             assert witness == first, "fixed seed changed encoded string data"
         first = witness
-    output, changed = compile_strings(rustc, work_dir, OTHER_SEED,
+    output, changed = compile_strings(rustc, opt, work_dir, OTHER_SEED,
                                       "other-seed")
     assert output == expected
     assert first[0] != changed[0], "different seed kept encoded string data"
@@ -187,6 +234,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--rustc", type=Path, required=True)
     parser.add_argument("--objdump", type=Path, required=True)
+    parser.add_argument("--opt", type=Path, required=True)
     parser.add_argument("--work-dir", type=Path, required=True)
     args = parser.parse_args()
     work_dir = args.work_dir.resolve()
@@ -195,8 +243,9 @@ def main():
     version = run([str(rustc), "-vV"]).stdout.decode()
     assert re.search(r"(?m)^release: 1\.99\.", version), version
     assert re.search(r"(?m)^LLVM version: 23\.", version), version
-    check_branches(rustc, args.objdump.resolve(), work_dir)
-    check_strings(rustc, work_dir)
+    opt = args.opt.resolve()
+    check_branches(rustc, opt, args.objdump.resolve(), work_dir)
+    check_strings(rustc, opt, work_dir)
 
 
 if __name__ == "__main__":

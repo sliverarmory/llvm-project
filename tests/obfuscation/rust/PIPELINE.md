@@ -71,11 +71,15 @@ python3 tests/obfuscation/rust/test_pipeline.py \
 `pipeline.rs` is the companion runtime fixture for the pinned custom rustc.
 `run_pipeline.py` compiles and runs it at O0/O2 with LTO off, thin, and fat,
 then checks one transformed pass invocation on its unmangled `pipeline_probe`
-symbol and exact output. Run it after building the stage-1 compiler against
+symbol, verifies the emitted IR with this fork's `opt`, compares linked code
+with an ordinary build, and checks exact output. Run it after building the
+stage-1 compiler against
 the current `LLVMPasses` and `LLVMObfuscation` archives:
 
 ```sh
 python3 tests/obfuscation/rust/run_pipeline.py \
   --rustc build-rust-1.99/build/<host>/stage1/bin/rustc \
+  --opt build-llvm-project/bin/opt \
+  --objdump build-llvm-project/bin/llvm-objdump \
   --work-dir build-llvm-project/rust-m1
 ```

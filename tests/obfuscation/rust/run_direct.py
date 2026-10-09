@@ -430,13 +430,17 @@ def main():
     if not args.baseline_only:
         check_unknown_pass(args.rustc, work_dir)
         base_machine = {
-            "transform_target": disassembled_function(
-                args.objdump, baselines[2][1], "transform_target"),
-            "global_target": disassembled_function(
-                args.objdump, global_baselines[2][1], "global_target"),
+            level: {
+                "transform_target": disassembled_function(
+                    args.objdump, baselines[level][1], "transform_target"),
+                "global_target": disassembled_function(
+                    args.objdump, global_baselines[level][1], "global_target"),
+            }
+            for level in (0, 2)
         }
-        require(C_MARKER.encode() in baselines[2][1].read_bytes(),
-                "baseline final artifact lacks selected plaintext marker")
+        for level in (0, 2):
+            require(C_MARKER.encode() in baselines[level][1].read_bytes(),
+                    f"O{level} baseline artifact lacks selected plaintext marker")
         for name in PASS_NAMES:
             report["passes"][name] = {}
             for level in (0, 2):
@@ -467,18 +471,30 @@ def main():
                 report_path.write_text(
                     json.dumps(report, indent=2, sort_keys=True) + "\n",
                     encoding="utf-8")
-                if level == 2:
-                    require(error is None, f"{name}/O2: {error}")
+                if name == "obf-global-access" and level == 0 and error is not None:
+                    # When O0 lowers STATE to a byte array, the scalar pass
+                    # must report its precise ineligibility and leave code.
+                    require(any(
+                        f'symbol="{selected_names["counter"]}" reason=not-integer'
+                        in line for line in
+                        report["passes"][name]["O0_selected_skips"]),
+                        "obf-global-access/O0 did not report the expected scalar skip")
+                    require(disassembled_function(args.objdump, executable,
+                                                   "global_target") ==
+                            base_machine[level]["global_target"],
+                            "obf-global-access/O0 changed excluded final code")
+                else:
+                    require(error is None, f"{name}/O{level}: {error}")
                     if name == "obf-string":
                         require(C_MARKER.encode() not in executable.read_bytes(),
-                                "string marker remains in transformed final artifact")
+                                f"{name}/O{level}: plaintext remains in final artifact")
                     else:
                         target = ("global_target" if name == "obf-global-access"
                                   else "transform_target")
                         changed_machine = disassembled_function(
                             args.objdump, executable, target)
-                        require(changed_machine != base_machine[target],
-                                f"{name}: final {target} machine code unchanged")
+                        require(changed_machine != base_machine[level][target],
+                                f"{name}/O{level}: final {target} machine code unchanged")
                 print(f"{name}/O{level}: parses, verifies, runs; effect={error is None}",
                       flush=True)
 

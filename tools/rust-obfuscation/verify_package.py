@@ -134,7 +134,8 @@ def main():
     if run([objdump, "--version"]).stdout.strip() != manifest["objdump_version"]:
         raise ValueError("extracted llvm-objdump version differs from manifest")
     run([sys.executable, ROOT / "tests/obfuscation/rust/run_pipeline.py",
-         "--rustc", rustc, "--work-dir", work / "pipeline"])
+         "--rustc", rustc, "--opt", opt, "--objdump", objdump,
+         "--work-dir", work / "pipeline"])
     if args.full:
         run([sys.executable, ROOT / "tests/obfuscation/rust/test_pipeline.py",
              "--opt", opt, "--clang", args.clang.resolve()])
@@ -168,7 +169,7 @@ def main():
              "--objdump", objdump,
              "--work-dir", work / "lto"], timeout=1800)
         run([sys.executable, ROOT / "tests/obfuscation/rust/test_seed_parallel.py",
-             "--rustc", rustc, "--objdump", objdump,
+             "--rustc", rustc, "--opt", opt, "--objdump", objdump,
              "--work-dir", work / "seed-parallel"], timeout=900)
         run([sys.executable,
              ROOT / "tests/obfuscation/rust/test_cargo_outputs.py",

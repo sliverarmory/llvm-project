@@ -75,8 +75,20 @@ def check_case(rustc, opt, objdump, work, label, level, cgus, lto):
             command += [f"--emit=llvm-ir={ir_path},link={executable}"]
             ir_paths[variant] = ir_path
         else:
-            command += ["-o", executable]
+            # --emit=llvm-ir together with -o would reset multi-CGU builds
+            # to one codegen unit. Save the bitcode from this link invocation
+            # instead, and remove only this variant's prior saved outputs so
+            # a rerun cannot accidentally verify stale IR.
+            for stale in work.glob(f"{stem.name}.*.rcgu.bc"):
+                stale.unlink()
+            command += ["-C", "save-temps=yes", "-o", executable]
         run([*command, SOURCE], timeout=600)
+        if cgus != 1 or lto != "off":
+            bitcode = sorted(work.glob(f"{stem.name}.*.rcgu.bc"))
+            if not bitcode:
+                raise AssertionError(f"{label}/{variant}: rustc saved no emitted bitcode")
+            for path in bitcode:
+                run([opt, "-passes=verify", "-disable-output", path])
         output = run([executable], timeout=30).stdout
         if output != expected_output():
             raise AssertionError(f"{label}/{variant}: wrong loop result: {output!r}")
@@ -90,7 +102,7 @@ def check_case(rustc, opt, objdump, work, label, level, cgus, lto):
     flattened = machine_instructions(objdump, executables["flattened"])
     if ordinary == flattened:
         raise AssertionError(f"{label}: final loop instructions unchanged")
-    print(f"PASS {label}: exact loop output, final effect, IR verified={bool(ir_paths)}",
+    print(f"PASS {label}: exact loop output, final effect, IR verified=True",
           flush=True)
 
 
