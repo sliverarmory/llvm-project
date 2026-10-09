@@ -16,9 +16,8 @@ pub extern "C" fn accept_bin_probe(a: u32, b: u32) -> u32 {
 
 #[inline(never)]
 fn generic_mix<T: Into<u64> + Copy>(value: T) -> u64 {
-    std::hint::black_box(value.into())
-        .wrapping_mul(3)
-        .wrapping_add(11)
+    let input = std::hint::black_box(value.into());
+    (input.rotate_left(1) ^ 11).wrapping_add(20)
 }
 
 #[inline(never)]
@@ -29,7 +28,7 @@ fn invoke_closure(callback: &dyn Fn(u64) -> u64, value: u64) -> u64 {
 #[inline(never)]
 async fn async_mix(value: u64) -> u64 {
     std::future::ready(()).await;
-    std::hint::black_box(value).wrapping_add(17)
+    std::hint::black_box(value).rotate_left(1) ^ 8
 }
 
 struct NoopWake;
@@ -52,7 +51,7 @@ fn main() {
     let generic_value =
         generic_mix(std::hint::black_box(7_u32)) + generic_mix(std::hint::black_box(9_u64));
     let salt = std::hint::black_box(5_u64);
-    let closure = move |value: u64| value.wrapping_mul(2).wrapping_add(salt);
+    let closure = move |value: u64| value.rotate_left(1) ^ salt;
     let closure_value = invoke_closure(std::hint::black_box(&closure as &dyn Fn(u64) -> u64), 9);
     let mut future = Box::pin(async_mix(std::hint::black_box(9)));
     let async_value = block_on(std::hint::black_box(future.as_mut()));

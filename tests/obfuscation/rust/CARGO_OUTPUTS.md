@@ -11,7 +11,7 @@ verifies the LLVM bitcode saved by those same Cargo builds with this fork's
 
 | Selected target | Consumer and final-code witness |
 | --- | --- |
-| `bin` | Executable `accept_bin_probe`; it also executes generic `u32` and `u64` instantiations, a captured closure, and an async future. Their demangled effect names must appear in the report. |
+| `bin` | Executable `accept_bin_probe`; it also executes generic `u32` and `u64` instantiations, a captured closure, and an async future. Each Rust witness must have one exact demangled `obf-sub` effect event. macOS and Linux compare each final linked symbol; Windows compares each saved COFF function and checks that its selected instructions survive in the final PE code. |
 | `rlib` | The library has `#![no_std]`; a Rust executable calls its probe. Final code is checked in that executable, not in the intermediate rlib. |
 | `dylib` | A Rust executable calls its probe. Final code is checked in the loaded Rust dynamic library. |
 | `cdylib` | A C executable loads and calls its exported probe. Final code is checked in the shared library. |
@@ -37,10 +37,16 @@ only shows up once`. The runner adds the selected target directory and dynamic
 sysroot to the platform library search path. The C static library remains a
 self-contained archive and is linked directly by the C harness.
 
-On Windows, C consumers are explicitly skipped only if a clang-compatible C
-driver is unavailable; the result JSON records that reason. On Linux and macOS,
-a missing C driver fails the gate. Any crate type or consumer that fails to
-compile, link, run, or retain its final effect fails the gate with the command
-and error output. This fixture currently has a native macOS arm64 pass; Linux
-amd64/arm64 and Windows amd64 need their own native runs before a four-platform
-support claim.
+A linked Windows PE can omit private Rust names from its symbol table. Rustc's
+saved COFF objects retain those names, so the Windows gate compares each named
+baseline and selected object function. It then requires each object's opcode
+sequence to appear in its corresponding linked executable and the selected
+sequence to be absent from the baseline executable. This proves retained code
+but does not identify a private PE function by name after linking. The result
+JSON labels the evidence as `saved COFF object and linked PE code`.
+
+A missing C driver fails the gate on every host. Any crate type or consumer
+that fails to compile, link, run, or retain its final effect fails the gate
+with the command and error output. This fixture currently has a native macOS
+arm64 pass; Linux amd64/arm64 and Windows amd64 need their own native runs
+before a four-platform support claim.

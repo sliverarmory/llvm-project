@@ -34,6 +34,12 @@ OUTPUTS = {
     "obf-output-cdylib": ("cdylib", "accept_cdylib_probe", "obf-split"),
     "obf-output-staticlib": ("staticlib", "accept_staticlib_probe", "obf-split"),
 }
+BIN_RUST_WITNESSES = {
+    "generic-u32": "obf_output_bin::generic_mix::<u32>",
+    "generic-u64": "obf_output_bin::generic_mix::<u64>",
+    "closure": "obf_output_bin::main::{closure#0}",
+    "async": "obf_output_bin::async_mix::{closure#0}",
+}
 
 
 def run(command, *, env=None, timeout=600):
@@ -106,13 +112,60 @@ def artifact(directory, stem, kind):
     return directory / ("lib" + name + suffix)
 
 
-def machine_instructions(objdump, path, symbol):
-    raw = "_" + symbol if sys.platform == "darwin" else symbol
-    output = run([str(objdump), f"--disassemble-symbols={raw}",
-                  "--no-show-raw-insn", str(path)], timeout=60).stdout
-    assert f"<{raw}>:" in output, (path, symbol, output[:2000])
-    instructions = re.findall(r"(?m)^\s*[0-9a-f]+:\s+([a-z][a-z0-9_.]*)\b", output)
-    assert instructions, (path, symbol, output[:2000])
+def machine_instructions(objdump, path, symbol, *, required=True):
+    # LLVM's raw name is used on ELF/COFF; Mach-O prepends an underscore.
+    # Probe both spellings so private Rust symbols and exported C probes use
+    # the same final-artifact check on every host.
+    candidates = ("_" + symbol, symbol) if sys.platform == "darwin" else (
+        symbol, "_" + symbol)
+    for raw in candidates:
+        output = run([str(objdump), f"--disassemble-symbols={raw}",
+                      "--no-show-raw-insn", str(path)], timeout=60).stdout
+        if f"<{raw}>:" not in output:
+            continue
+        instructions = re.findall(
+            r"(?m)^\s*[0-9a-f]+:\s+([a-z][a-z0-9_.]*)\b", output)
+        assert instructions, (path, symbol, output[:2000])
+        return instructions
+    if not required:
+        return None
+    raise AssertionError(f"machine-code symbol missing: {path} {symbol}")
+
+
+def linked_instructions(objdump, path):
+    output = run([str(objdump), "--disassemble", "--no-show-raw-insn",
+                  str(path)], timeout=60).stdout
+    instructions = re.findall(
+        r"(?m)^\s*[0-9a-f]+:\s+([a-z][a-z0-9_.]*)\b", output)
+    assert instructions, (path, output[:2000])
+    return instructions
+
+
+def contains_instructions(haystack, needle):
+    return any(haystack[index:index + len(needle)] == needle
+               for index in range(len(haystack) - len(needle) + 1))
+
+
+def saved_bin_objects(target_dir, host):
+    deps = target_dir / host / "release" / "deps"
+    objects = sorted((*deps.glob("obf_output_bin-*.rcgu.o"),
+                      *deps.glob("obf_output_bin-*.rcgu.obj")))
+    assert objects, deps
+    return objects
+
+
+def saved_object_instructions(objdump, objects, symbol):
+    matches = [(path, machine_instructions(objdump, path, symbol, required=False))
+               for path in objects]
+    matches = [(path, instructions) for path, instructions in matches
+               if instructions is not None]
+    assert len(matches) == 1, (symbol, matches, objects)
+    instructions = matches[0][1]
+    # COFF symbol ranges can include alignment bytes after the last return.
+    # Linkers may use different padding, so compare the function body itself.
+    while instructions and instructions[-1] in ("nop", "nopw", "nopl", "nopq", "int3"):
+        instructions = instructions[:-1]
+    assert instructions, (symbol, matches)
     return instructions
 
 
@@ -234,13 +287,18 @@ def check_report(report):
         if invocation["crate_name"] in ("obf_output_rlib_consumer",
                                          "obf_output_dylib_consumer"):
             assert invocation["status"] == "unselected", invocation
-    names = {event["demangled_name"] for event in packages["obf-output-bin"]["events"]
-             if event["event"] == "effect"}
-    for witness in ("generic_mix", "{closure#", "async_mix::{closure#"):
-        assert any(witness in name for name in names), (witness, sorted(names))
+    effects = [event for event in packages["obf-output-bin"]["events"]
+               if event["event"] == "effect" and event["pass"] == "sub"]
+    symbols = {}
+    for witness, demangled in BIN_RUST_WITNESSES.items():
+        matches = [event for event in effects
+                   if event["demangled_name"] == demangled]
+        assert len(matches) == 1, (witness, demangled, effects)
+        symbols[witness] = matches[0]["raw_name"]
+    return symbols
 
 
-def check_final_effects(objdump, host, baseline, selected):
+def check_final_effects(objdump, host, baseline, selected, bin_symbols):
     before_dir = baseline / host / "release"
     after_dir = selected / host / "release"
     result = {}
@@ -263,6 +321,45 @@ def check_final_effects(objdump, host, baseline, selected):
         result[name] = {"baseline_instructions": len(original),
                         "selected_instructions": len(protected)}
         print(f"PASS {kind}: {symbol} runs and changes in final machine code", flush=True)
+    before = artifact(before_dir, "obf-output-bin", "bin")
+    after = artifact(after_dir, "obf-output-bin", "bin")
+    rust_witnesses = {}
+    if sys.platform == "win32":
+        # PE links may discard private Rust names. Compare each named function
+        # in rustc's saved COFF objects, then require the selected instruction
+        # sequence to survive in the linked executable's code. The sequence
+        # must be absent from the ordinary executable.
+        before_objects = saved_bin_objects(baseline, host)
+        after_objects = saved_bin_objects(selected, host)
+        before_linked = linked_instructions(objdump, before)
+        after_linked = linked_instructions(objdump, after)
+        assert before_linked != after_linked, "linked PE code is unchanged"
+        evidence = "saved COFF object and linked PE code"
+    else:
+        before_linked = after_linked = None
+        evidence = "final linked symbol"
+    for witness, symbol in bin_symbols.items():
+        if before_linked is None:
+            original = machine_instructions(objdump, before, symbol)
+            protected = machine_instructions(objdump, after, symbol)
+        else:
+            original = saved_object_instructions(objdump, before_objects, symbol)
+            protected = saved_object_instructions(objdump, after_objects, symbol)
+        assert original != protected, (witness, symbol, original, protected)
+        if before_linked is not None:
+            assert contains_instructions(before_linked, original), (
+                witness, "baseline object code absent from linked PE")
+            assert contains_instructions(after_linked, protected), (
+                witness, "selected object code absent from linked PE")
+            assert not contains_instructions(before_linked, protected), (
+                witness, "selected code already present in baseline PE")
+        rust_witnesses[witness] = {
+            "baseline_instructions": len(original),
+            "selected_instructions": len(protected),
+        }
+        print(f"PASS bin {witness}: obf-sub effect in {evidence}", flush=True)
+    result["obf-output-bin"]["rust_witnesses"] = rust_witnesses
+    result["obf-output-bin"]["rust_witness_evidence"] = evidence
     return result
 
 
@@ -309,12 +406,12 @@ def main():
     run([str(wrapper), "--config", str(config_path), "--report",
          str(report_path), "--", *cargo_args(host)], env=selected_env)
     report = json.loads(report_path.read_text())
-    check_report(report)
+    bin_symbols = check_report(report)
     selected = selected_target_dir(report)
     verify_emitted_ir(opt, selected, host)
     protected = check_runtime(rustc, host, sysroot, selected, cc, native_libs)
     assert protected == ordinary == EXPECTED
-    final = check_final_effects(objdump, host, baseline, selected)
+    final = check_final_effects(objdump, host, baseline, selected, bin_symbols)
     (work / "acceptance-result.json").write_text(json.dumps({
         "host": host, "rustc": version, "runtime": protected,
         "final_effects": final,
