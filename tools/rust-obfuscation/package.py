@@ -11,6 +11,7 @@ import tarfile
 import tempfile
 import zipfile
 from pathlib import Path
+from bootstrap import check_rust_source
 from verify_integrity import validate_native_rustc_host, validate_package_path
 
 
@@ -43,6 +44,14 @@ def copy_tool(source, destination):
         raise ValueError(f"required tool is absent: {source}")
     destination.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source, destination)
+
+
+def validated_rust_source_commit(source):
+    # Bootstrap accepts either the pinned Git checkout or the verified source
+    # archive. Git invoked inside an archive tree would walk up to the LLVM
+    # checkout and report its commit instead of the Rust revision.
+    check_rust_source(source)
+    return PINS["rust_commit"]
 
 
 def manifest_files(package_dir):
@@ -89,11 +98,7 @@ def main():
                  llvm_ar, llvm_dis):
         if not tool.is_file():
             raise ValueError(f"required tool is absent: {tool}")
-    source_revision = run("git", "-C", str(rust_source), "rev-parse", "HEAD")
-    if source_revision != PINS["rust_commit"]:
-        raise ValueError(f"Rust source is {source_revision}; expected {PINS['rust_commit']}")
-    if run("git", "-C", str(rust_source), "status", "--porcelain", "--untracked-files=no"):
-        raise ValueError("pinned Rust source has tracked modifications")
+    source_revision = validated_rust_source_commit(rust_source)
 
     revision = run("git", "rev-parse", "HEAD")
     dirty = bool(run("git", "status", "--porcelain"))

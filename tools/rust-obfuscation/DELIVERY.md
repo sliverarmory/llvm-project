@@ -37,7 +37,8 @@ python3 tools/rust-obfuscation/package.py \
 ```
 
 Use `.zip` for a ZIP archive and `.exe` tool names on Windows. `package.py`
-requires the exact, unmodified pinned Rust checkout and refuses a dirty LLVM
+accepts the exact, unmodified pinned Rust Git checkout or the SHA256-verified
+release source tree prepared by `bootstrap.py`. It refuses a dirty LLVM
 checkout. `--allow-dirty` marks an archive for local development; it is not a
 release artifact. The package includes `rust-toolchain/`, the launcher and
 LLVM tools under `bin/`, licenses, a manifest, and a self-contained integrity

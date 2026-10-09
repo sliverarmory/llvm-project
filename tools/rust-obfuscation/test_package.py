@@ -3,19 +3,41 @@
 import hashlib
 import json
 import stat
+import subprocess
 import tarfile
 import tempfile
 import unittest
 import zipfile
 from pathlib import Path
 
-from package import manifest_files
+from package import PINS, manifest_files, validated_rust_source_commit
 from verify_integrity import (validate_native_rustc_host,
                               verify_archive_sidecar, verify_tree)
 from verify_package import extract
 
 
 class PackageIntegrityTests(unittest.TestCase):
+    def test_verified_rust_tarball_does_not_inherit_parent_git_commit(self):
+        with tempfile.TemporaryDirectory() as temp:
+            parent = Path(temp)
+            subprocess.run(["git", "init", "-q", str(parent)], check=True,
+                           capture_output=True, text=True)
+            subprocess.run([
+                "git", "-C", str(parent), "-c", "commit.gpgsign=false",
+                "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                "commit", "--allow-empty", "-m", "LLVM parent",
+            ], check=True, capture_output=True, text=True)
+            source = parent / "build-rust-1.99"
+            (source / "src").mkdir(parents=True)
+            (source / "bootstrap.example.toml").write_text("")
+            (source / "src" / "version").write_text(PINS["rust_version"] + "\n")
+            marker = source / ".rust-source-sha256"
+            marker.write_text(PINS["rust_source_sha256"] + "\n")
+            self.assertEqual(validated_rust_source_commit(source), PINS["rust_commit"])
+            marker.write_text("wrong archive checksum\n")
+            with self.assertRaisesRegex(RuntimeError, "unverified Rust source tree"):
+                validated_rust_source_commit(source)
+
     def test_rejects_zip_traversal(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
