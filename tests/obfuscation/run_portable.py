@@ -21,6 +21,7 @@ SUITES = (
     ("test_objc_metadata.py", True, False),
     ("test_constant_encoding.py", True, True),
     ("test_global_access.py", True, True),
+    ("report_static_recovery.py", False, True),
     ("rust/test_string_data.py", True, False),
 )
 
@@ -58,8 +59,8 @@ def main():
     work_dir.mkdir(parents=True, exist_ok=True)
     suite_dir = Path(__file__).resolve().parent
     for script, needs_opt, accepts_objdump in SUITES:
-        if script == "test_split_machine.py" and not objdump:
-            print("skipping final-code split test (pass --objdump to run it)",
+        if script in ("test_split_machine.py", "report_static_recovery.py") and not objdump:
+            print(f"skipping {script} (pass --objdump to run it)",
                   flush=True)
             continue
         suite_work_dir = work_dir / Path(script).stem
