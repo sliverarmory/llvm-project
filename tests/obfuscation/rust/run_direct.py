@@ -13,6 +13,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from machine_code import isolated_instructions
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from test_http_programs import DOCUMENTS, REDIRECTS, start_server  # noqa: E402
 
@@ -89,7 +91,8 @@ def compile_rust(rustc, source, ir_path, exe_path, *, opt_level,
         exported = {"direct": "transform_target",
                     "global_access": "global_target",
                     "https_client": "summarize_checksum"}[source.stem]
-        command.extend(("-C", f"link-arg=/EXPORT:{exported}"))
+        command.extend(("-C", f"link-arg=/EXPORT:{exported}",
+                        "-C", "force-frame-pointers=yes"))
     if pass_name:
         command.extend(("-C", f"passes={pass_name}"))
     if llvm_options:
@@ -226,17 +229,8 @@ def effect_error(name, ir, baseline, selected):
 
 def disassembled_function(objdump, executable, symbol):
     raw = "_" + symbol if platform.system() == "Darwin" else symbol
-    output = run([str(objdump), f"--disassemble-symbols={raw}",
-                  "--no-show-raw-insn", str(executable)]).stdout
-    require(f"<{raw}>:" in output,
-            f"final artifact lacks disassemblable symbol {raw}: {executable}")
-    instructions = []
-    for line in output.splitlines():
-        match = re.match(r"^\s*[0-9a-f]+:\s+([a-z][a-z0-9_.]*)\b", line)
-        if match:
-            instructions.append(match.group(1))
-    require(instructions, f"no machine instructions for {raw}: {executable}")
-    return instructions
+    return [line.split(None, 1)[0]
+            for line in isolated_instructions(objdump, executable, raw)]
 
 
 def runtime_output(executable):

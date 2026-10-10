@@ -14,6 +14,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from machine_code import isolated_instructions
+
 
 ROOT = Path(__file__).resolve().parents[3]
 SOURCE = Path(__file__).with_name("pipeline.rs")
@@ -73,14 +75,8 @@ def check_toolchain(rustc: Path, opt: Path) -> None:
 
 def linked_probe(objdump: Path, binary: Path) -> tuple[str, ...]:
     raw = ("_" if platform.system() == "Darwin" else "") + "pipeline_probe"
-    output = run([str(objdump), f"--disassemble-symbols={raw}",
-                  "--no-show-raw-insn", str(binary)], timeout=30).stdout
-    if f"<{raw}>:" not in output:
-        raise AssertionError(f"{binary}: linked {raw} symbol is not disassemblable")
-    instructions = tuple(re.findall(r"(?m)^\s*[0-9a-f]+:\s+([a-z][a-z0-9_.]*)\b", output))
-    if not instructions:
-        raise AssertionError(f"{binary}: linked {raw} has no machine instructions")
-    return instructions
+    return tuple(line.split(None, 1)[0]
+                 for line in isolated_instructions(objdump, binary, raw))
 
 
 def compile_and_verify(opt: Path, common: list[str],
@@ -127,7 +123,8 @@ def check_case(rustc: Path, opt: Path, objdump: Path, work_dir: Path,
         "-C", f"lto={lto}",
     ]
     if sys.platform == "win32":
-        common.extend(("-C", "link-arg=/EXPORT:pipeline_probe"))
+        common.extend(("-C", "link-arg=/EXPORT:pipeline_probe",
+                       "-C", "force-frame-pointers=yes"))
     baseline_binary, _ = compile_and_verify(
         opt, common, work_dir / label / "baseline")
     expected = expected_output()

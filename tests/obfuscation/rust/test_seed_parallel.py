@@ -10,6 +10,8 @@ import re
 import subprocess
 from pathlib import Path
 
+from machine_code import isolated_instructions
+
 
 SEED = "00112233445566778899aabbccddeeff"
 OTHER_SEED = "ffeeddccbbaa99887766554433221100"
@@ -77,10 +79,7 @@ def instruction_hashes(objdump, binary):
     hashes = {}
     for number in range(16):
         raw = ("_" if platform.system() == "Darwin" else "") + f"probe_{number}"
-        dump = run([str(objdump), f"--disassemble-symbols={raw}",
-                    "--no-show-raw-insn", str(binary)]).stdout.decode()
-        lines = re.findall(r"(?m)^\s*[0-9a-f]+:\s+(.+)$", dump)
-        assert lines, (binary, raw)
+        lines = isolated_instructions(objdump, binary, raw)
         normalized = "\n".join(
             re.sub(r"0x[0-9a-f]+(?= <)", "ADDR", line) for line in lines)
         hashes[raw] = hashlib.sha256(normalized.encode()).hexdigest()
@@ -102,6 +101,8 @@ def compile_branches(rustc, opt, objdump, source, work_dir, pass_name, seed,
     exports = ([item for number in range(16)
                 for item in ("-C", f"link-arg=/EXPORT:probe_{number}")]
                if os.name == "nt" else [])
+    if os.name == "nt":
+        exports += ["-C", "force-frame-pointers=yes"]
     command = [str(rustc), "--edition=2024", "-C", "opt-level=2",
                "-C", "codegen-units=4", "-C", "lto=false",
                "-C", "save-temps=yes",
@@ -128,6 +129,8 @@ def check_branches(rustc, opt, objdump, work_dir):
     exports = ([item for number in range(16)
                 for item in ("-C", f"link-arg=/EXPORT:probe_{number}")]
                if os.name == "nt" else [])
+    if os.name == "nt":
+        exports += ["-C", "force-frame-pointers=yes"]
     baseline_command = [str(rustc), "--edition=2024", "-C", "opt-level=2",
                         "-C", "codegen-units=4", "-C", "lto=false",
                         "-C", "save-temps=yes",

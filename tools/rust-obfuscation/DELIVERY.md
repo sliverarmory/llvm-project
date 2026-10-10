@@ -166,6 +166,12 @@ binary or library for the requested instruction/data effect. Inlining,
 linking, and LTO can change what survives. The focused Cargo test checks a
 linked selected function in addition to the report.
 
+Native Windows final-code fixtures compile both variants with
+`-C force-frame-pointers=yes` so PE unwind metadata can bound each exported
+probe. The shared disassembly helper uses those exact ranges and rejects
+branching leaf functions whose extent is unavailable. Saved COFF object
+witnesses retain their ordinary symbol bounds.
+
 ## Eligibility and current limits
 
 - String encoding handles eligible local constant byte arrays, including
@@ -195,6 +201,8 @@ compiler peak resident memory in bytes, and process-level runtime wall time
 in nanoseconds. Windows uses peak working set; Unix uses `ru_maxrss`, so
 compare memory within a host rather than across operating systems. The
 benchmark verifies exact output and a changed final function.
+Its Windows configuration also records the frame-pointer setting used by
+both variants for exact final-function evidence.
 The generated harness includes the unchanged pipeline fixture and calls its
 probe 100,000 times by default. Runtime still includes process launch and
 should not be treated as isolated function throughput. Use the JSON's raw

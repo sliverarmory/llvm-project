@@ -127,6 +127,9 @@ jobs:
       - name: Check Rust package unit tests
         run: python -B -m unittest discover -s tools/rust-obfuscation -p test_package.py -v
 
+      - name: Check isolated final machine-code extraction
+        run: python -B tests/obfuscation/rust/test_machine_code.py
+
       - name: Fetch pinned Rust 1.99 source
         run: git clone --depth 1 --branch 1.99.0 --filter=blob:none https://github.com/rust-lang/rust.git build-rust-1.99
 

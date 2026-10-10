@@ -8,6 +8,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from machine_code import isolated_instructions
+
 
 SOURCE = Path(__file__).with_name("flatten_loop.rs")
 SEED = "00112233445566778899aabbccddeeff"
@@ -45,14 +47,8 @@ def expected_output():
 
 def machine_instructions(objdump, executable):
     symbol = "_flatten_loop" if platform.system() == "Darwin" else "flatten_loop"
-    output = run([objdump, f"--disassemble-symbols={symbol}",
-                  "--no-show-raw-insn", executable]).stdout
-    if f"<{symbol}>:" not in output:
-        raise AssertionError(f"final executable lacks {symbol}")
-    instructions = re.findall(r"(?m)^\s*[0-9a-f]+:\s+([a-z][a-z0-9_.]*)\b", output)
-    if not instructions:
-        raise AssertionError(f"no final instructions for {symbol}")
-    return instructions
+    return [line.split(None, 1)[0]
+            for line in isolated_instructions(objdump, executable, symbol)]
 
 
 def check_case(rustc, opt, objdump, work, label, level, cgus, lto):
@@ -65,7 +61,8 @@ def check_case(rustc, opt, objdump, work, label, level, cgus, lto):
                    "-C", f"codegen-units={cgus}", "-C", f"lto={lto}",
                    "-C", "panic=abort"]
         if sys.platform == "win32":
-            command += ["-C", "link-arg=/EXPORT:flatten_loop"]
+            command += ["-C", "link-arg=/EXPORT:flatten_loop",
+                        "-C", "force-frame-pointers=yes"]
         if variant == "flattened":
             llvm = ("-rust-obf-pipeline=obf-fla -rust-obf-prelink-only "
                     f"-obf-only-functions=flatten_loop -obf-test-seed={SEED}")

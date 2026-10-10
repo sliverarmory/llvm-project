@@ -23,6 +23,7 @@ import threading
 import time
 from pathlib import Path
 
+from machine_code import isolated_instructions
 from run_pipeline import expected_output
 
 
@@ -169,18 +170,8 @@ def run_program(path, *, expected, timeout):
 
 def machine_mnemonics(objdump, path):
     symbol = "_pipeline_probe" if platform.system() == "Darwin" else "pipeline_probe"
-    result = subprocess.run(
-        [str(objdump), f"--disassemble-symbols={symbol}", "--no-show-raw-insn",
-         str(path)], capture_output=True, text=True, timeout=30, check=True,
-    )
-    if f"<{symbol}>:" not in result.stdout:
-        raise RuntimeError(f"linked function {symbol} absent in {path}")
-    instructions = re.findall(
-        r"(?m)^\s*[0-9a-f]+:\s+([a-z][a-z0-9_.]*)\b", result.stdout
-    )
-    if not instructions:
-        raise RuntimeError(f"no linked machine instructions found in {path}")
-    return instructions
+    return [line.split(None, 1)[0]
+            for line in isolated_instructions(objdump, path, symbol)]
 
 
 def median(samples):
@@ -257,7 +248,9 @@ def main():
     common = [str(rustc), "--edition=2024", "-C", "opt-level=2",
               "-C", "panic=abort", "-C", "codegen-units=1", "-C", "lto=off"]
     if os.name == "nt":
-        common += ["-C", "link-arg=/EXPORT:pipeline_probe"]
+        # A frame prologue gives PE leaves exact unwind-table function bounds.
+        common += ["-C", "force-frame-pointers=yes",
+                   "-C", "link-arg=/EXPORT:pipeline_probe"]
     llvm = (f"-rust-obf-pipeline={PASSES} "
             f"-obf-only-functions=pipeline_probe -obf-test-seed={SEED}")
     for number in range(args.compile_runs):
@@ -327,6 +320,7 @@ def main():
         "rustc_vv": version,
         "configuration": {"opt_level": 2, "panic": "abort", "codegen_units": 1,
                           "lto": "off", "passes": PASSES.split(","),
+                          "force_frame_pointers": os.name == "nt",
                           "function": "pipeline_probe", "fixed_seed": SEED,
                           "compile_runs": args.compile_runs,
                           "runtime_runs": args.runtime_runs, "warmup_runs": 2,
@@ -357,6 +351,7 @@ def main():
             "obfuscated_binary_sha256": sha256(final_binaries["obfuscated"]),
         },
         "caveats": [
+            "Windows builds retain frame pointers in both variants to obtain exact PE unwind-table bounds for the selected function.",
             "Wall times include process startup and, for compilation, linking; 100000 probe calls by default amortize but do not remove launch overhead.",
             "Peak memory is the top-level rustc process's OS-reported maximum, excluding any separately spawned linker process; Windows uses peak working set and Unix uses ru_maxrss.",
             "Runs share the host with other work, use warm filesystem caches, and are not CPU-pinned; ratios are descriptive, not confidence intervals.",

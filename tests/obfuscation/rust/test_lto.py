@@ -2,7 +2,6 @@
 """Qualify selected-crate LTO placement against linked Rust 1.99 artifacts."""
 
 import argparse
-from functools import lru_cache
 import json
 import os
 import platform
@@ -11,6 +10,8 @@ import shutil
 import subprocess
 import time
 from pathlib import Path
+
+from machine_code import isolated_instructions
 
 
 FIXTURE = Path(__file__).with_name("lto_fixture")
@@ -70,6 +71,8 @@ def saved_ir_env(base=None, *, bcf_prob=None):
     """Keep the IR from the actual Cargo invocation for independent verification."""
     env = dict(os.environ if base is None else base)
     flags = ["-C", "save-temps=yes"]
+    if os.name == "nt":
+        flags.extend(("-C", "force-frame-pointers=yes"))
     if bcf_prob is not None:
         flags.extend(("-C", f"llvm-args=-bcf_prob={bcf_prob}"))
     if "CARGO_ENCODED_RUSTFLAGS" in env:
@@ -121,61 +124,9 @@ def verify_emitted_ir(opt, target_dir, host, *, selected_crate,
             "protected symbols share a CGU", locations)
 
 
-@lru_cache(maxsize=8)
-def coff_unwind_ranges(objdump, binary, mtime_ns, size):
-    """Return exact PE function ranges; COFF exports have no symbol sizes."""
-    dump = run([str(objdump), "--private-headers", "--unwind-info",
-                str(binary)], timeout=30).stdout
-    image_base = re.search(r"(?m)^ImageBase\s+([0-9a-fA-F]+)$", dump)
-    assert image_base, binary
-    base = int(image_base.group(1), 16)
-    ranges = re.findall(
-        r"(?m)^Function Table:\s*\n\s+Start Address: 0x([0-9a-fA-F]+)"
-        r"\s*\n\s+End Address: 0x([0-9a-fA-F]+)", dump)
-    assert ranges, (binary, "PE unwind table is empty")
-    return {base + int(start, 16): base + int(end, 16)
-            for start, end in ranges}
-
-
-def coff_leaf_range(entries, raw, start):
-    """Bound a leaf with no .pdata entry by its reachable forward branches."""
-    last_target = start
-    for index, (address, line) in enumerate(entries):
-        opcode = line.split(None, 1)[0]
-        if opcode.startswith("j") or opcode.startswith("loop"):
-            for offset in re.findall(
-                    rf"<{re.escape(raw)}\+0x([0-9a-fA-F]+)>", line):
-                last_target = max(last_target, start + int(offset, 16))
-        if address >= last_target and (opcode in ("ret", "retq", "ud2") or
-                                       (opcode.startswith("jmp") and
-                                        f"<{raw}+" not in line)):
-            return entries[:index + 1]
-    raise AssertionError((raw, "could not bound COFF leaf function"))
-
-
 def instructions(objdump, binary, symbol):
     raw = "_" + symbol if platform.system() == "Darwin" else symbol
-    dump = run([str(objdump), f"--disassemble-symbols={raw}",
-                "--no-show-raw-insn", str(binary)], timeout=30).stdout
-    assert f"<{raw}>:" in dump, (binary, raw)
-    lines = re.findall(r"(?m)^\s*[0-9a-f]+:\s+(.+)$", dump)
-    assert lines, (binary, raw)
-    if os.name == "nt":
-        label = re.search(rf"(?m)^([0-9a-fA-F]+) <{re.escape(raw)}>:$", dump)
-        assert label, (binary, raw)
-        entries = [(int(address, 16), line) for address, line in re.findall(
-            r"(?m)^\s*([0-9a-fA-F]+):\s+(.+)$", dump)]
-        entries = [(address, line) for address, line in entries
-                   if address >= int(label.group(1), 16)]
-        assert entries, (binary, raw)
-        stat = binary.stat()
-        end = coff_unwind_ranges(objdump, binary, stat.st_mtime_ns,
-                                 stat.st_size).get(entries[0][0])
-        entries = ([(address, line) for address, line in entries
-                    if address < end] if end is not None else
-                   coff_leaf_range(entries, raw, entries[0][0]))
-        assert entries, (binary, raw, "COFF function range is empty")
-        lines = [line for _, line in entries]
+    lines = isolated_instructions(objdump, binary, raw)
     # Linked addresses change when a different sized chosen function shifts
     # later code. Keep relative symbol offsets and non-PC-relative operands.
     normalized = []
@@ -371,7 +322,8 @@ def check_incremental(wrapper, rustc, host, opt, objdump, work_dir):
     rejected = run([str(wrapper), "--config", str(changed), "--report",
                     str(directory / "changed-report.json"),
                     "--reuse-target-dir", str(target), "--",
-                    *cargo_args(manifest, "thin", 4, 2)], code=1)
+                    *cargo_args(manifest, "thin", 4, 2)],
+                   env=saved_ir_env({**os.environ, "RUSTC": str(rustc)}), code=1)
     assert "different build identity" in rejected.stderr
     print("PASS incremental: fresh effects, honest no-op, stable rebuild, seed guard")
 

@@ -15,6 +15,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from machine_code import isolated_instructions
+
 
 SOURCE = Path(__file__).with_name("eh_regions.rs")
 SEED = "00112233445566778899aabbccddeeff"
@@ -79,17 +81,10 @@ def instruction_count(body: str) -> int:
 
 def linked_instructions(objdump: Path, binary: Path) -> tuple[str, ...]:
     symbol = "_eh_probe" if sys.platform == "darwin" else "eh_probe"
-    output = run([str(objdump), f"--disassemble-symbols={symbol}",
-                  "--no-show-raw-insn", str(binary)], timeout=60).stdout
-    if f"<{symbol}>:" not in output:
-        raise AssertionError(f"linked {binary} lacks {symbol} disassembly")
     # Addresses and branch targets can move when another variant adds code.
     # An opcode difference proves the selected EH function changed after link.
-    instructions = tuple(re.findall(
-        r"(?m)^\s*[0-9a-fA-F]+:\s+([a-z][a-z0-9_.]*)\b", output))
-    if not instructions:
-        raise AssertionError(f"linked {binary} has no {symbol} instructions")
-    return instructions
+    return tuple(line.split(None, 1)[0]
+                 for line in isolated_instructions(objdump, binary, symbol))
 
 
 def selected_globals(ir: str, body: str) -> tuple[str, str, str]:
@@ -264,7 +259,8 @@ def compile_case(rustc: Path, opt: Path, objdump: Path, work_dir: Path, level: i
     if sys.platform == "win32":
         # PE linkers may omit the symbol table needed for disassembly. Export
         # the same probe from every baseline and selected executable.
-        args.extend(("-C", "link-arg=/EXPORT:eh_probe"))
+        args.extend(("-C", "link-arg=/EXPORT:eh_probe",
+                     "-C", "force-frame-pointers=yes"))
     passes = VARIANTS[variant]
     env = None
     if passes:

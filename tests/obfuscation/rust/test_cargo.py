@@ -9,6 +9,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from machine_code import isolated_instructions
+
 
 FIXTURE = Path(__file__).resolve().parent / "cargo_fixture"
 MEMBER = "rust-obf-member"
@@ -30,13 +32,16 @@ def run(command, *, env=None, code=0, timeout=240):
 
 def saved_ir_env(base=None):
     env = dict(os.environ if base is None else base)
+    flags = ["-C", "save-temps=yes"]
+    if sys.platform == "win32":
+        flags.extend(("-C", "force-frame-pointers=yes"))
     if "CARGO_ENCODED_RUSTFLAGS" in env:
         prior = env["CARGO_ENCODED_RUSTFLAGS"]
         env["CARGO_ENCODED_RUSTFLAGS"] = (
-            prior + ("\x1f" if prior else "") + "-C\x1fsave-temps=yes")
+            prior + ("\x1f" if prior else "") + "\x1f".join(flags))
     else:
         env["RUSTFLAGS"] = (env.get("RUSTFLAGS", "") +
-                            " -C save-temps=yes").strip()
+                            " " + " ".join(flags)).strip()
     return env
 
 
@@ -71,12 +76,8 @@ def executable(target_dir, host):
 
 def machine_instructions(objdump, path, symbol):
     raw = "_" + symbol if platform.system() == "Darwin" else symbol
-    output = run([str(objdump), f"--disassemble-symbols={raw}",
-                  "--no-show-raw-insn", str(path)]).stdout
-    assert f"<{raw}>:" in output, (path, symbol)
-    instructions = re.findall(r"(?m)^\s*[0-9a-f]+:\s+([a-z][a-z0-9_.]*)\b", output)
-    assert instructions, (path, symbol)
-    return instructions
+    return [line.split(None, 1)[0]
+            for line in isolated_instructions(objdump, path, raw)]
 
 
 def config(rustc, rules, *, strict=True, cargo="cargo"):

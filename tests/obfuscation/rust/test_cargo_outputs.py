@@ -20,6 +20,8 @@ import tempfile
 import uuid
 from pathlib import Path
 
+from machine_code import isolated_instructions
+
 
 FIXTURE = Path(__file__).with_name("cargo_outputs_fixture")
 EXPECTED = {
@@ -77,6 +79,8 @@ def env_for(rustc, sysroot, host, target_dir):
     # linked Rust sysroot; the default static std fails with duplicate crates.
     # Save the exact Cargo invocation's LLVM IR for the independent opt gate.
     env["RUSTFLAGS"] = "-C prefer-dynamic -C save-temps=yes"
+    if sys.platform == "win32":
+        env["RUSTFLAGS"] += " -C force-frame-pointers=yes"
     env.pop("CARGO_ENCODED_RUSTFLAGS", None)
     env["CARGO_TARGET_DIR"] = str(target_dir)
     paths = [sysroot / "lib" / "rustlib" / host / "lib",
@@ -121,14 +125,10 @@ def machine_instructions(objdump, path, symbol, *, required=True):
     candidates = ("_" + symbol, symbol) if sys.platform == "darwin" else (
         symbol, "_" + symbol)
     for raw in candidates:
-        output = run([str(objdump), f"--disassemble-symbols={raw}",
-                      "--no-show-raw-insn", str(path)], timeout=60).stdout
-        if f"<{raw}>:" not in output:
+        lines = isolated_instructions(objdump, path, raw, required=False)
+        if not lines:
             continue
-        instructions = re.findall(
-            r"(?m)^\s*[0-9a-f]+:\s+([a-z][a-z0-9_.]*)\b", output)
-        assert instructions, (path, symbol, output[:2000])
-        return instructions
+        return [line.split(None, 1)[0] for line in lines]
     if not required:
         return None
     raise AssertionError(f"machine-code symbol missing: {path} {symbol}")
