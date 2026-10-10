@@ -47,6 +47,7 @@ JSON labels the evidence as `saved COFF object and linked PE code`.
 
 A missing C driver fails the gate on every host. Any crate type or consumer
 that fails to compile, link, run, or retain its final effect fails the gate
-with the command and error output. This fixture currently has a native macOS
-arm64 pass; Linux amd64/arm64 and Windows amd64 need their own native runs
-before a four-platform support claim.
+with the command and error output. The native workflow runs this fixture on
+macOS arm64, Linux amd64/arm64, and Windows amd64. A four-platform support
+claim requires a green run and extracted toolchain archive proof from every
+host at the same commit.
