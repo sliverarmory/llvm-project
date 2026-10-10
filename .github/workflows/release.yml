@@ -311,18 +311,27 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  rust-toolchain:
+    name: Build and qualify native Rust toolchains
+    needs: validate-tag
+    uses: ./.github/workflows/rust-m0.yml
+    permissions:
+      contents: read
+
   release:
     name: Create GitHub release and upload archives
-    needs: build-and-package
+    needs: [build-and-package, rust-toolchain]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
       - name: Download all intermediate artifacts
         uses: actions/download-artifact@v4
         with:
           path: dist
 
-      - name: Show downloaded artifacts
-        run: find dist -type f -name "*.zip" -print
+      - name: Validate all archives and their exact-commit Rust smoke evidence
+        run: python3 tools/rust-obfuscation/release_assets.py --artifacts dist --tag "$GITHUB_REF_NAME" --expected-commit "$GITHUB_SHA" --output release-assets
 
       - name: Create release and upload archives with gh
         env:
@@ -330,10 +339,10 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          shopt -s globstar nullglob
+          shopt -s nullglob
 
           TAG="${GITHUB_REF_NAME}"
-          FILES=(dist/**/*.zip)
+          FILES=(release-assets/*)
           if [ "${#FILES[@]}" -eq 0 ]; then
             echo "No release archives found."
             exit 1

@@ -1,9 +1,11 @@
 name: Rust obfuscation toolchain
 
 on:
+  pull_request:
   push:
-    branches: [feat/rust-obfuscation]
+    branches: [main, feat/rust-obfuscation]
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
@@ -122,11 +124,8 @@ jobs:
       - name: Check LLVM obfuscation unit tests
         run: python -c "import subprocess; subprocess.run(['build-llvm-project/unittests/Transforms/Obfuscation/ObfuscationTests${{ matrix.exe }}'], check=True)"
 
-      - name: Check Rust bootstrap unit tests
-        run: python -B -m unittest discover -s tools/rust-obfuscation -p test_bootstrap.py -v
-
-      - name: Check Rust package unit tests
-        run: python -B -m unittest discover -s tools/rust-obfuscation -p test_package.py -v
+      - name: Check Rust bootstrap and delivery unit tests
+        run: python -B -m unittest discover -s tools/rust-obfuscation -p 'test_*.py' -v
 
       - name: Check isolated final machine-code extraction
         run: python -B tests/obfuscation/rust/test_machine_code.py
@@ -140,7 +139,12 @@ jobs:
       - name: Build Cargo launcher from its lockfile
         env:
           CARGO_TARGET_DIR: ${{ github.workspace }}/build-llvm-project/cargo-wrapper-target
-        run: cargo build --locked --release --manifest-path tools/rust-obfuscation/cargo-wrapper/Cargo.toml
+        run: python -B tools/rust-obfuscation/provenance.py build-wrapper --target-dir build-llvm-project/cargo-wrapper-target
+
+      - name: Check Cargo launcher unit tests
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/build-llvm-project/cargo-wrapper-target
+        run: cargo test --locked --manifest-path tools/rust-obfuscation/cargo-wrapper/Cargo.toml
 
       - name: Verify LLVM obfuscation pipeline
         run: python -B tests/obfuscation/rust/test_pipeline.py --opt build-llvm-project/bin/opt${{ matrix.exe }} --clang build-llvm-project/bin/clang${{ matrix.exe }}
@@ -157,6 +161,9 @@ jobs:
       - name: Verify portable Clang obfuscation suites
         run: python -B tests/obfuscation/run_portable.py --clang build-llvm-project/bin/clang${{ matrix.exe }} --opt build-llvm-project/bin/opt${{ matrix.exe }} --objdump build-llvm-project/bin/llvm-objdump${{ matrix.exe }} --work-dir build-llvm-project/portable-rust
 
+      - name: Measure each Clang obfuscation pass from final binaries
+        run: python -B tests/obfuscation/report_size_time.py --clang build-llvm-project/bin/clang${{ matrix.exe }} --opt build-llvm-project/bin/opt${{ matrix.exe }} --objdump build-llvm-project/bin/llvm-objdump${{ matrix.exe }} --work-dir build-llvm-project/clang-cost
+
       - name: Verify four-language HTTPS clients on Linux
         if: runner.os == 'Linux'
         run: python -B tests/obfuscation/test_http_programs.py --clang build-llvm-project/bin/clang --opt build-llvm-project/bin/opt --work-dir build-llvm-project/http-rust
@@ -170,8 +177,11 @@ jobs:
             build-llvm-project/rust-obfuscation-${{ matrix.platform }}.${{ matrix.extension }}.sha256
             build-llvm-project/rust-extracted/smoke-report.json
             build-llvm-project/rust-extracted/benchmark/benchmark-report.json
+            build-llvm-project/clang-cost/obfuscation-performance.json
+            build-llvm-project/clang-cost/obfuscation-performance.md
+            build-llvm-project/portable-rust/report_static_recovery/static-recovery.json
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 30
 
       - name: Upload Rust diagnostic reports and emitted IR
         if: failure()
@@ -183,5 +193,7 @@ jobs:
             build-llvm-project/rust-extracted/**/*.ll
             build-llvm-project/eh-ir/*.ll
             build-llvm-project/portable-rust/**/*.ll
+            build-llvm-project/portable-rust/**/*.json
+            build-llvm-project/clang-cost/**
             build-llvm-project/http-rust/*.ll
           if-no-files-found: ignore
