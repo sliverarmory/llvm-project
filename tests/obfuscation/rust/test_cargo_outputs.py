@@ -150,9 +150,17 @@ def contains_instructions(haystack, needle):
 
 def saved_bin_objects(target_dir, host):
     deps = target_dir / host / "release" / "deps"
-    objects = sorted((*deps.glob("obf_output_bin-*.rcgu.o"),
-                      *deps.glob("obf_output_bin-*.rcgu.obj")))
-    assert objects, deps
+    # rustc uses the same crate/CGU stem for saved bitcode and native objects.
+    # The stem can use either a dot or a hyphen after the crate name, so take
+    # it from the bitcode already verified for this exact Cargo build.
+    bitcode = sorted(path for path in deps.glob("*.rcgu.bc")
+                     if path.name.startswith(("obf_output_bin-", "obf_output_bin.")))
+    assert bitcode, f"saved bin bitcode missing from {deps}"
+    objects = sorted(path for bc in bitcode
+                     for path in (bc.with_suffix(".o"), bc.with_suffix(".obj"))
+                     if path.is_file())
+    assert objects, (deps, [path.name for path in bitcode],
+                     [path.name for path in deps.glob("*.rcgu.o")])
     return objects
 
 
