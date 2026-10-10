@@ -18,6 +18,10 @@ SPEC.loader.exec_module(bootstrap)
 
 
 class BootstrapPreflightTests(unittest.TestCase):
+    @staticmethod
+    def archive_name(target: str) -> str:
+        return f"{target}.lib" if os.name == "nt" else f"lib{target}.a"
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -25,9 +29,10 @@ class BootstrapPreflightTests(unittest.TestCase):
         self.libdir = self.root / "lib"
         self.libdir.mkdir()
         self.llvm_config = self.root / "bin/llvm-config"
-        self.absent = [self.libdir / "libLLVMMCA.a", self.libdir / "libLLVMX86TargetMCA.a"]
-        for name in ("libLLVMPasses.a", "libLLVMObfuscation.a"):
-            (self.libdir / name).write_bytes(b"archive")
+        self.absent = [self.libdir / self.archive_name("LLVMMCA"),
+                       self.libdir / self.archive_name("LLVMX86TargetMCA")]
+        for target in ("LLVMPasses", "LLVMObfuscation"):
+            (self.libdir / self.archive_name(target)).write_bytes(b"archive")
 
     def fake_llvm_config(self, *args, **_kwargs) -> str:
         if "--libdir" in args:
@@ -39,8 +44,9 @@ class BootstrapPreflightTests(unittest.TestCase):
             if missing:
                 lines = [f"llvm-config: error: missing: {path}" for path in missing]
                 raise RuntimeError("llvm-config failed (1): " + "\n".join(lines))
-            return " ".join(str(path) for path in [*self.absent,
-                self.libdir / "libLLVMPasses.a", self.libdir / "libLLVMObfuscation.a"])
+            return " ".join(shlex.quote(str(path)) for path in [*self.absent,
+                self.libdir / self.archive_name("LLVMPasses"),
+                self.libdir / self.archive_name("LLVMObfuscation")])
         if "--libs" in args:
             return "-lLLVMMCA -lLLVMX86TargetMCA -lLLVMPasses -lLLVMObfuscation -lzstd"
         raise AssertionError(f"unexpected llvm-config query: {args}")
@@ -51,7 +57,7 @@ class BootstrapPreflightTests(unittest.TestCase):
         def fake_ninja(command, **_kwargs):
             calls.append(command)
             for target in command[3:]:
-                (self.libdir / f"lib{target}.a").write_bytes(b"archive")
+                (self.libdir / self.archive_name(target)).write_bytes(b"archive")
 
         with mock.patch.object(bootstrap, "run", side_effect=self.fake_llvm_config), \
              mock.patch.object(bootstrap, "rust_llvm_components", return_value=["ipo", "x86"]), \
@@ -67,7 +73,7 @@ class BootstrapPreflightTests(unittest.TestCase):
         with mock.patch.object(bootstrap, "run", side_effect=self.fake_llvm_config), \
              mock.patch.object(bootstrap, "rust_llvm_components", return_value=["ipo", "x86"]), \
              mock.patch.object(bootstrap.subprocess, "run") as ninja:
-            with self.assertRaisesRegex(RuntimeError, "libLLVMMCA.a"):
+            with self.assertRaisesRegex(RuntimeError, "LLVMMCA"):
                 bootstrap.ensure_llvm_libraries(self.llvm_config, build=False)
             ninja.assert_not_called()
 
