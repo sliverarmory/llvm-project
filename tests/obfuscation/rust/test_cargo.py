@@ -98,7 +98,7 @@ def member_rule(function="member_value"):
 
 def registry_rule():
     return {"name": REGISTRY, "version": "2.0.1", "source": "registry",
-            "crate_types": ["rlib"], "passes": ["obf-sub"]}
+            "crate_types": ["rlib"], "passes": ["obf-bcf"]}
 
 
 def string_rule(*, global_name=None, functions=None):
@@ -211,15 +211,16 @@ def main():
     registry_binary = executable(Path(registry_only["target_dir"]), host)
     assert run([str(registry_binary)]).stdout == EXPECTED
     registry_effects = [event for event in selected_packages(registry_only)[REGISTRY]["events"]
-                        if event["event"] == "effect" and event["pass"] == "sub"
+                        if event["event"] == "effect" and event["pass"] == "bcf"
                         and event["kind"] == "function"]
     assert registry_effects, "selected registry package has no function effect"
     if sys.platform == "win32":
         # PE binaries need an explicit export for llvm-objdump to identify a
         # linked Rust function reliably. Discover its exact mangled name from
         # the first selected build, then export it from both fresh binaries.
-        assert len(registry_effects) == 1, registry_effects
-        symbol = registry_effects[0]["raw_name"]
+        symbol = next((event["raw_name"] for event in registry_effects
+                       if event["demangled_name"] == "adler2::adler32_slice"),
+                      registry_effects[0]["raw_name"])
         exported_env = saved_ir_env()
         exported_env.update({
             "RUSTC": str(rustc),
