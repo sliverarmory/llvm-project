@@ -101,6 +101,32 @@ def verify_tree(package, *, expected_commit=None, allow_dirty=False):
         entry = expected[name]
         if path.stat().st_size != entry["bytes"] or sha256(path) != entry["sha256"]:
             raise ValueError(f"package file checksum mismatch: {name}")
+    provenance = manifest.get("build_provenance")
+    if provenance:
+        stage_path = package / "rust-toolchain" / ".obfuscation-build.json"
+        wrapper_records = list((package / "bin").glob("rust-obf-cargo*.provenance.json"))
+        if len(wrapper_records) != 1:
+            raise ValueError("package must contain exactly one wrapper build record")
+        wrapper_path = wrapper_records[0]
+        if (sha256(stage_path) != provenance["stage1_record_sha256"] or
+                sha256(wrapper_path) != provenance["wrapper_record_sha256"]):
+            raise ValueError("package build record hash differs from manifest")
+        stage = json.loads(stage_path.read_text())
+        wrapper = json.loads(wrapper_path.read_text())
+        for key, value in (("source_identity", stage["source_identity"]),
+                           ("stage1_build_revision", stage["build_revision"]),
+                           ("wrapper_source_identity", wrapper["source_identity"]),
+                           ("wrapper_build_revision", wrapper["build_revision"])):
+            if provenance[key] != value:
+                raise ValueError(f"package build record differs from manifest: {key}")
+        delivered_stage = {name.removeprefix("rust-toolchain/"): {"bytes": entry["bytes"], "sha256": entry["sha256"]}
+                           for name, entry in expected.items()
+                           if name.startswith("rust-toolchain/") and name != "rust-toolchain/.obfuscation-build.json"}
+        if stage["outputs"] != delivered_stage:
+            raise ValueError("delivered compiler/sysroot differs from its build record")
+        binary_name = wrapper_path.name.removesuffix(".provenance.json")
+        if wrapper["binary_sha256"] != sha256(wrapper_path.with_name(binary_name)):
+            raise ValueError("delivered wrapper differs from its build record")
     return manifest
 
 

@@ -6,6 +6,7 @@ import importlib.util
 import os
 import shlex
 import tempfile
+import shutil
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -18,6 +19,51 @@ SPEC.loader.exec_module(bootstrap)
 
 
 class BootstrapPreflightTests(unittest.TestCase):
+    def test_unstamped_stage_cleans_external_llvm_dependents_before_build(self):
+        source = self.root / "rust"
+        host = "x86_64-unknown-linux-gnu"
+        stage = source / "build" / host / "stage1"
+        # A failed earlier build can leave Cargo intermediates without stage1.
+        intermediates = stage.with_name("stage1-rustc")
+        intermediates.mkdir(parents=True)
+        (intermediates / "stale-driver").write_text("old LLVM")
+        library = self.libdir / self.archive_name("LLVMObfuscation")
+        tool = self.root / "bin" / ("opt.exe" if os.name == "nt" else "opt")
+        tool.parent.mkdir(exist_ok=True)
+        tool.write_text("opt")
+        self.llvm_config.write_text("llvm-config")
+        (self.root / "CMakeCache.txt").write_text("configuration")
+        config = source / "bootstrap-obfuscation.toml"
+        config.write_text("bootstrap")
+        commands = []
+
+        def fake_run(command, **kwargs):
+            commands.append(command)
+            if "clean" in command:
+                self.assertEqual(command[-2:], ["--stage", "0"])
+                shutil.rmtree(intermediates)
+            if "build" in command:
+                self.assertFalse(intermediates.exists(), "stale rustc cache must be removed")
+                (stage / "bin").mkdir(parents=True)
+                for name in ("rustc", "rustdoc"):
+                    (stage / "bin" / (name + (".exe" if os.name == "nt" else ""))).write_text("new compiler")
+                libs = stage / "lib" / "rustlib" / host / "lib"
+                libs.mkdir(parents=True)
+                (libs / "libtest-test.rlib").write_text("test harness")
+
+        with mock.patch.object(bootstrap, "llvm_build_inputs", return_value=([library], [tool], self.root)), \
+             mock.patch.object(bootstrap, "source_identity", return_value="source"), \
+             mock.patch.object(bootstrap, "check_rust_source"), \
+             mock.patch.object(bootstrap, "git", return_value=b"revision"), \
+             mock.patch.object(bootstrap.subprocess, "run", side_effect=fake_run):
+            bootstrap.build_stage1(source, self.llvm_config, host, config, {})
+        self.assertEqual(len(commands), 3)
+        self.assertEqual(commands[0][0], "ninja")
+        self.assertIn("clean", commands[1])
+        self.assertIn("library/test", commands[2])
+        self.assertIn("src/tools/rustdoc", commands[2])
+        self.assertTrue((stage / bootstrap.STAGE_RECORD).is_file())
+
     @staticmethod
     def archive_name(target: str) -> str:
         return f"{target}.lib" if os.name == "nt" else f"lib{target}.a"

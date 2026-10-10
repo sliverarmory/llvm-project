@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import os
 import stat
 import subprocess
 import tarfile
@@ -9,8 +10,14 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest import mock
 
+import bootstrap
 from package import PINS, manifest_files, validated_rust_source_commit
+from provenance import (STAGE_RECORD, digest_json, file_inventory, sha256,
+                        build_wrapper,
+                        source_identity, stage_inventory, verify_stage,
+                        verify_wrapper, wrapper_record_path, write_record)
 from verify_integrity import (validate_native_rustc_host,
                               verify_archive_sidecar, verify_tree)
 from verify_package import extract, verify_llvm_tool_version
@@ -61,10 +68,196 @@ class PackageIntegrityTests(unittest.TestCase):
             (source / "src" / "version").write_text(PINS["rust_version"] + "\n")
             marker = source / ".rust-source-sha256"
             marker.write_text(PINS["rust_source_sha256"] + "\n")
-            self.assertEqual(validated_rust_source_commit(source), PINS["rust_commit"])
+            inventory = {"archive_sha256": PINS["rust_source_sha256"], "files":
+                         file_inventory([source / "bootstrap.example.toml", source / "src/version"], source)}
+            write_record(source / bootstrap.RUST_INVENTORY, inventory)
+            with mock.patch.dict(bootstrap.PINS, rust_source_inventory_sha256=digest_json(inventory)):
+                self.assertEqual(validated_rust_source_commit(source), PINS["rust_commit"])
             marker.write_text("wrong archive checksum\n")
             with self.assertRaisesRegex(RuntimeError, "unverified Rust source tree"):
                 validated_rust_source_commit(source)
+
+    def test_archive_tree_rejects_changed_missing_extra_and_forged_inventory(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp)
+            (source / "compiler").mkdir()
+            code = source / "compiler/input.rs"
+            code.write_text("original")
+            inventory = {"archive_sha256": PINS["rust_source_sha256"],
+                         "files": file_inventory([code], source)}
+            write_record(source / bootstrap.RUST_INVENTORY, inventory)
+            with mock.patch.dict(bootstrap.PINS, rust_source_inventory_sha256=digest_json(inventory)):
+                bootstrap.verify_rust_archive_tree(source)
+                (source / "build").mkdir()
+                (source / "build/generated.rs").write_text("generated")
+                (source / "bootstrap-obfuscation.toml").write_text("generated")
+                bootstrap.verify_rust_archive_tree(source)
+                code.write_text("changed")
+                with self.assertRaisesRegex(RuntimeError, "changed=.*compiler/input.rs"):
+                    bootstrap.verify_rust_archive_tree(source)
+                code.unlink()
+                with self.assertRaisesRegex(RuntimeError, "missing=.*compiler/input.rs"):
+                    bootstrap.verify_rust_archive_tree(source)
+                code.write_text("original")
+                extra = source / "compiler/extra.rs"
+                extra.write_text("extra input")
+                with self.assertRaisesRegex(RuntimeError, "extra=.*compiler/extra.rs"):
+                    bootstrap.verify_rust_archive_tree(source)
+                forged = {**inventory, "files": file_inventory([code, extra], source)}
+                write_record(source / bootstrap.RUST_INVENTORY, forged)
+                with self.assertRaisesRegex(RuntimeError, "pinned archive inventory"):
+                    bootstrap.verify_rust_archive_tree(source)
+
+    def test_source_identity_survives_commit_but_detects_source_edits(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            code = root / "input.cpp"
+            code.write_text("first")
+            identity = source_identity(root, ("input.cpp",))
+            subprocess.run(["git", "-C", str(root), "add", "input.cpp"], check=True)
+            self.assertEqual(identity, source_identity(root, ("input.cpp",)))
+            subprocess.run(["git", "-C", str(root), "-c", "commit.gpgsign=false",
+                            "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                            "commit", "-qm", "inputs"], check=True)
+            self.assertEqual(identity, source_identity(root, ("input.cpp",)))
+            code.write_text("changed")
+            self.assertNotEqual(identity, source_identity(root, ("input.cpp",)))
+            code.unlink()
+            self.assertNotEqual(identity, source_identity(root, ("input.cpp",)))
+
+    def test_stage_provenance_rejects_stale_source_binary_and_link_archive(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            stage = root / "stage1"
+            (stage / "bin").mkdir(parents=True)
+            rustc = stage / "bin/rustc"
+            rustc.write_bytes(b"compiler")
+            library = root / "LLVMObfuscation.a"
+            library.write_bytes(b"archive")
+            tool = root / "opt"
+            tool.write_bytes(b"opt")
+            record = {"schema_version": 1, "kind": "rust-stage1", "source_identity": "current",
+                      "outputs": stage_inventory(stage), "llvm_tools": file_inventory([tool], root),
+                      "llvm_inputs": file_inventory([library])}
+            write_record(stage / STAGE_RECORD, record)
+            with mock.patch("provenance.source_identity", return_value="current"):
+                verify_stage(stage, [tool], root)
+                rustc.write_bytes(b"different compiler")
+                with self.assertRaisesRegex(ValueError, "compiler/sysroot"):
+                    verify_stage(stage, [tool], root)
+                rustc.write_bytes(b"compiler")
+                library.write_bytes(b"new archive")
+                with self.assertRaisesRegex(ValueError, "inputs or outputs changed"):
+                    verify_stage(stage, [tool], root)
+            with mock.patch("provenance.source_identity", return_value="new source"):
+                with self.assertRaisesRegex(ValueError, "LLVM/build source changed"):
+                    verify_stage(stage, [tool], root)
+
+    def test_wrapper_provenance_rejects_stale_source_and_binary(self):
+        with tempfile.TemporaryDirectory() as temp:
+            wrapper = Path(temp) / "rust-obf-cargo"
+            wrapper.write_bytes(b"wrapper")
+            write_record(wrapper_record_path(wrapper), {"schema_version": 1, "kind": "cargo-wrapper",
+                "source_identity": "old", "binary_sha256": sha256(wrapper)})
+            with mock.patch("provenance.source_identity", return_value="new"):
+                with self.assertRaisesRegex(ValueError, "wrapper source changed"):
+                    verify_wrapper(wrapper)
+            wrapper.write_bytes(b"changed")
+            with mock.patch("provenance.source_identity", return_value="old"):
+                with self.assertRaisesRegex(ValueError, "wrapper binary differs"):
+                    verify_wrapper(wrapper)
+
+    def test_wrapper_uses_cargo_artifact_under_inherited_build_target(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            target = root / "target"
+            canonical = target / "release" / ("rust-obf-cargo.exe" if os.name == "nt" else "rust-obf-cargo")
+            canonical.parent.mkdir(parents=True)
+            canonical.write_bytes(b"STALE WRAPPER")
+            artifact = target / "native-host" / "release" / canonical.name
+            artifact.parent.mkdir(parents=True)
+            artifact.write_bytes(b"FRESH WRAPPER")
+            compiler = root / "sysroot" / "bin" / ("rustc.exe" if os.name == "nt" else "rustc")
+            compiler.parent.mkdir(parents=True)
+            compiler.write_bytes(b"compiler")
+            cargo = root / "cargo"
+            cargo.write_bytes(b"cargo")
+
+            def fake_command(command, **kwargs):
+                if command[1:] == ["--print", "sysroot"]:
+                    output = str(compiler.parent.parent)
+                elif command[1:] == ["-vV"]:
+                    output = "rustc 1.99.0\nhost: native-host\n"
+                elif command[1] == "build":
+                    self.assertEqual(command[command.index("--target") + 1], "native-host")
+                    self.assertEqual(kwargs["env"]["RUSTC"], str(compiler))
+                    output = json.dumps({"reason": "compiler-artifact", "target": {
+                        "name": "rust-obf-cargo", "kind": ["bin"]}, "executable": str(artifact)})
+                else:
+                    output = "cargo 1.99.0"
+                return subprocess.CompletedProcess(command, 0, stdout=output)
+
+            with mock.patch.dict(os.environ, CARGO_BUILD_TARGET="unrelated-target"), \
+                 mock.patch("provenance.source_identity", return_value="current"), \
+                 mock.patch("provenance.validate_native_rustc_host", return_value="native-host"), \
+                 mock.patch("provenance.git", return_value=b"revision"), \
+                 mock.patch("provenance.subprocess.run", side_effect=fake_command):
+                build_wrapper(target, str(cargo), root)
+                self.assertEqual(canonical.read_bytes(), b"FRESH WRAPPER")
+                verify_wrapper(canonical, root)
+
+    def test_wrapper_cache_changes_when_compiler_driver_changes_at_same_version(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            target = root / "target"
+            name = "rust-obf-cargo.exe" if os.name == "nt" else "rust-obf-cargo"
+            compiler = root / "sysroot" / "bin" / ("rustc.exe" if os.name == "nt" else "rustc")
+            compiler.parent.mkdir(parents=True)
+            compiler.write_bytes(b"unchanged compiler launcher")
+            driver = root / "sysroot" / "lib" / "librustc_driver-test"
+            driver.parent.mkdir()
+            driver.write_bytes(b"first compiler driver")
+            cargo = root / "cargo"
+            cargo.write_bytes(b"cargo")
+            build_directories = []
+
+            def fake_command(command, **kwargs):
+                if command[1:] == ["--print", "sysroot"]:
+                    output = str(compiler.parent.parent)
+                elif command[1:] == ["-vV"]:
+                    output = "rustc 1.99.0\nhost: native-host\n"
+                elif command[1] == "build":
+                    # Model Cargo's real reuse behavior: the compiler's -vV and
+                    # package source are unchanged, so an existing artifact is
+                    # considered fresh even if a shared compiler driver changed.
+                    directory = Path(kwargs["env"]["CARGO_TARGET_DIR"])
+                    build_directories.append(directory)
+                    self.assertEqual(command[command.index("--target-dir") + 1], str(directory))
+                    artifact = directory / "native-host" / "release" / name
+                    artifact.parent.mkdir(parents=True, exist_ok=True)
+                    if not artifact.exists():
+                        artifact.write_bytes(driver.read_bytes())
+                    output = json.dumps({"reason": "compiler-artifact", "target": {
+                        "name": "rust-obf-cargo", "kind": ["bin"]}, "executable": str(artifact)})
+                else:
+                    output = "cargo 1.99.0"
+                return subprocess.CompletedProcess(command, 0, stdout=output)
+
+            with mock.patch("provenance.source_identity", return_value="current"), \
+                 mock.patch("provenance.validate_native_rustc_host", return_value="native-host"), \
+                 mock.patch("provenance.git", return_value=b"revision"), \
+                 mock.patch("provenance.subprocess.run", side_effect=fake_command):
+                build_wrapper(target, str(cargo), root)
+                canonical = target / "release" / name
+                self.assertEqual(canonical.read_bytes(), b"first compiler driver")
+                driver.write_bytes(b"second compiler driver")
+                build_wrapper(target, str(cargo), root)
+                self.assertEqual(canonical.read_bytes(), b"second compiler driver")
+                self.assertNotEqual(build_directories[0], build_directories[1])
+                build_wrapper(target, str(cargo), root)
+                self.assertEqual(build_directories[1], build_directories[2])
+                verify_wrapper(canonical, root)
 
     def test_rejects_zip_traversal(self):
         with tempfile.TemporaryDirectory() as temp:

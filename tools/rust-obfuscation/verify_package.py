@@ -60,6 +60,8 @@ def extract(archive, destination):
 
 def verify_manifest(package, *, allow_dirty):
     manifest = verify_tree(package, allow_dirty=allow_dirty)
+    if not manifest.get("build_provenance"):
+        raise ValueError("archive lacks compiler and wrapper build provenance; rebuild it")
     if manifest["rust_source_commit"] != PINS["rust_commit"]:
         raise ValueError("archive Rust source does not match the pinned commit")
     if manifest["llvm_base_commit"] != PINS["llvm_base_commit"]:
@@ -133,17 +135,20 @@ def main():
     exe = ".exe" if os.name == "nt" else ""
     rustc = package / "rust-toolchain" / "bin" / f"rustc{exe}"
     wrapper = package / "bin" / f"rust-obf-cargo{exe}"
+    rustdoc = package / "rust-toolchain" / "bin" / f"rustdoc{exe}"
     opt = package / "bin" / f"opt{exe}"
     objdump = package / "bin" / f"llvm-objdump{exe}"
     llvm_ar = package / "bin" / f"llvm-ar{exe}"
     llvm_dis = package / "bin" / f"llvm-dis{exe}"
-    for tool in (rustc, wrapper, opt, objdump, llvm_ar, llvm_dis):
+    for tool in (rustc, rustdoc, wrapper, opt, objdump, llvm_ar, llvm_dis):
         if not tool.is_file():
             raise ValueError(f"packaged tool is absent: {tool}")
     rust_version = run([rustc, "-vV"]).stdout.strip()
     if rust_version != manifest["rustc_vv"]:
         raise ValueError("extracted rustc version differs from manifest")
     validate_native_rustc_host(rust_version)
+    if PINS["rust_version"] not in run([rustdoc, "--version"]).stdout:
+        raise ValueError("extracted rustdoc does not match the pinned Rust version")
     verify_llvm_tool_version(run([opt, "--version"]).stdout,
                              manifest["opt_version"], "opt")
     verify_llvm_tool_version(run([objdump, "--version"]).stdout,
@@ -179,6 +184,9 @@ def main():
         if args.online:
             cargo_command.append("--online")
         run(cargo_command)
+        run([sys.executable, ROOT / "tests/obfuscation/rust/test_cargo_test.py",
+             "--wrapper", wrapper, "--rustc", rustc,
+             "--work-dir", work / "cargo-test"])
         run([sys.executable, ROOT / "tests/obfuscation/rust/test_lto.py",
              "--wrapper", wrapper, "--rustc", rustc, "--opt", opt,
              "--objdump", objdump,

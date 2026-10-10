@@ -20,7 +20,10 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tarfile
 from pathlib import Path
+from provenance import (STAGE_RECORD, digest_json, file_inventory, git, sha256,
+                        source_identity, stage_inventory, write_record)
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -276,12 +279,81 @@ def check_rust_source(source: Path) -> None:
             raise RuntimeError(f"Rust source is {actual}; expected {PINS['rust_commit']}")
         if run("git", "status", "--porcelain", "--untracked-files=no", cwd=source):
             raise RuntimeError("Rust source has tracked modifications; pin a patch before building")
+        extra = run("git", "ls-files", "--others", "--exclude-standard", "--",
+                    "compiler", "library", "src", cwd=source)
+        if extra:
+            raise RuntimeError("Rust source has additional unpinned source files: " + extra)
     else:
         marker = source / ".rust-source-sha256"
         if not marker.is_file() or marker.read_text().strip() != PINS["rust_source_sha256"]:
             raise RuntimeError(f"unverified Rust source tree: {source}")
+        verify_rust_archive_tree(source)
     if (source / "src" / "version").read_text().strip() != PINS["rust_version"]:
         raise RuntimeError(f"Rust source version is not {PINS['rust_version']}")
+
+
+RUST_INVENTORY = ".rust-source-files.json"
+
+
+def rust_archive_inventory(archive: Path) -> dict:
+    """Derive immutable source evidence from the verified archive, never the tree."""
+    if archive_sha256(archive) != PINS["rust_source_sha256"]:
+        raise RuntimeError(f"Rust source archive has the wrong SHA256: {archive}")
+    files = {}
+    prefix = f"rustc-{PINS['rust_version']}-src/"
+    with tarfile.open(archive, "r:xz") as source:
+        for entry in source:
+            if not entry.name.startswith(prefix) or entry.isdir():
+                continue
+            name = entry.name[len(prefix):]
+            if entry.issym():
+                files[name] = {"symlink": entry.linkname}
+            elif entry.isfile():
+                digest = hashlib.sha256()
+                with source.extractfile(entry) as content:
+                    for block in iter(lambda: content.read(1024 * 1024), b""):
+                        digest.update(block)
+                files[name] = {"sha256": digest.hexdigest(), "bytes": entry.size}
+            else:
+                raise RuntimeError(f"unsupported Rust source archive entry: {name}")
+    return {"archive_sha256": PINS["rust_source_sha256"], "files": files}
+
+
+def verify_rust_archive_tree(source: Path, inventory=None) -> None:
+    inventory_path = source / RUST_INVENTORY
+    if inventory is None:
+        if not inventory_path.is_file():
+            raise RuntimeError("Rust source file inventory is missing; run prepare with the verified --archive")
+        inventory = json.loads(inventory_path.read_text())
+    if inventory.get("archive_sha256") != PINS["rust_source_sha256"]:
+        raise RuntimeError("Rust source inventory has the wrong archive identity")
+    if digest_json(inventory) != PINS["rust_source_inventory_sha256"]:
+        raise RuntimeError("Rust source inventory differs from the pinned archive inventory")
+    expected = inventory["files"]
+    actual = {}
+    generated = {RUST_INVENTORY, ".rust-source-sha256", "bootstrap.toml",
+                 "bootstrap-obfuscation.toml"}
+    for directory, dirs, files in os.walk(source, followlinks=False):
+        relative = Path(directory).relative_to(source)
+        if relative == Path("."):
+            dirs[:] = [d for d in dirs if d not in ("build", "cargo-home")]
+        dirs[:] = [d for d in dirs if d != "__pycache__"]
+        for name in [*files, *(d for d in dirs if (Path(directory) / d).is_symlink())]:
+            path = Path(directory) / name
+            key = path.relative_to(source).as_posix()
+            if relative == Path(".") and (name in generated or name.endswith(".log")):
+                continue
+            if path.is_symlink():
+                actual[key] = {"symlink": os.readlink(path)}
+            else:
+                actual[key] = {"sha256": sha256(path), "bytes": path.stat().st_size}
+    changed = sorted(name for name in expected.keys() & actual.keys()
+                     if expected[name] != actual[name])
+    missing = sorted(expected.keys() - actual.keys())
+    extra = sorted(actual.keys() - expected.keys())
+    if changed or missing or extra:
+        raise RuntimeError(f"Rust source differs from verified archive: changed={changed[:10]}, "
+                           f"missing={missing[:10]}, extra={extra[:10]}")
 
 
 def ensure_backtrace(source: Path, *, update: bool) -> None:
@@ -309,6 +381,10 @@ def ensure_backtrace(source: Path, *, update: bool) -> None:
 
 def fetch_rust_source(source: Path, archive: Path) -> None:
     if source.exists():
+        if not (source / ".git").exists() and not (source / RUST_INVENTORY).exists():
+            inventory = rust_archive_inventory(archive)
+            verify_rust_archive_tree(source, inventory)
+            write_record(source / RUST_INVENTORY, inventory)
         check_rust_source(source)
         return
     archive.parent.mkdir(parents=True, exist_ok=True)
@@ -334,6 +410,7 @@ def fetch_rust_source(source: Path, archive: Path) -> None:
         if not extracted.is_dir():
             raise RuntimeError(f"Rust source archive had no {extracted.name} directory")
         (extracted / ".rust-source-sha256").write_text(PINS["rust_source_sha256"] + "\n")
+        write_record(extracted / RUST_INVENTORY, rust_archive_inventory(archive))
         extracted.rename(source)
     check_rust_source(source)
 
@@ -366,6 +443,69 @@ lld = false
 llvm-config = {llvm_path}
 llvm-has-rust-patches = false
 '''
+
+
+def llvm_build_inputs(llvm_config: Path):
+    components = rust_llvm_components(llvm_config)
+    archives = [Path(path) for path in shlex.split(run(
+        llvm_config, "--link-static", "--libfiles", *components, "--quote-paths"))]
+    exe = ".exe" if os.name == "nt" else ""
+    tools = [llvm_config.with_name(name + exe) for name in LLVM_TOOLS]
+    obj_root = Path(run(llvm_config, "--obj-root"))
+    return archives, tools, obj_root
+
+
+def build_stage1(source, llvm_config, host, config_path, env):
+    # Rebuild present-but-stale external LLVM archives, not merely missing ones.
+    archives, tools, obj_root = llvm_build_inputs(llvm_config)
+    source_before = source_identity(ROOT)
+    target_set = {llvm_archive_target(p) for p in archives}
+    if None in target_set:
+        raise RuntimeError("unrecognized external LLVM archive")
+    targets = sorted(target_set)
+    subprocess.run(["ninja", "-C", str(obj_root), *targets,
+                    "llvm-config", *LLVM_TOOLS], check=True)
+    check_rust_source(source)
+    if source_identity(ROOT) != source_before:
+        raise RuntimeError("LLVM sources changed while refreshing build inputs; rebuild")
+    input_paths = [*archives, *tools, llvm_config, obj_root / "CMakeCache.txt", config_path]
+    inputs_before = file_inventory(input_paths)
+    stage = source / "build" / host / "stage1"
+    record_path = stage / STAGE_RECORD
+    previous = json.loads(record_path.read_text()) if record_path.is_file() else None
+    reusable = (previous and previous.get("source_identity") == source_before
+                and previous.get("llvm_inputs") == inputs_before
+                and previous.get("outputs") == stage_inventory(stage))
+    if any(stage.parent.glob("stage1*")) and not reusable:
+        # Rust's stage-0 clean removes stage1 and stage1-* build directories.
+        # Cargo does not fingerprint the contents of external static archives.
+        subprocess.run([sys.executable, "x.py", "--config", str(config_path),
+                        "clean", "--stage", "0"], cwd=source, env=env, check=True)
+    record_path.unlink(missing_ok=True)
+    subprocess.run(
+        [sys.executable, "x.py", "--config", str(config_path), "--stage", "1",
+         "build", "compiler/rustc", "library/std", "library/proc_macro",
+         "library/test", "src/tools/rustdoc"], cwd=source, env=env, check=True)
+    check_rust_source(source)
+    if source_identity(ROOT) != source_before or file_inventory(input_paths) != inputs_before:
+        raise RuntimeError("source or LLVM link inputs changed during Rust build; rebuild")
+    exe = ".exe" if os.name == "nt" else ""
+    for name in ("rustc", "rustdoc"):
+        if not (stage / "bin" / (name + exe)).is_file():
+            raise RuntimeError(f"stage1 is missing required {name}")
+    libraries = stage / "lib" / "rustlib" / host / "lib"
+    if not list(libraries.glob("libtest-*.rlib")):
+        raise RuntimeError("stage1 is missing the Rust test harness library")
+    write_record(record_path, {
+        "schema_version": 1, "kind": "rust-stage1", "source_identity": source_before,
+        "build_revision": git(ROOT, "rev-parse", "HEAD").decode().strip(),
+        "build_source_dirty": bool(git(ROOT, "status", "--porcelain")),
+        "rust_source_commit": PINS["rust_commit"], "llvm_inputs": inputs_before,
+        "llvm_tools": file_inventory(tools, llvm_config.parent),
+        "outputs": stage_inventory(stage),
+        "bootstrap_config_sha256": sha256(config_path),
+    })
+    print("stage-1 Rust bootstrap completed with verified build provenance")
 
 
 def main() -> int:
@@ -426,12 +566,7 @@ def main() -> int:
                     [*(str(path) for path in system_search_paths), *([existing] if existing else [])]
                 )
                 print(f"{system_search_variable}={env[system_search_variable]}", flush=True)
-            subprocess.run(
-                [sys.executable, "x.py", "--config", str(config_path), "--stage", "1",
-                 "build", "compiler/rustc", "library/std", "library/proc_macro"],
-                cwd=source, env=env, check=True,
-            )
-            print("stage-1 Rust bootstrap completed")
+            build_stage1(source, llvm_config, host, config_path, env)
         return 0
     except (OSError, subprocess.CalledProcessError, RuntimeError) as exc:
         print(f"bootstrap: {exc}", file=sys.stderr)

@@ -13,6 +13,7 @@ import zipfile
 from pathlib import Path
 from bootstrap import check_rust_source
 from verify_integrity import validate_native_rustc_host, validate_package_path
+from provenance import STAGE_RECORD, verify_stage, verify_wrapper, wrapper_record_path
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -94,7 +95,7 @@ def main():
     exe = ".exe" if os.name == "nt" else ""
     llvm_ar = objdump.with_name("llvm-ar" + exe)
     llvm_dis = objdump.with_name("llvm-dis" + exe)
-    for tool in (stage1 / "bin" / f"rustc{exe}", wrapper, opt, objdump,
+    for tool in (stage1 / "bin" / f"rustc{exe}", stage1 / "bin" / f"rustdoc{exe}", wrapper, opt, objdump,
                  llvm_ar, llvm_dis):
         if not tool.is_file():
             raise ValueError(f"required tool is absent: {tool}")
@@ -109,6 +110,13 @@ def main():
             f"LLVM version: {PINS['llvm_version']}" not in rust_version):
         raise ValueError("stage1 does not match the pinned Rust/LLVM versions")
     validate_native_rustc_host(rust_version)
+    try:
+        stage_provenance = verify_stage(stage1, (opt, objdump, llvm_ar, llvm_dis))
+        wrapper_provenance = verify_wrapper(wrapper)
+    except (OSError, KeyError, ValueError) as error:
+        raise ValueError(f"build provenance verification failed; rebuild compiler/wrapper: {error}") from error
+    if stage_provenance["rust_source_commit"] != source_revision:
+        raise ValueError("stage1 build provenance uses a different Rust source")
 
     label = f"rust-obfuscation-{revision[:12]}-{platform.system().lower()}-{platform.machine().lower()}"
     with tempfile.TemporaryDirectory(prefix="rust-obf-package-", dir=output.parent) as temp:
@@ -121,6 +129,8 @@ def main():
                              (llvm_ar, f"llvm-ar{exe}"),
                              (llvm_dis, f"llvm-dis{exe}")):
             copy_tool(source, package_dir / "bin" / name)
+        copy_tool(wrapper_record_path(wrapper),
+                  wrapper_record_path(package_dir / "bin" / f"rust-obf-cargo{exe}"))
         copy_tool(ROOT / "tools/rust-obfuscation/cargo-wrapper/README.md",
                   package_dir / "CARGO-WRAPPER.md")
         copy_tool(ROOT / "tools/rust-obfuscation/README.md",
@@ -153,6 +163,14 @@ def main():
             "objdump_version": run(str(objdump), "--version"),
             "host_system": platform.system(),
             "host_machine": platform.machine(),
+            "build_provenance": {
+                "stage1_build_revision": stage_provenance["build_revision"],
+                "wrapper_build_revision": wrapper_provenance["build_revision"],
+                "source_identity": stage_provenance["source_identity"],
+                "wrapper_source_identity": wrapper_provenance["source_identity"],
+                "stage1_record_sha256": sha256(stage1 / STAGE_RECORD),
+                "wrapper_record_sha256": sha256(wrapper_record_path(wrapper)),
+            },
             "files": manifest_files(package_dir),
         }
         (package_dir / "manifest.json").write_text(
