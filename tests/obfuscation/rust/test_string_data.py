@@ -481,6 +481,10 @@ def check_rust(rustc, opt, clang, work):
         executable = work / f"ffi-consumer-{label}"
         if sys.platform == "win32":
             executable = executable.with_suffix(".exe")
+            # The Clang driver treats bare .lib names as local input files.
+            # Let the MSVC linker resolve rustc's native-static-libs through LIB.
+            native_libs = [arg for lib in native_libs
+                           for arg in ("-Xlinker", lib)]
         run([*clang, str(consumer), str(library), *native_libs,
              "-o", str(executable)], timeout=360)
         run([str(executable)], timeout=15)

@@ -193,10 +193,7 @@ def compile_c(cc, source, output, *, library=None, native_libs=()):
         if sys.platform == "win32":
             command.extend(("-Xlinker", "/EXPORT:accept_staticlib_probe"))
             for native_lib in native_libs:
-                if native_lib.startswith("/LIBPATH:"):
-                    command.extend(("-Xlinker", native_lib))
-                else:
-                    command.append(native_lib)
+                command.extend(("-Xlinker", native_lib))
     if sys.platform == "linux":
         command.extend(["-ldl", "-lpthread", "-lm", "-lrt", "-lutil"])
     command.extend(["-o", str(output)])
