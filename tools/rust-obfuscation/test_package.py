@@ -13,10 +13,38 @@ from pathlib import Path
 from package import PINS, manifest_files, validated_rust_source_commit
 from verify_integrity import (validate_native_rustc_host,
                               verify_archive_sidecar, verify_tree)
-from verify_package import extract
+from verify_package import extract, verify_llvm_tool_version
 
 
 class PackageIntegrityTests(unittest.TestCase):
+    def test_llvm_version_allows_runtime_host_changes_only(self):
+        recorded = ("LLVM (http://llvm.org/):\n"
+                    "  LLVM version 23.1.3\n"
+                    "  Optimized build with assertions.\n"
+                    "  Default target: arm64-apple-darwin24.6.0\n"
+                    "  Host CPU: (unknown)")
+        actual = recorded.replace("darwin24.6.0", "darwin27.0.0").replace(
+            "(unknown)", "apple-m5")
+        verify_llvm_tool_version(actual, recorded, "opt")
+        for changed in (actual.replace("23.1.3", "23.1.4"),
+                        actual.replace("Optimized build", "DEBUG build"),
+                        actual.replace(" with assertions", "")):
+            with self.subTest(changed=changed):
+                with self.assertRaisesRegex(ValueError, "extracted opt version differs"):
+                    verify_llvm_tool_version(changed, recorded, "opt")
+
+    def test_llvm_version_preserves_registered_target_identity(self):
+        recorded = ("LLVM (http://llvm.org/):\n"
+                    "  LLVM version 23.1.3\n"
+                    "  Optimized build with assertions.\n\n\n"
+                    "  Registered Targets:\n"
+                    "    aarch64 - AArch64 (little endian)\n"
+                    "    x86 - 32-bit X86: Pentium-Pro and above")
+        verify_llvm_tool_version(recorded, recorded, "llvm-objdump")
+        with self.assertRaisesRegex(ValueError, "extracted llvm-objdump version differs"):
+            verify_llvm_tool_version(recorded.replace("    x86 -", "    arm -"),
+                                     recorded, "llvm-objdump")
+
     def test_verified_rust_tarball_does_not_inherit_parent_git_commit(self):
         with tempfile.TemporaryDirectory() as temp:
             parent = Path(temp)

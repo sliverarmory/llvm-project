@@ -71,6 +71,21 @@ def verify_manifest(package, *, allow_dirty):
     return manifest
 
 
+def verify_llvm_tool_version(actual, recorded, tool):
+    # opt registers printDefaultTargetAndDetectedCPU from TargetParser/Host.cpp.
+    # Those two fields describe the executing machine, while the remaining
+    # PrintVersionMessage output identifies the build and registered targets.
+    # Keep the full original output in the manifest for provenance.
+    runtime_fields = ("  Default target: ", "  Host CPU: ")
+
+    def build_identity(output):
+        return [line for line in output.strip().splitlines()
+                if not line.startswith(runtime_fields)]
+
+    if build_identity(actual) != build_identity(recorded):
+        raise ValueError(f"extracted {tool} version differs from manifest")
+
+
 def run(command, *, env=None, timeout=600):
     print("+", " ".join(map(str, command)), flush=True)
     result = subprocess.run(command, cwd=ROOT, env=env, capture_output=True,
@@ -129,10 +144,10 @@ def main():
     if rust_version != manifest["rustc_vv"]:
         raise ValueError("extracted rustc version differs from manifest")
     validate_native_rustc_host(rust_version)
-    if run([opt, "--version"]).stdout.strip() != manifest["opt_version"]:
-        raise ValueError("extracted opt version differs from manifest")
-    if run([objdump, "--version"]).stdout.strip() != manifest["objdump_version"]:
-        raise ValueError("extracted llvm-objdump version differs from manifest")
+    verify_llvm_tool_version(run([opt, "--version"]).stdout,
+                             manifest["opt_version"], "opt")
+    verify_llvm_tool_version(run([objdump, "--version"]).stdout,
+                             manifest["objdump_version"], "llvm-objdump")
     run([sys.executable, ROOT / "tests/obfuscation/rust/run_pipeline.py",
          "--rustc", rustc, "--opt", opt, "--objdump", objdump,
          "--work-dir", work / "pipeline"])
