@@ -8,6 +8,7 @@ The selected build must also change the final code of each exported probe.
 """
 
 import argparse
+from contextlib import nullcontext
 import json
 import os
 import platform
@@ -15,6 +16,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import uuid
 from pathlib import Path
 
@@ -397,18 +399,33 @@ def main():
     ordinary = check_runtime(rustc, host, sysroot, baseline, cc, native_libs)
 
     config_path = work / "obfuscation.json"
-    report_path = work / "selected-report.json"
     config_path.write_text(json.dumps(config(rustc, args.cargo), indent=2) + "\n")
-    selected_env = env_for(rustc, sysroot, host, work / "selected-unused-target")
-    run([str(wrapper), "--config", str(config_path), "--report",
-         str(report_path), "--", *cargo_args(host)], env=selected_env)
-    report = json.loads(report_path.read_text())
-    bin_symbols = check_report(report)
-    selected = selected_target_dir(report)
-    verify_emitted_ir(opt, selected, host)
-    protected = check_runtime(rustc, host, sysroot, selected, cc, native_libs)
-    assert protected == ordinary == EXPECTED
-    final = check_final_effects(objdump, host, baseline, selected, bin_symbols)
+    # The wrapper nests its Cargo target beneath the report path. On Windows,
+    # MSVC's linker cannot create the resulting files under a deep --work-dir.
+    # Keep the acceptance result there, but use a short, cleaned-up scratch
+    # directory for the selected build (RUNNER_TEMP is short on Actions).
+    selected_context = (
+        tempfile.TemporaryDirectory(prefix="roc-", dir=os.environ.get("RUNNER_TEMP"))
+        if sys.platform == "win32" else nullcontext(work)
+    )
+    with selected_context as selected_root:
+        selected_root = Path(selected_root)
+        report_path = selected_root / "selected-report.json"
+        selected_env = env_for(rustc, sysroot, host,
+                               selected_root / "selected-unused-target")
+        try:
+            run([str(wrapper), "--config", str(config_path), "--report",
+                 str(report_path), "--", *cargo_args(host)], env=selected_env)
+            report = json.loads(report_path.read_text())
+            bin_symbols = check_report(report)
+            selected = selected_target_dir(report)
+            verify_emitted_ir(opt, selected, host)
+            protected = check_runtime(rustc, host, sysroot, selected, cc, native_libs)
+            assert protected == ordinary == EXPECTED
+            final = check_final_effects(objdump, host, baseline, selected, bin_symbols)
+        finally:
+            if selected_root != work and report_path.is_file():
+                shutil.copy2(report_path, work / "selected-report.json")
     (work / "acceptance-result.json").write_text(json.dumps({
         "host": host, "rustc": version, "runtime": protected,
         "final_effects": final,
