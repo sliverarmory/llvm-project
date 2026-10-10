@@ -128,8 +128,23 @@ def instructions(objdump, binary, symbol):
     lines = re.findall(r"(?m)^\s*[0-9a-f]+:\s+(.+)$", dump)
     assert lines, (binary, raw)
     # Linked addresses change when a different sized chosen function shifts
-    # later code. Keep relative symbol offsets and all machine operands.
-    return [re.sub(r"0x[0-9a-f]+(?= <)", "ADDR", line) for line in lines]
+    # later code. Keep relative symbol offsets and non-PC-relative operands.
+    normalized = []
+    for line in lines:
+        if os.name == "nt" and re.search(r"#\s+0x[0-9a-f]+\s+<[^>]+>", line):
+            # COFF prints a layout-dependent RIP displacement even when its
+            # symbolic target (kept below) is identical in both binaries.
+            line = re.sub(r"(?<!\w)-?0x[0-9a-f]+(?=\(%rip\))", "RIPREL", line)
+        normalized.append(re.sub(r"0x[0-9a-f]+(?= <)", "ADDR", line))
+    lines = normalized
+    # COFF symbol ranges can include linker alignment after the function.
+    # Its length may change when the selected function grows under LTO; it is
+    # not part of the unselected function's instructions.
+    while os.name == "nt" and lines and lines[-1].split(None, 1)[0] in (
+            "nop", "nopw", "nopl", "nopq", "int3"):
+        lines.pop()
+    assert lines, (binary, raw)
+    return lines
 
 
 def rule(pass_name, global_name=None, *, local_thin=False):
@@ -241,9 +256,11 @@ def check_report(report, pass_name, *, local_thin=False):
 def check_machine(objdump, ordinary, transformed, *, symbol="lto_chosen"):
     assert instructions(objdump, ordinary, symbol) != \
            instructions(objdump, transformed, symbol), symbol
-    assert instructions(objdump, ordinary, "lto_plain") == \
-           instructions(objdump, transformed, "lto_plain"), \
-           "unselected dependency's linked instructions changed"
+    plain_before = instructions(objdump, ordinary, "lto_plain")
+    plain_after = instructions(objdump, transformed, "lto_plain")
+    assert plain_before == plain_after, (
+        "unselected dependency's linked instructions changed",
+        plain_before, plain_after)
 
 
 def private_state_name(llvm_ar, llvm_dis, ordinary, work_dir):
