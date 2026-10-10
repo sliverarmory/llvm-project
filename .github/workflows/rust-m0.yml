@@ -52,7 +52,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           # bootstrap.py verifies ancestry from the pinned LLVM base commit.
-          fetch-depth: 32
+          # Full commit history keeps the proof valid as this branch grows.
+          fetch-depth: 0
           filter: blob:none
 
       - uses: actions/setup-python@v7
