@@ -15,6 +15,7 @@
 #include "llvm/Transforms/Obfuscation/OptionParser.h"
 #include "llvm/Transforms/Obfuscation/Split.h"
 #include "llvm/Transforms/Obfuscation/Utils.h"
+#include "EHRegion.h"
 #include "llvm/IR/IRBuilder.h"
 #include <algorithm>
 #include <memory>
@@ -93,9 +94,15 @@ bool SplitBasicBlock::split(Function *f) {
     reportObfuscationSkip("split", "function", f->getName(), "convergent");
     return false;
   }
+  SmallPtrSet<BasicBlock *, 32> ProtectedEHBlocks;
+  obfuscation::collectProtectedEHBlocks(*f, ProtectedEHBlocks);
   for (BasicBlock &BB : *f) {
     for (Instruction &I : BB) {
-      if (I.getType()->isTokenTy()) {
+      // An EH pad's token stays in a protected block. Other token values,
+      // including convergence-control tokens in funclets, still constrain
+      // the entire function's control flow.
+      if (I.getType()->isTokenTy() &&
+          !(ProtectedEHBlocks.contains(&BB) && I.isEHPad())) {
         reportObfuscationSkip("split", "function", f->getName(), "token");
         return false;
       }
@@ -122,10 +129,17 @@ bool SplitBasicBlock::split(Function *f) {
     origBB.push_back(&*I);
   }
 
+  for (BasicBlock *BB : origBB)
+    if (ProtectedEHBlocks.contains(BB))
+      reportObfuscationSkip("split", "block", BB->getNameOrAsOperand(),
+                            "protected-eh-region");
+
   for (std::vector<BasicBlock *>::iterator I = origBB.begin(),
                                            IE = origBB.end();
        I != IE; ++I) {
     BasicBlock *curr = *I;
+    if (ProtectedEHBlocks.contains(curr))
+      continue;
 
     // No need to split a 1 inst bb
     // Or ones containing a PHI node or a musttail call.

@@ -58,12 +58,17 @@ def main():
             uncontrolled = function_body(ir, "uncontrolled_target")
             attribute_only = function_body(ir, "convergent_attribute_only")
             ordinary = function_body(ir, "ordinary_target")
+            eh_cleanup = function_body(ir, "convergent_eh_cleanup")
             assert "@llvm.experimental.convergence.entry()" in controlled
             assert "@llvm.experimental.convergence.loop()" in controlled
             assert "@convergent_op" in uncontrolled
             effect = "switch i32" if name == "fla" else ".split"
             for protected in (controlled, uncontrolled, attribute_only):
                 assert effect not in protected, f"{name} rewrote convergent IR"
+            if name == "split":
+                assert effect not in eh_cleanup, (
+                    "split rewrote normal blocks despite a convergent "
+                    "call in protected EH cleanup")
             assert effect in ordinary, f"{name} skipped the ordinary peer"
             print(f"[{level}] {name} preserves convergence and transforms peer", flush=True)
 

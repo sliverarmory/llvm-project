@@ -181,7 +181,7 @@ def check_events(label: str, event_file: Path, passes: tuple[str, ...],
             raise AssertionError(
                 f"{label}: {pass_name} expected skip {reason}, "
                 f"got effects={len(effects)} skips={skips}")
-        if pass_name in ("obf-bcf", "obf-fla"):
+        if pass_name in ("obf-split", "obf-bcf", "obf-fla"):
             protected = [record["raw_name"] for record in records
                          if record["pass"] == EVENT_NAMES[pass_name]
                          and record["kind"] == "block"

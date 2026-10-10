@@ -15,6 +15,7 @@ from pathlib import Path
 SOURCE = Path(__file__).with_name("eh_regions.cpp")
 VARIANTS = {
     "plain": (),
+    "split": ("obf-split",),
     "bcf": ("obf-bcf",),
     "fla": ("obf-fla",),
     "combined": ("obf-bcf", "obf-fla"),
@@ -71,8 +72,13 @@ def check_effect(label: str, ir: str, base: str, variant: str,
     if pad == "landingpad":
         shared_join = "return" if label.startswith("O0-") else "cleanup"
         protected = named_block(target, shared_join)
-        if "urem i32" in protected or "switch i32" in protected:
+        if ("@.obf.split.state" in protected or "urem i32" in protected
+                or "switch i32" in protected):
             raise AssertionError(f"{label}: shared cleanup join was transformed")
+    if variant == "split":
+        if (".obf.split.state" not in ir or ".split" not in target
+                or target.count("br ") <= baseline.count("br ")):
+            raise AssertionError(f"{label}: split normal-region rewrite missing")
     if variant in ("bcf", "combined"):
         if "load volatile i32" not in target or "urem i32" not in target:
             raise AssertionError(f"{label}: BCF normal-region rewrite missing")
@@ -125,7 +131,7 @@ def main() -> int:
         for target_name, pad in targets:
             baseline = compile_ir(clang, opt, work_dir, level,
                                   target_name, "plain")
-            for variant in ("bcf", "fla", "combined"):
+            for variant in ("split", "bcf", "fla", "combined"):
                 label = f"O{level}-{target_name}-{variant}"
                 ir = compile_ir(clang, opt, work_dir, level,
                                 target_name, variant)
