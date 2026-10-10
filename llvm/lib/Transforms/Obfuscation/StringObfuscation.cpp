@@ -192,6 +192,35 @@ static void collectEarlyCtorReaders(
   }
 }
 
+// C strings may be referenced through pointer globals, aliases, and constant
+// expressions. Follow those references to the first instruction user without
+// imposing Rust's function-selection and pointer-escape policy on C callers.
+static StringRef cStringEarlyUseSkipReason(
+    GlobalVariable &GV, const SmallPtrSetImpl<const Function *> &EarlyReaders,
+    bool HasIndirectEarlyCall) {
+  if (HasIndirectEarlyCall)
+    return "early-ctor-indirect-call";
+  if (EarlyReaders.empty())
+    return {};
+
+  SmallVector<const User *, 16> Pending(GV.user_begin(), GV.user_end());
+  SmallPtrSet<const User *, 32> Seen;
+  while (!Pending.empty()) {
+    const User *U = Pending.pop_back_val();
+    if (!Seen.insert(U).second)
+      continue;
+    if (const auto *I = dyn_cast<Instruction>(U)) {
+      if (EarlyReaders.contains(I->getFunction()))
+        return "early-initialization";
+      continue;
+    }
+    if (const auto *C = dyn_cast<Constant>(U))
+      for (const User *Parent : C->users())
+        Pending.push_back(Parent);
+  }
+  return {};
+}
+
 // Follow a Rust allocation through constant pointer/length descriptors and
 // transparent pointer operations. Any unsupported or unselected user makes a
 // whole-global decision: replacing only some reads would be misleading, while
@@ -365,13 +394,16 @@ static StringRef stringSkipReason(
       std::numeric_limits<uint32_t>::max())
     return "oversized-array";
 
+  // An explicit section may remain read-only even after clearing isConstant.
+  // Preserve its storage contract instead of writing to it from the decoder.
+  if (GV.hasSection())
+    return "explicit-section";
+
   if (RustByteArrays) {
     if (!GV.hasLocalLinkage())
       return "non-local";
     if (GV.getAddressSpace() != 0)
       return "address-space";
-    if (GV.hasSection())
-      return "explicit-section";
     if (GV.isExternallyInitialized())
       return "external-init";
     if (GV.hasMetadataOtherThanDebugLocAndGuid())
@@ -380,6 +412,10 @@ static StringRef stringSkipReason(
             GV, EarlyReaders, HasIndirectEarlyCall, RuntimeReaders);
         !Reason.empty())
       return Reason;
+  } else if (StringRef Reason = cStringEarlyUseSkipReason(
+                 GV, EarlyReaders, HasIndirectEarlyCall);
+             !Reason.empty()) {
+    return Reason;
   }
 
   return {};
@@ -423,8 +459,7 @@ public:
     bool Changed = false;
     SmallPtrSet<const Function *, 16> EarlyReaders;
     bool HasIndirectEarlyCall = false;
-    if (RustByteArrays)
-      collectEarlyCtorReaders(M, EarlyReaders, HasIndirectEarlyCall);
+    collectEarlyCtorReaders(M, EarlyReaders, HasIndirectEarlyCall);
 
     // rustc often creates private literal allocations without an LLVM name.
     // Derive stable names for safe, eligible arrays before applying exact
@@ -571,10 +606,10 @@ private:
           ArrayRef<Value *>(IndexList, 2), "strdec.gep");
       LoadInst *LoadElement = Builder.CreateLoad(Builder.getInt8Ty(), GEP);
       LoadElement->setAlignment(Align(1));
-      // Rust runs this decoder at pipeline start. Without observable memory
-      // accesses, GlobalOpt can evaluate a small decoder and restore the
-      // plaintext initializer in the final artifact.
-      LoadElement->setVolatile(RustByteArrays);
+      // Both Clang and Rust run this decoder at pipeline start. Without
+      // observable memory accesses, GlobalOpt can evaluate a small decoder
+      // and restore the plaintext initializer in the final artifact.
+      LoadElement->setVolatile(true);
 
       Value *Index8 = Builder.CreateTrunc(Index, Builder.getInt8Ty());
       Value *Mask = Builder.CreateAdd(
@@ -584,7 +619,7 @@ private:
 
       StoreInst *Store = Builder.CreateStore(Decoded, GEP);
       Store->setAlignment(Align(1));
-      Store->setVolatile(RustByteArrays);
+      Store->setVolatile(true);
 
       Value *NextValue =
           Builder.CreateAdd(Index, Builder.getInt32(1), "next-value");

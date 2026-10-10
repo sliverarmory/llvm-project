@@ -175,6 +175,12 @@ struct BogusControlFlow : public FunctionPass {
     }
     // If fla annotations
     if (toObfuscate(flag, &F, "bcf")) {
+      // Naked functions rely on their assembly controlling register and stack
+      // use. Predicate loads and cloned blocks would violate that contract.
+      if (F.hasFnAttribute(Attribute::Naked)) {
+        reportObfuscationSkip("bcf", "function", F.getName(), "naked");
+        return false;
+      }
       // The bogus paths clone calls and introduce cycles. Convergence control
       // tokens constrain both placement and cycles, so this rewriter cannot
       // safely transform functions that use them.
