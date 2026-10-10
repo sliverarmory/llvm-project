@@ -11,7 +11,7 @@ verifies the LLVM bitcode saved by those same Cargo builds with this fork's
 
 | Selected target | Consumer and final-code witness |
 | --- | --- |
-| `bin` | Executable `accept_bin_probe`; it also executes generic `u32` and `u64` instantiations, a captured closure, and an async future. Each Rust witness must have one exact demangled `obf-sub` effect event. macOS and Linux compare each final linked symbol; Windows compares each saved COFF function and checks that its selected instructions survive in the final PE code. |
+| `bin` | Executable `accept_bin_probe`; it also executes generic `u32` and `u64` instantiations, a captured closure, and an async future. Each Rust witness must have one exact demangled `obf-split` effect event. macOS and Linux compare each final linked symbol; Windows compares each saved COFF function and checks that its selected instructions survive in the final PE code. |
 | `rlib` | The library has `#![no_std]`; a Rust executable calls its probe. Final code is checked in that executable, not in the intermediate rlib. |
 | `dylib` | A Rust executable calls its probe. Final code is checked in the loaded Rust dynamic library. |
 | `cdylib` | A C executable loads and calls its exported probe. Final code is checked in the shared library. |

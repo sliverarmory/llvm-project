@@ -30,7 +30,7 @@ EXPECTED = {
     "staticlib-c-consumer": "23079\n",
 }
 OUTPUTS = {
-    "obf-output-bin": ("bin", "accept_bin_probe", "obf-sub"),
+    "obf-output-bin": ("bin", "accept_bin_probe", "obf-split"),
     "obf-output-rlib": ("rlib", "accept_rlib_probe", "obf-split"),
     "obf-output-dylib": ("dylib", "accept_dylib_probe", "obf-split"),
     "obf-output-cdylib": ("cdylib", "accept_cdylib_probe", "obf-split"),
@@ -295,7 +295,7 @@ def check_report(report):
                                          "obf_output_dylib_consumer"):
             assert invocation["status"] == "unselected", invocation
     effects = [event for event in packages["obf-output-bin"]["events"]
-               if event["event"] == "effect" and event["pass"] == "sub"]
+               if event["event"] == "effect" and event["pass"] == "split"]
     symbols = {}
     for witness, demangled in BIN_RUST_WITNESSES.items():
         matches = [event for event in effects
@@ -364,7 +364,7 @@ def check_final_effects(objdump, host, baseline, selected, bin_symbols):
             "baseline_instructions": len(original),
             "selected_instructions": len(protected),
         }
-        print(f"PASS bin {witness}: obf-sub effect in {evidence}", flush=True)
+        print(f"PASS bin {witness}: obf-split effect in {evidence}", flush=True)
     result["obf-output-bin"]["rust_witnesses"] = rust_witnesses
     result["obf-output-bin"]["rust_witness_evidence"] = evidence
     return result
