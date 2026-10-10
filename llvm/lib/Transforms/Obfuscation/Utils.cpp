@@ -7,7 +7,10 @@
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/JSON.h"
+#include "llvm/Support/Path.h"
+#include "llvm/Support/Process.h"
 #include "llvm/Support/raw_ostream.h"
 #include <cstdlib>
 #include <fstream>
@@ -24,20 +27,31 @@ static cl::opt<bool> ReportObfuscationSkips(
     "obf-report-skips", cl::init(false),
     cl::desc("Report why requested obfuscation transformations were skipped"));
 
-// The Cargo wrapper gives each rustc invocation a distinct event file. This
-// keeps multi-CGU and parallel Cargo builds separate without redirecting
-// compiler diagnostics or relying on their text format.
+// Cargo uses one file per rustc invocation. Compiler launchers may instead
+// supply a directory: each cc1 or LTO process then writes its own file, even
+// when one driver command compiles multiple translation units in parallel.
 static void appendObfuscationEvent(StringRef Event, StringRef Pass,
                                    StringRef Kind, StringRef Symbol,
                                    StringRef Reason, uint64_t Count) {
-  const char *Path = std::getenv("RUST_OBF_EVENT_FILE");
+  SmallString<256> EventPath;
+  const char *Path = std::getenv("OBF_EVENT_FILE");
+  if (!Path || !*Path)
+    Path = std::getenv("RUST_OBF_EVENT_FILE");
+  if (const char *Directory = std::getenv("OBF_EVENT_DIR");
+      Directory && *Directory) {
+    EventPath = Directory;
+    sys::path::append(EventPath, "events-" +
+                                    std::to_string(sys::Process::getProcessId()) +
+                                    ".jsonl");
+    Path = EventPath.c_str();
+  }
   if (!Path || !*Path)
     return;
   static std::mutex EventMutex;
   std::lock_guard<std::mutex> Lock(EventMutex);
   std::ofstream Out(Path, std::ios::binary | std::ios::app);
   if (!Out)
-    return;
+    report_fatal_error(Twine("cannot open obfuscation event file: ") + Path);
   json::Object Record{{"event", Event.str()},
                       {"pass", Pass.str()},
                       {"kind", Kind.str()},
@@ -50,6 +64,9 @@ static void appendObfuscationEvent(StringRef Event, StringRef Pass,
   raw_string_ostream Stream(Line);
   Stream << json::Value(std::move(Record));
   Out << Line << '\n';
+  Out.flush();
+  if (!Out)
+    report_fatal_error(Twine("cannot write obfuscation event file: ") + Path);
 }
 
 void reportObfuscationSkip(StringRef Pass, StringRef Kind, StringRef Symbol,

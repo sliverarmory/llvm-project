@@ -8,6 +8,8 @@ from pathlib import Path
 
 SUITES = (
     ("test_transforms.py", True, False),
+    ("test_transform_safety.py", True, False),
+    ("test_build_manifest.py", True, False),
     ("test_split_machine.py", True, True),
     ("test_opt_passes.py", True, False),
     ("test_convergence.py", True, False),
