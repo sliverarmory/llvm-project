@@ -49,7 +49,9 @@ rust-obf-cargo --config obfuscation.json --report rust-obf-report.json -- build 
 ```
 
 `build`, `check`, `test`, `run`, and `rustc` are accepted Cargo commands. The
-launcher adds an explicit target triple when absent. This separates target
+launcher adds an explicit target triple when absent, before any Cargo `--`
+separator. Arguments after that separator pass unchanged to the application,
+test harness, or rustc, and never affect package metadata resolution. This separates target
 crates from host build dependencies and proc macros. It uses a fresh target
 directory for each invocation, so the report cannot mistake a cached artifact
 for a newly transformed one. For an incremental build, pass
@@ -60,7 +62,9 @@ reports `no-selected-crate-compiled` and fails strict coverage; touching or
 changing a selected source makes Cargo compile it again and generates fresh
 effect events. If another `RUSTC_WRAPPER` or `RUSTC_WORKSPACE_WRAPPER` is
 already set, the launcher stops with an error; it does not silently skip that
-wrapper.
+wrapper. For `cargo test`, it also selects the pinned compiler's sibling
+`rustdoc`; the toolchain must include `library/test` and rustdoc to run tests
+and doctests. Test harnesses are binary targets for `crate_types` selection.
 
 The `passes` list selects from the pipeline's fixed order: string, split,
 bogus control flow, flattening, substitution, constant encoding, then global
@@ -90,7 +94,16 @@ empty target or type list accepts all non-host targets in that package. In
 strict mode, every explicit target and crate type must compile at least once;
 the per-package `unmatched_targets` and `unmatched_crate_types` report fields
 identify requests that did not compile. A successful transform in one target
-does not satisfy a different requested target or crate type.
+does not satisfy a different requested target or crate type. Each selected
+compilation that emits code must satisfy every requested pass and exact symbol
+selector independently. The per-package `targets` entries show each code
+compilation's `crate_name`, `crate_types`, target triple, `strict_passed`, and
+`pass_summary`; `invocation_index` identifies its entry in `invocations`.
+Package-level summaries remain the union of all compilation events, so inspect
+the target entries when a package summary shows effects but strict coverage
+fails. Metadata-only and failed compilations do not satisfy a requested target
+or crate type. A single rustc invocation emitting several crate types shares
+its effect evidence across those outputs.
 
 `obf-global-access` requires nonempty `globals`; `obf-const` requires typed
 `constants` such as `i32:0x5a17`. String and global-access passes can share a
@@ -126,4 +139,16 @@ python3 tests/obfuscation/rust/test_lto.py \
   --opt build-llvm-project/bin/opt \
   --objdump build-llvm-project/bin/llvm-objdump \
   --work-dir /tmp/rust-obf-lto
+```
+
+The dependency-free wrapper regression covers per-target strict coverage and
+argument forwarding through `run`, `test`, and `rustc`. It also runs inside
+the main Cargo gate:
+
+```sh
+python3 tests/obfuscation/rust/test_cargo_wrapper.py \
+  --wrapper /path/to/rust-obf-cargo \
+  --rustc /path/to/custom-rust-1.99/bin/rustc \
+  --work-dir /tmp/rust-obf-wrapper
+cargo test --locked --manifest-path tools/rust-obfuscation/cargo-wrapper/Cargo.toml
 ```

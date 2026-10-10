@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 
 from machine_code import isolated_instructions
+from test_cargo_wrapper import run_regressions as wrapper_regressions
 
 
 FIXTURE = Path(__file__).resolve().parent / "cargo_fixture"
@@ -179,6 +180,7 @@ def main():
     work_dir = args.work_dir.resolve()
     work_dir.mkdir(parents=True, exist_ok=True)
     host = host_triple(rustc)
+    wrapper_regressions(wrapper, rustc, args.cargo, work_dir / "wrapper-regressions")
     env = saved_ir_env()
     env["RUSTC"] = str(rustc)
     env["CARGO_TARGET_DIR"] = str(work_dir / "baseline-target")

@@ -123,6 +123,17 @@ struct PassSummary {
 }
 
 #[derive(Serialize)]
+struct TargetReport {
+    invocation_index: usize,
+    crate_name: Option<String>,
+    crate_types: Vec<String>,
+    target: Option<String>,
+    code_artifact: bool,
+    strict_passed: bool,
+    pass_summary: BTreeMap<String, PassSummary>,
+}
+
+#[derive(Serialize)]
 struct RuleReport {
     package_id: String,
     rule: Rule,
@@ -130,6 +141,7 @@ struct RuleReport {
     unmatched_targets: Vec<String>,
     unmatched_crate_types: Vec<String>,
     pass_summary: BTreeMap<String, PassSummary>,
+    targets: Vec<TargetReport>,
     events: Vec<Event>,
 }
 
@@ -256,15 +268,43 @@ fn validate(config: &Config) -> io::Result<()> {
     Ok(())
 }
 
-fn cargo_metadata(cargo: &Path, cargo_args: &[OsString]) -> io::Result<Metadata> {
-    let mut command = Command::new(cargo);
-    command.args(["metadata", "--format-version", "1"]);
+// Everything after Cargo's separator belongs to rustc, the test harness, or
+// the executed program. Never interpret those arguments as Cargo options.
+fn cargo_options(args: &[OsString]) -> &[OsString] {
+    let end = args
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(args.len());
+    &args[..end]
+}
+
+fn cargo_build_args(args: &[OsString], host: &str) -> Vec<OsString> {
+    let options = cargo_options(args);
+    let mut result = options.to_vec();
+    if !options
+        .iter()
+        .any(|arg| arg == "--target" || arg.to_string_lossy().starts_with("--target="))
+    {
+        result.extend([OsString::from("--target"), OsString::from(host)]);
+    }
+    result.extend_from_slice(&args[options.len()..]);
+    result
+}
+
+fn cargo_metadata_args(args: &[OsString]) -> Vec<OsString> {
+    let args = cargo_options(args);
+    let mut result = vec![
+        OsString::from("metadata"),
+        OsString::from("--format-version"),
+        OsString::from("1"),
+    ];
     let mut i = 0;
-    while i < cargo_args.len() {
-        let arg = cargo_args[i].to_string_lossy();
+    while i < args.len() {
+        let arg = args[i].to_string_lossy();
         if matches!(arg.as_ref(), "--manifest-path" | "--features" | "--config") {
-            if let Some(value) = cargo_args.get(i + 1) {
-                command.arg(&cargo_args[i]).arg(value);
+            if let Some(value) = args.get(i + 1) {
+                result.push(args[i].clone());
+                result.push(value.clone());
                 i += 2;
                 continue;
             }
@@ -274,11 +314,18 @@ fn cargo_metadata(cargo: &Path, cargo_args: &[OsString]) -> io::Result<Metadata>
             "--locked" | "--offline" | "--frozen" | "--all-features" | "--no-default-features"
         ) || arg.starts_with("--manifest-path=")
             || arg.starts_with("--features=")
+            || arg.starts_with("--config=")
         {
-            command.arg(&cargo_args[i]);
+            result.push(args[i].clone());
         }
         i += 1;
     }
+    result
+}
+
+fn cargo_metadata(cargo: &Path, cargo_args: &[OsString]) -> io::Result<Metadata> {
+    let mut command = Command::new(cargo);
+    command.args(cargo_metadata_args(cargo_args));
     let output = command.output()?;
     if !output.status.success() {
         return Err(fail(format!(
@@ -404,7 +451,7 @@ fn launcher() -> io::Result<i32> {
             "unset existing RUSTC_WRAPPER and RUSTC_WORKSPACE_WRAPPER for this build",
         ));
     }
-    if cargo_args.iter().any(|arg| {
+    if cargo_options(cargo_args).iter().any(|arg| {
         arg == OsStr::new("--target-dir") || arg.to_string_lossy().starts_with("--target-dir=")
     }) {
         return Err(fail(
@@ -515,12 +562,18 @@ fn launcher() -> io::Result<i32> {
     let runtime_path = work_dir.join("runtime.json");
     write_json(&runtime_path, &runtime)?;
     let mut command = Command::new(&cargo);
-    command.args(cargo_args);
-    if !cargo_args
-        .iter()
-        .any(|arg| arg == OsStr::new("--target") || arg.to_string_lossy().starts_with("--target="))
-    {
-        command.arg("--target").arg(&host);
+    command.args(cargo_build_args(cargo_args, &host));
+    if cargo_subcommand == "test" {
+        // Doctests must use the same custom compiler/sysroot as normal crates.
+        // A rustup rustdoc from PATH may be incompatible with these artifacts.
+        command.env(
+            "RUSTDOC",
+            rustc.with_file_name(if cfg!(windows) {
+                "rustdoc.exe"
+            } else {
+                "rustdoc"
+            }),
+        );
     }
     command
         .env("RUSTC", &rustc)
@@ -570,6 +623,9 @@ fn option_values(args: &[OsString], option: &str) -> Vec<String> {
 }
 
 fn crate_types(args: &[OsString]) -> Vec<String> {
+    if args.iter().any(|arg| arg == "--test") {
+        return vec!["bin".to_owned()];
+    }
     option_values(args, "--crate-type")
         .into_iter()
         .flat_map(|value| {
@@ -707,7 +763,12 @@ fn wrapper() -> io::Result<i32> {
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
     if let Some(path) = &event_file {
-        command.env("RUST_OBF_EVENT_FILE", path);
+        // The wrapper owns this compilation's evidence destination. Generic
+        // Clang logging inherited from the caller must not redirect its events.
+        command
+            .env_remove("OBF_EVENT_DIR")
+            .env_remove("OBF_EVENT_FILE")
+            .env("RUST_OBF_EVENT_FILE", path);
     }
     let status = command.status()?;
     let code = status.code().unwrap_or(1);
@@ -740,6 +801,109 @@ fn wrapper() -> io::Result<i32> {
     Ok(code)
 }
 
+fn summarize_passes(rule: &Rule, events: &[Event]) -> (BTreeMap<String, PassSummary>, bool) {
+    let mut strict_passed = true;
+    let mut pass_summary = BTreeMap::new();
+    for pass in &rule.passes {
+        let short_pass = match pass.as_str() {
+            "obf-string" => "sobf",
+            "obf-split" => "split",
+            "obf-bcf" => "bcf",
+            "obf-fla" => "fla",
+            "obf-sub" => "sub",
+            "obf-const" => "constenc",
+            "obf-global-access" => "gai",
+            _ => unreachable!(),
+        };
+        let global_pass = matches!(pass.as_str(), "obf-string" | "obf-global-access");
+        let primary_kind = if global_pass { "global" } else { "function" };
+        let related: Vec<_> = events
+            .iter()
+            .filter(|event| event.pass == short_pass && event.kind == primary_kind)
+            .collect();
+        let function_events: Vec<_> = events
+            .iter()
+            .filter(|event| event.pass == short_pass && event.kind == "function")
+            .collect();
+        let matched_functions: BTreeSet<_> = function_events
+            .iter()
+            .filter(|event| !matches!(event.reason.as_deref(), Some("not-selected" | "not-found")))
+            .map(|event| event.raw_name.as_str())
+            .collect();
+        let transformed_functions: BTreeSet<_> = function_events
+            .iter()
+            .filter(|event| event.event == "effect")
+            .map(|event| event.raw_name.as_str())
+            .collect();
+        let matched: BTreeSet<_> = related
+            .iter()
+            .filter(|event| !matches!(event.reason.as_deref(), Some("not-selected" | "not-found")))
+            .map(|event| event.raw_name.as_str())
+            .collect();
+        let transformed: BTreeSet<_> = related
+            .iter()
+            .filter(|event| event.event == "effect")
+            .map(|event| event.raw_name.as_str())
+            .collect();
+        let skipped: BTreeSet<_> = events
+            .iter()
+            .filter(|event| {
+                event.pass == short_pass
+                    && event.event == "skip"
+                    && event.reason.as_deref() != Some("not-selected")
+            })
+            .map(|event| (event.kind.as_str(), event.raw_name.as_str()))
+            .collect();
+        let unmatched_functions: Vec<_> = rule
+            .functions
+            .iter()
+            .filter(|name| !matched_functions.contains(name.as_str()))
+            .cloned()
+            .collect();
+        let unmatched_globals = if !global_pass {
+            Vec::new()
+        } else {
+            rule.globals
+                .iter()
+                .filter(|name| !matched.contains(name.as_str()))
+                .cloned()
+                .collect()
+        };
+        if transformed.is_empty()
+            || !unmatched_functions.is_empty()
+            || !unmatched_globals.is_empty()
+            || rule
+                .functions
+                .iter()
+                .any(|name| !transformed_functions.contains(name.as_str()))
+            || (global_pass
+                && !rule.globals.is_empty()
+                && rule
+                    .globals
+                    .iter()
+                    .any(|name| !transformed.contains(name.as_str())))
+        {
+            strict_passed = false;
+        }
+        pass_summary.insert(
+            pass.clone(),
+            PassSummary {
+                matched_symbols: matched.len(),
+                transformed_symbols: transformed.len(),
+                transformed_sites: related
+                    .iter()
+                    .filter(|event| event.event == "effect")
+                    .map(|event| event.count)
+                    .sum(),
+                skipped_symbols: skipped.len(),
+                unmatched_functions,
+                unmatched_globals,
+            },
+        );
+    }
+    (pass_summary, strict_passed)
+}
+
 fn aggregate(
     runtime: &Runtime,
     cargo_args: &[OsString],
@@ -756,13 +920,18 @@ fn aggregate(
             .then(a.crate_name.cmp(&b.crate_name))
     });
     let mut reports = Vec::new();
-    let mut strict_passed = true;
+    let mut strict_passed = cargo_exit_code == 0;
     for (index, resolved) in runtime.rules.iter().enumerate() {
         let selected: Vec<_> = invocations
             .iter()
             .filter(|item| item.rule_index == Some(index))
             .collect();
-        let matched_targets: BTreeSet<_> = selected
+        let compiled: Vec<_> = selected
+            .iter()
+            .copied()
+            .filter(|item| item.status == "selected" && item.exit_code == 0 && item.linked_artifact)
+            .collect();
+        let matched_targets: BTreeSet<_> = compiled
             .iter()
             .filter_map(|item| item.crate_name.as_deref())
             .collect();
@@ -773,7 +942,7 @@ fn aggregate(
             .filter(|name| !matched_targets.contains(name.replace('-', "_").as_str()))
             .cloned()
             .collect();
-        let matched_crate_types: BTreeSet<_> = selected
+        let matched_crate_types: BTreeSet<_> = compiled
             .iter()
             .flat_map(|item| item.crate_type.iter().map(String::as_str))
             .collect();
@@ -785,121 +954,44 @@ fn aggregate(
             .cloned()
             .collect();
         let mut events = Vec::new();
-        for item in &selected {
+        let mut targets = Vec::new();
+        for (invocation_index, item) in invocations
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| item.rule_index == Some(index))
+        {
+            let mut target_events = Vec::new();
             if let Some(path) = &item.event_file {
                 if path.exists() {
                     for line in fs::read_to_string(path)?.lines() {
-                        events.push(serde_json::from_str::<Event>(line).map_err(io::Error::other)?);
+                        target_events
+                            .push(serde_json::from_str::<Event>(line).map_err(io::Error::other)?);
                     }
                 }
             }
-        }
-        let mut pass_summary = BTreeMap::new();
-        for pass in &resolved.rule.passes {
-            let short_pass = match pass.as_str() {
-                "obf-string" => "sobf",
-                "obf-split" => "split",
-                "obf-bcf" => "bcf",
-                "obf-fla" => "fla",
-                "obf-sub" => "sub",
-                "obf-const" => "constenc",
-                "obf-global-access" => "gai",
-                _ => unreachable!(),
-            };
-            let global_pass = matches!(pass.as_str(), "obf-string" | "obf-global-access");
-            let primary_kind = if global_pass { "global" } else { "function" };
-            let related: Vec<_> = events
-                .iter()
-                .filter(|event| event.pass == short_pass && event.kind == primary_kind)
-                .collect();
-            let function_events: Vec<_> = events
-                .iter()
-                .filter(|event| event.pass == short_pass && event.kind == "function")
-                .collect();
-            let matched_functions: BTreeSet<_> = function_events
-                .iter()
-                .filter(|event| {
-                    !matches!(event.reason.as_deref(), Some("not-selected" | "not-found"))
-                })
-                .map(|event| event.raw_name.as_str())
-                .collect();
-            let transformed_functions: BTreeSet<_> = function_events
-                .iter()
-                .filter(|event| event.event == "effect")
-                .map(|event| event.raw_name.as_str())
-                .collect();
-            let matched: BTreeSet<_> = related
-                .iter()
-                .filter(|event| {
-                    !matches!(event.reason.as_deref(), Some("not-selected" | "not-found"))
-                })
-                .map(|event| event.raw_name.as_str())
-                .collect();
-            let transformed: BTreeSet<_> = related
-                .iter()
-                .filter(|event| event.event == "effect")
-                .map(|event| event.raw_name.as_str())
-                .collect();
-            let skipped: BTreeSet<_> = events
-                .iter()
-                .filter(|event| {
-                    event.pass == short_pass
-                        && event.event == "skip"
-                        && event.reason.as_deref() != Some("not-selected")
-                })
-                .map(|event| (event.kind.as_str(), event.raw_name.as_str()))
-                .collect();
-            let unmatched_functions: Vec<_> = resolved
-                .rule
-                .functions
-                .iter()
-                .filter(|name| !matched_functions.contains(name.as_str()))
-                .cloned()
-                .collect();
-            let unmatched_globals = if !global_pass {
-                Vec::new()
-            } else {
-                resolved
-                    .rule
-                    .globals
-                    .iter()
-                    .filter(|name| !matched.contains(name.as_str()))
-                    .cloned()
-                    .collect()
-            };
-            if transformed.is_empty()
-                || !unmatched_functions.is_empty()
-                || !unmatched_globals.is_empty()
-                || resolved
-                    .rule
-                    .functions
-                    .iter()
-                    .any(|name| !transformed_functions.contains(name.as_str()))
-                || (global_pass
-                    && !resolved.rule.globals.is_empty()
-                    && resolved
-                        .rule
-                        .globals
-                        .iter()
-                        .any(|name| !transformed.contains(name.as_str())))
-            {
-                strict_passed = false;
+            if item.status != "metadata-only" {
+                let (pass_summary, passes_succeeded) =
+                    summarize_passes(&resolved.rule, &target_events);
+                let code_artifact =
+                    item.status == "selected" && item.exit_code == 0 && item.linked_artifact;
+                targets.push(TargetReport {
+                    invocation_index,
+                    crate_name: item.crate_name.clone(),
+                    crate_types: item.crate_type.clone(),
+                    target: item.target.clone(),
+                    code_artifact,
+                    strict_passed: code_artifact && passes_succeeded,
+                    pass_summary,
+                });
             }
-            pass_summary.insert(
-                pass.clone(),
-                PassSummary {
-                    matched_symbols: matched.len(),
-                    transformed_symbols: transformed.len(),
-                    transformed_sites: related
-                        .iter()
-                        .filter(|event| event.event == "effect")
-                        .map(|event| event.count)
-                        .sum(),
-                    skipped_symbols: skipped.len(),
-                    unmatched_functions,
-                    unmatched_globals,
-                },
-            );
+            events.extend(target_events);
+        }
+        let (pass_summary, package_passed) = summarize_passes(&resolved.rule, &events);
+        if !package_passed
+            || targets.is_empty()
+            || targets.iter().any(|target| !target.strict_passed)
+        {
+            strict_passed = false;
         }
         if selected.is_empty() || !unmatched_targets.is_empty() || !unmatched_crate_types.is_empty()
         {
@@ -912,6 +1004,7 @@ fn aggregate(
             unmatched_targets,
             unmatched_crate_types,
             pass_summary,
+            targets,
             events,
         });
     }
@@ -945,4 +1038,305 @@ fn aggregate(
         invocations,
         packages: reports,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(values: &[&str]) -> Vec<OsString> {
+        values.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn implicit_target_precedes_forwarded_arguments() {
+        for command in ["run", "test", "rustc"] {
+            let input = args(&[command, "--release", "--", "--target", "program-value"]);
+            assert_eq!(
+                cargo_build_args(&input, "native-host"),
+                args(&[
+                    command,
+                    "--release",
+                    "--target",
+                    "native-host",
+                    "--",
+                    "--target",
+                    "program-value"
+                ])
+            );
+        }
+        assert_eq!(
+            cargo_build_args(&args(&["build"]), "native-host"),
+            args(&["build", "--target", "native-host"])
+        );
+    }
+
+    #[test]
+    fn explicit_cargo_target_is_preserved() {
+        for option in [
+            vec!["--target", "chosen-host"],
+            vec!["--target=chosen-host"],
+        ] {
+            let mut input = args(&["run"]);
+            input.extend(args(&option));
+            input.extend(args(&["--", "hello"]));
+            assert_eq!(cargo_build_args(&input, "native-host"), input);
+        }
+    }
+
+    #[test]
+    fn metadata_ignores_forwarded_options_and_keeps_inline_config() {
+        let input = args(&[
+            "run",
+            "--manifest-path",
+            "real.toml",
+            "--offline",
+            "--config=net.offline=true",
+            "--features",
+            "real-feature",
+            "--",
+            "--manifest-path",
+            "missing.toml",
+            "--features=missing",
+            "--config",
+            "missing.toml",
+        ]);
+        assert_eq!(
+            cargo_metadata_args(&input),
+            args(&[
+                "metadata",
+                "--format-version",
+                "1",
+                "--manifest-path",
+                "real.toml",
+                "--offline",
+                "--config=net.offline=true",
+                "--features",
+                "real-feature"
+            ])
+        );
+        assert_eq!(
+            cargo_options(&args(&["run", "--", "--target-dir", "program-dir"])),
+            args(&["run"])
+        );
+    }
+
+    #[test]
+    fn test_harness_is_a_binary_target() {
+        assert_eq!(crate_types(&args(&["--test"])), vec!["bin"]);
+        assert_eq!(
+            crate_types(&args(&["--test", "--crate-type=lib"])),
+            vec!["bin"]
+        );
+        assert_eq!(
+            crate_types(&args(&["--crate-type=rlib,cdylib"])),
+            vec!["rlib", "cdylib"]
+        );
+    }
+
+    fn rule(targets: &[&str], crate_types: &[&str], functions: &[&str]) -> Rule {
+        Rule {
+            name: "fixture".to_owned(),
+            version: None,
+            source: "workspace".to_owned(),
+            targets: targets.iter().map(|value| value.to_string()).collect(),
+            crate_types: crate_types.iter().map(|value| value.to_string()).collect(),
+            passes: vec!["obf-sub".to_owned()],
+            functions: functions.iter().map(|value| value.to_string()).collect(),
+            globals: Vec::new(),
+            constants: Vec::new(),
+        }
+    }
+
+    fn event(name: &str, effect: bool) -> Event {
+        Event {
+            event: if effect { "effect" } else { "skip" }.to_owned(),
+            pass: "sub".to_owned(),
+            kind: "function".to_owned(),
+            raw_name: name.to_owned(),
+            demangled_name: name.to_owned(),
+            count: u64::from(effect),
+            reason: (!effect).then(|| "no-eligible-instructions".to_owned()),
+        }
+    }
+
+    struct ReportFixture(Runtime);
+
+    impl ReportFixture {
+        fn new(rule: Rule) -> Self {
+            let work_dir = unique_dir(&env::temp_dir().join("rust-obf-cargo-tests")).unwrap();
+            fs::create_dir(work_dir.join("invocations")).unwrap();
+            fs::create_dir(work_dir.join("events")).unwrap();
+            Self(Runtime {
+                config: Config {
+                    version: 1,
+                    rustc: PathBuf::from("rustc"),
+                    cargo: None,
+                    seed: None,
+                    strict: true,
+                    packages: vec![rule.clone()],
+                },
+                rules: vec![ResolvedRule {
+                    rule,
+                    package_id: "fixture-id".to_owned(),
+                    manifest_dir: work_dir.clone(),
+                }],
+                host: "native-host".to_owned(),
+                target_dir: work_dir.join("target"),
+                work_dir,
+                reused_target_dir: false,
+            })
+        }
+
+        fn invocation(
+            &self,
+            name: &str,
+            types: &[&str],
+            events: &[Event],
+            status: &str,
+            exit_code: i32,
+        ) {
+            let serial = fs::read_dir(self.0.work_dir.join("invocations"))
+                .unwrap()
+                .count();
+            let event_file = self
+                .0
+                .work_dir
+                .join("events")
+                .join(format!("{serial}.jsonl"));
+            let data = events
+                .iter()
+                .map(|event| serde_json::to_string(event).unwrap() + "\n")
+                .collect::<String>();
+            fs::write(&event_file, data).unwrap();
+            write_json(
+                &self
+                    .0
+                    .work_dir
+                    .join("invocations")
+                    .join(format!("{serial}.json")),
+                &Invocation {
+                    package_id: Some("fixture-id".to_owned()),
+                    rule_index: Some(0),
+                    crate_name: Some(name.to_owned()),
+                    crate_type: types.iter().map(|value| value.to_string()).collect(),
+                    target: Some("native-host".to_owned()),
+                    status: status.to_owned(),
+                    exit_code,
+                    linked_artifact: status == "selected",
+                    event_file: Some(event_file),
+                },
+            )
+            .unwrap();
+        }
+
+        fn report(&self) -> BuildReport {
+            aggregate(&self.0, &args(&["build"]), 0, false).unwrap()
+        }
+    }
+
+    impl Drop for ReportFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0.work_dir);
+        }
+    }
+
+    #[test]
+    fn one_target_effect_cannot_cover_another_target_skip() {
+        let fixture = ReportFixture::new(rule(&["alpha", "beta"], &["bin"], &["probe"]));
+        fixture.invocation("alpha", &["bin"], &[event("probe", true)], "selected", 0);
+        fixture.invocation("beta", &["bin"], &[event("probe", false)], "selected", 0);
+        let report = fixture.report();
+        assert!(!report.strict_passed);
+        assert!(report.code_artifact);
+        let package = &report.packages[0];
+        assert!(package.unmatched_targets.is_empty());
+        assert_eq!(package.pass_summary["obf-sub"].transformed_symbols, 1);
+        assert!(package.targets[0].strict_passed);
+        assert!(!package.targets[1].strict_passed);
+        assert_eq!(
+            package.targets[1].pass_summary["obf-sub"].transformed_symbols,
+            0
+        );
+    }
+
+    #[test]
+    fn each_crate_type_needs_its_own_effect() {
+        let fixture = ReportFixture::new(rule(&["chosen"], &["rlib", "dylib"], &["probe"]));
+        fixture.invocation("chosen", &["rlib"], &[event("probe", true)], "selected", 0);
+        fixture.invocation(
+            "chosen",
+            &["dylib"],
+            &[event("probe", false)],
+            "selected",
+            0,
+        );
+        let report = fixture.report();
+        assert!(!report.strict_passed);
+        assert!(report.packages[0].unmatched_crate_types.is_empty());
+        assert_eq!(
+            report.packages[0]
+                .targets
+                .iter()
+                .filter(|target| target.strict_passed)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn exact_selectors_are_checked_within_each_target() {
+        let fixture = ReportFixture::new(rule(&["alpha", "beta"], &[], &["first", "second"]));
+        fixture.invocation("alpha", &["bin"], &[event("first", true)], "selected", 0);
+        fixture.invocation("beta", &["bin"], &[event("second", true)], "selected", 0);
+        let report = fixture.report();
+        assert!(!report.strict_passed);
+        assert!(report.packages[0].pass_summary["obf-sub"]
+            .unmatched_functions
+            .is_empty());
+        assert!(report.packages[0]
+            .targets
+            .iter()
+            .all(|target| !target.strict_passed));
+    }
+
+    #[test]
+    fn successful_multi_output_compilation_covers_each_emitted_type() {
+        let fixture = ReportFixture::new(rule(&["chosen"], &["rlib", "dylib"], &["probe"]));
+        fixture.invocation(
+            "chosen",
+            &["rlib", "dylib"],
+            &[event("probe", true)],
+            "selected",
+            0,
+        );
+        let report = fixture.report();
+        assert!(report.strict_passed);
+        assert!(report.packages[0].unmatched_crate_types.is_empty());
+    }
+
+    #[test]
+    fn metadata_and_failed_compilations_do_not_satisfy_target_coverage() {
+        for (status, code) in [("metadata-only", 0), ("selected", 1)] {
+            let fixture = ReportFixture::new(rule(&["alpha", "beta"], &["bin"], &["probe"]));
+            fixture.invocation("alpha", &["bin"], &[event("probe", true)], "selected", 0);
+            fixture.invocation("beta", &["bin"], &[event("probe", true)], status, code);
+            let report = fixture.report();
+            assert!(!report.strict_passed);
+            assert_eq!(report.packages[0].unmatched_targets, vec!["beta"]);
+        }
+    }
+
+    #[test]
+    fn cached_build_and_failed_cargo_do_not_pass_strict_coverage() {
+        let fixture = ReportFixture::new(rule(&["alpha"], &["bin"], &["probe"]));
+        assert!(!fixture.report().strict_passed);
+        fixture.invocation("alpha", &["bin"], &[event("probe", true)], "selected", 0);
+        assert!(fixture.report().strict_passed);
+        assert!(
+            !aggregate(&fixture.0, &args(&["build"]), 101, false)
+                .unwrap()
+                .strict_passed
+        );
+    }
 }
