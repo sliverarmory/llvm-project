@@ -1,7 +1,11 @@
 # Rust obfuscation support roadmap
 
-Status: proposed implementation plan, 2026-10-08. This document complements
-`OBFUSCATION_ROADMAP.md`; it does not mark any Rust milestone complete.
+Status: implementation and acceptance inventory, updated 2026-10-10. This
+document complements `OBFUSCATION_ROADMAP.md`. Milestones 0–6 have working
+implementations and native acceptance runners; qualification is revision-specific.
+The audit baseline `aee13a36f` passed all four native extracted-archive jobs in
+[run 38073707099](https://github.com/sliverarmory/llvm-project/actions/runs/38073707099).
+Each later revision is qualified by its own complete regression run.
 
 ## Goal and support contract
 
@@ -28,46 +32,47 @@ explicit skips in the build report. A strict mode must fail when a requested
 crate, function, global, or pass never matched or never transformed anything
 eligible.
 
-## Current baseline
+## Current implementation
 
-- `llvm/lib/Passes/PassRegistry.def` registers all seven named new-pass-manager
-  passes. Clang inserts its pass sequence in
-  `clang/lib/CodeGen/BackendUtil.cpp`; rustc constructs its own `PassBuilder`
-  and will not inherit Clang's callbacks.
-- `llvm/lib/Transforms/Obfuscation/StringObfuscation.cpp` requires
-  `isCString()`. Ordinary Rust `&str` backing arrays can remain plaintext.
-- `BogusControlFlow.cpp` and `Flattening.cpp` reject whole functions with
-  exception-handling pads or unsupported terminators. Rust `panic=unwind` can
-  therefore lose control-flow coverage. Split and constant encoding also need
-  Rust unwind-IR review.
-- Function selection in `Utils.cpp` uses Clang annotations or exact LLVM
-  names. Rust source annotations must not be assumed to produce
-  `llvm.global.annotations`; monomorphization and mangling complicate names.
-- `.github/workflows/obfuscation.yml` runs Clang/`opt` tests on Linux amd64.
-  `.github/workflows/release.yml` builds four LLVM/Clang archives, none of
-  which contains rustc, a Rust sysroot, or a Cargo wrapper.
+- All seven named passes are registered in `PassRegistry.def`. The shared
+  `PassBuilder` hook owns the opt-in Rust pipeline and prevents duplicate
+  insertion through Clang callbacks. See [stage policy](tests/obfuscation/rust/PIPELINE.md).
+- Rust string encoding handles eligible local byte arrays, including ordinary
+  `&str`, UTF-8 and embedded NUL, while preserving slice lengths and runtime
+  bytes. Unsafe storage and initialization cases have explicit skip reasons.
+  See [string/data eligibility](tests/obfuscation/rust/STRING_DATA.md).
+- Split, BCF and flattening transform eligible ordinary regions inside unwind
+  functions while preserving pads and exceptional edges. Constant encoding
+  and global-access retain their narrower eligibility rules.
+  See [EH coverage](tests/obfuscation/rust/EH_REGIONS.md).
+- Cargo configuration resolves packages and selects targets, crate types,
+  raw LLVM function/global names and typed constants. Reports include raw and
+  demangled symbols and per-target strict coverage; effects in one target do
+  not satisfy another selected target. Host build scripts and proc macros
+  remain excluded. See [wrapper configuration](tools/rust-obfuscation/cargo-wrapper/README.md).
+- The custom compiler/sysroot includes `library/test` and rustdoc. Bootstrap
+  and packaging bind source content, external LLVM inputs and output hashes;
+  edited extracted source trees and stale/mixed binaries are rejected.
+- Native CI runs on PRs, main and the Rust development branch. The release
+  workflow reuses the four-host gate and publishes separate LLVM/Clang and
+  Rust archives only after extracted-artifact verification succeeds.
 
-## Milestones
+## Milestones and acceptance evidence
 
-The estimates are engineering time for one engineer, not elapsed CI time.
-Re-estimate after milestones 0 and 1, especially if Rust 1.99 cannot link
-cleanly against this fork or unwind-aware rewriting needs a larger redesign.
+| Milestone | Implemented behavior | Acceptance runner |
+| --- | --- | --- |
+| 0. Toolchain proof | Pinned Rust 1.99 and LLVM 23, static obfuscation link closure, named passes, O0/O2 behavior and final-code witnesses. | `run_direct.py`, bootstrap/package provenance tests |
+| 1. Stage-aware pipeline | Shared LLVM hook, fixed order, once-only ordinary/local/cross-crate LTO placement, Clang callback isolation. | `test_pipeline.py`, `run_pipeline.py` |
+| 2. Cargo and selection | Workspace and registry packages, per-target/type strict effects, symbol diagnostics, honest check/cache reporting, argument forwarding. | `test_cargo.py`, `test_cargo_wrapper.py`, wrapper unit tests |
+| 3. Rust strings and data | Non-NUL strings, UTF-8, embedded NUL, descriptors, FFI, weak/duplicate/early-init exclusions, scalar eligibility. | `test_string_data.py` |
+| 4. Unwind and control flow | Ordinary regions transform while EH is protected; native MSVC funclets, Drop, checked overflow, unwind and abort. | `run_eh_regions.py`, `../test_eh_regions.py` |
+| 5. Optimization and LTO | Off/local/thin/fat LTO, one/multiple CGUs, unselected-crate isolation, incremental reporting and seeded parallel repeatability. | `test_lto.py`, `test_seed_parallel.py`, `test_flatten_loop.py` |
+| 6. CI, delivery and docs | Four native hosts, clean extracted archives, build provenance, checksums, Cargo output types, unit/integration/doctests, cost reports and tag publication gates. | `verify_package.py --full --benchmark`, `test_cargo_outputs.py`, `test_cargo_test.py` |
 
-| Milestone | Implementation | Exit gate | Estimate |
-| --- | --- | --- | --- |
-| **0. Toolchain proof** | Pin the Rust 1.99 and LLVM revisions. Build a stage-1 rustc and sysroot against this fork; build `llvm-config` and ensure `LLVMObfuscation` is linked into rustc. Use `-C passes` only as an initial named-pass probe. | Direct rustc fixtures compile and run on macOS arm64 and Linux amd64. Each named pass parses; eligible test code shows the expected IR and final-artifact effect. Record real Rust O0 behavior, including `optnone`. Wrong LLVM versions and unknown passes fail clearly. | 1 week |
-| **1. Stage-aware pipeline** | Put the ordered, opt-in pass sequence in a shared LLVM integration point. First prove whether an LLVM `PassBuilder` hook controlled by rustc's `-C llvm-args` can cover O0, optimized, pre-link, ThinLTO, and fat-LTO stages without double-running Clang's callbacks. If not, add a small pinned Rust `PassWrapper.cpp` callback patch. | A single-crate fixture is transformed once at the intended stage in ordinary and LTO builds. Clang does not double-run the passes. Pass order and stage policy are documented; cross-crate isolation is gated in milestone 5. | 1–2 weeks |
-| **2. Cargo and selection** | Add a Cargo-facing wrapper and configuration for package, target, crate type, and optional function/global selection. Use Cargo's workspace wrapper for members and a Cargo-wide wrapper or equivalent interception for explicitly selected external dependencies; filter host build tools by crate type and target. Emit a per-build manifest with raw LLVM names, demangled Rust names, matched/transformed/skipped/unmatched counts, and reasons. Define generic, closure, async, inlined, and multi-CGU selection behavior. | A workspace member and a non-workspace registry dependency can be selected independently; unselected crates, host build scripts, and proc macros stay outside the default policy. Strict unmatched selection fails. `cargo check` reports that it produced no protected code artifact. | 1–2 weeks |
-| **3. Rust strings and data** | Extend the string pass to use-aware byte arrays, including non-NUL `&str`, UTF-8, embedded NUL, byte strings, and static/const references. Preserve slice pointer/length values and decoder initialization order. Keep unsafe exported, weak/COMDAT, metadata, and early-initialization cases excluded with reasons. Audit scalar globals and constant encoding against Rust IR without broadening their safety rules indiscriminately. | Selected eligible literals are absent as plaintext from final artifacts and retain exact bytes at runtime. `static`, `const`, FFI, and duplicate-definition tests pass or produce a documented skip. Selected scalar statics and constants show effects where eligible. | 2–3 weeks |
-| **4. Unwind and control flow** | Make BCF and flattening operate on eligible normal regions of functions containing `invoke`/EH, while preserving exceptional edges and pads. Audit split and narrow constant-encoding skips only where verified safe. Preserve Rust checked-overflow, `Drop`, `catch_unwind`, and `panic=abort` behavior. | Every pass and the combined pipeline verify and run on panic-abort and panic-unwind fixtures. Include native Windows MSVC funclet EH with `catch_unwind`, observable `Drop`, IR verification, and a real pass effect. Normal regions in unwind functions receive an effect where eligible; untouched EH regions have explicit skip reasons. | 2–4 weeks |
-| **5. Optimization and LTO** | Define once-only behavior across codegen units, incremental rebuilds, local ThinLTO, cross-crate ThinLTO, and fat LTO. Preserve crate selection after modules merge or are imported; decide explicitly which transforms run before or after LTO. | Final binaries retain the intended effects for `lto="off"`, `lto=false`, `lto="thin"`, and `lto="fat"`, with one and multiple codegen units. The local ThinLTO witness specifically uses `lto=false`, O2/O3, and multiple codegen units. No unselected dependency or sysroot code is transformed by accident. Fixed-seed parallel builds reproduce the same effects after clean and incremental builds; a different seed changes at least one witness. | 1–2 weeks |
-| **6. CI, delivery, and docs** | Add native Rust CI first on Linux amd64 and macOS arm64, then Windows amd64 and Linux arm64. Package a pinned custom Rust toolchain/sysroot and Cargo integration as a separate artifact initially. Document installation, configuration, eligibility, reports, version matching, and limitations. | CI is green on all four hosts. Tests run from extracted deliverables, not only the build tree. Record exact Rust/LLVM revisions, checksums, and final-artifact size, build-time, memory, and runtime comparisons. | 2 weeks |
-
-Milestones 2, 3, and 4 can partly proceed in parallel after the toolchain and
-pipeline decisions. The working estimate for the full four-platform effort is
-roughly 10–16 engineer-weeks; the unwind and string milestones dominate its
-uncertainty. Milestone 0 is the first implementation step and a stop/go gate
-for the chosen toolchain architecture.
+Runner paths are under `tests/obfuscation/rust/` unless qualified. Toolchain
+packaging helpers are under `tools/rust-obfuscation/`. A runner's existence
+is not evidence of a passing revision: retain terminal CI, the tested archive
+hashes and per-host smoke reports for every release.
 
 ## Acceptance matrix
 
@@ -85,13 +90,14 @@ code or data for the requested effect.
 | Rust code | Arithmetic with overflow checks, match/branches, generics and monomorphizations, closures/async, scalar statics, FFI exports, `std` and `no_std`. |
 | Strings | ASCII, UTF-8, embedded NUL, non-NUL `&str`, byte strings, `static`/`const` references, duplicate/weak data, and early initialization. Check exact runtime bytes and selected plaintext in final artifacts. |
 | Panic | Standalone `panic=abort` programs; `panic=unwind`, `catch_unwind`, and destructors with observable drop order. Include a native Windows MSVC funclet witness. Cargo test harnesses ignore the panic profile setting, so they cannot be the sole abort witness. |
-| Cargo | `bin`, `rlib`, `dylib`, `cdylib`, `staticlib`, a selected non-workspace registry dependency, an unselected dependency, a build script, and a proc macro; clean and incremental rebuilds. Run `rlib`/`dylib` through Rust consumers and `cdylib`/`staticlib` through C harnesses. |
+| Cargo | `bin`, `rlib`, `dylib`, `cdylib`, `staticlib`, a selected non-workspace registry dependency, an unselected dependency, a build script, and a proc macro; clean and incremental rebuilds. Run `rlib`/`dylib` through Rust consumers and `cdylib`/`staticlib` through C harnesses; run unit, integration, and documentation tests from the delivered sysroot. |
 | Optimization | Rust O0, O2, and release O3; one and multiple codegen units; `lto="off"`, `lto=false`, `lto="thin"`, and `lto="fat"`. Exercise local ThinLTO at O2/O3 with multiple codegen units; verify fixed-seed parallel and incremental repeatability and a different-seed witness. |
 | Platforms | Native Linux amd64/arm64, macOS arm64, and Windows amd64 builds; extracted-artifact smoke on each host before a support claim. |
 
 The regression gate for every milestone is an assertions-enabled build, its
-focused Rust tests, and `tests/obfuscation/run_portable.py` (the 11 existing
-suites plus the final-code split regression when `--objdump` is supplied).
+focused Rust tests, and every suite registered in
+`tests/obfuscation/run_portable.py`, including final-code witnesses with
+`--objdump` and strict build-manifest and transform-safety regressions.
 Keep the four-language HTTPS suite in CI where its dependencies and loopback
 sockets are available. Reuse the existing deterministic-seed, skip-reporting,
 and final-code tests as patterns.
@@ -102,9 +108,9 @@ and final-code tests as patterns.
    Stock macOS rustc plugin loading is not a dependable route to a four-host
    product. A standalone plugin remains an optional development path where
    Rust's LLVM linkage permits it.
-2. **Pipeline ownership:** prefer an opt-in LLVM-side hook only if milestone 1
-   proves its stage placement and no-double-insertion behavior. Otherwise
-   carry a minimal Rust 1.99 patch, pinned and tested with the LLVM revision.
+2. **Pipeline ownership:** the opt-in LLVM-side hook implements stage placement
+   and callback isolation without a Rust source patch; keep both regression
+   gates when updating either toolchain revision.
 3. **Selection surface:** use an explicit Cargo configuration and build report
    first. An ergonomic Rust source attribute is optional follow-up work; the
    roadmap does not rely on Rust generating Clang annotation metadata.

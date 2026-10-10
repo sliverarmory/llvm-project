@@ -11,11 +11,17 @@ amd64 before calling the toolchain supported on all four hosts.
 
 The bundled `pins.json` pins Rust source commit
 `b940084d7eb6a299eb4bfeb8e34901bc051e7ac4` (Rust 1.99.0), the Rust
-source archive SHA256, LLVM version 23.1.3, and the LLVM baseline commit
+source archive SHA256 and pinned file-inventory digest, LLVM version 23.1.3,
+and the LLVM baseline commit
 `d881479b157bad1536ce4d77fd06648f89c9fa64`. A delivered archive's
-`manifest.json` gives the **actual LLVM source commit**, Rust source commit,
+`manifest.json` gives the **packaging checkout's LLVM commit**, Rust source commit,
 host, `rustc -vV`, `opt --version`, source-dirty flag, and SHA256/size of every
-included file. Check the LLVM commit against the release's expected commit;
+included file. Mandatory compiler and launcher build records bind their source
+content and build inputs to the actual binary/sysroot hashes. The manifest
+retains each component's build revision separately from the packaging commit.
+An unchanged source tree can be committed after building because verification
+compares content identities; a changed compiler, wrapper, LLVM archive, or tool
+must be rebuilt. Check the packaging commit against the release's expected commit;
 the baseline pin alone is not the final implementation revision. The current
 stage-1 compiler prints `commit-hash: unknown`, so its `-vV` output alone
 cannot establish source provenance. Keep the manifest, archive, and `.sha256`
@@ -26,11 +32,12 @@ Build the compiler as described in bundled `BUILD.md` (source path
 from its locked dependencies, then package the host's stage-1 directory:
 
 ```sh
-cargo build --release --locked --manifest-path tools/rust-obfuscation/cargo-wrapper/Cargo.toml
+python3 tools/rust-obfuscation/provenance.py build-wrapper \
+  --target-dir build-llvm-project/cargo-wrapper-target
 python3 tools/rust-obfuscation/package.py \
   --stage1 build-rust-1.99/build/<host>/stage1 \
   --rust-source build-rust-1.99 \
-  --wrapper tools/rust-obfuscation/cargo-wrapper/target/release/rust-obf-cargo \
+  --wrapper build-llvm-project/cargo-wrapper-target/release/rust-obf-cargo \
   --opt build-llvm-project/bin/opt \
   --objdump build-llvm-project/bin/llvm-objdump \
   --output dist/rust-obfuscation-<host>.tar.gz
@@ -38,12 +45,18 @@ python3 tools/rust-obfuscation/package.py \
 
 Use `.zip` for a ZIP archive and `.exe` tool names on Windows. `package.py`
 accepts the exact, unmodified pinned Rust Git checkout or the SHA256-verified
-release source tree prepared by `bootstrap.py`. It refuses a dirty LLVM
+release source tree prepared by `bootstrap.py`. Extracted Rust sources must
+still match the pinned file inventory, including the absence of extra source
+files. It refuses a dirty LLVM
 checkout. `--allow-dirty` marks an archive for local development; it is not a
 release artifact. The package includes `rust-toolchain/`, the launcher and
 LLVM tools under `bin/`, licenses, a manifest, and a self-contained integrity
-checker. The launcher build path above is Cargo's default; pass the actual
-release binary path if `CARGO_TARGET_DIR` was set.
+checker, `rustdoc`, the test harness library, and build records. The launcher
+helper writes its actual native executable to the path shown above regardless
+of inherited Cargo target configuration. Keep the adjacent launcher record and
+stage-1 `.obfuscation-build.json`, along with the recorded local LLVM inputs,
+available until packaging completes. `--allow-dirty` does not bypass stale or
+missing build provenance.
 
 ## Install and verify
 
@@ -62,7 +75,8 @@ python3 verify_integrity.py \
 
 For ZIP, give `--archive` its `.zip` path. The integrity checker compares the
 sidecar, every file against `manifest.json`, the expected LLVM commit, and the
-clean-source flag. Hashes detect accidental changes; get the expected commit
+clean-source flag, and consistency between build records and delivered files.
+Hashes detect accidental changes; get the expected commit
 and checksum through a trusted release channel because adjacent files do not
 authenticate their publisher. On Windows run `rustc.exe` and `opt.exe` from
 the same locations. Keep `rust-toolchain/` intact so rustc can find its sysroot.
@@ -81,7 +95,8 @@ It requires a source checkout containing the test fixtures, a fresh work
 directory, and the Cargo fixture's locked registry crates (cached or pass
 `--online`). It checks the archive and manifest, runs the extracted tools,
 the direct Rust pipeline, pipeline stage and callback isolation, seven-pass
-Rust gate, Cargo selection, Rust byte strings and C staticlib consumer, Rust
+Rust gate, Cargo selection, Cargo unit/integration/documentation tests through
+the extracted compiler and rustdoc, Rust byte strings and C staticlib consumer, Rust
 unwind/control-flow gate, native and cross-target EH IR, LTO and incremental
 coverage, fixed-seed parallel repeatability, and the five Cargo output types
 with Rust and C consumers. It also checks an optimized loop under local and
@@ -192,6 +207,15 @@ witnesses retain their ordinary symbol bounds.
   native hosts. A development archive or a build-tree test does not establish
   release support. Refer to the exact revision's terminal CI and extracted
   smoke reports before claiming four-host support.
+- Native dependency portability depends on the build configuration. Hosted
+  builds disable optional LLVM terminfo, zstd, zlib, and libxml2 dependencies.
+  Manual builds must verify the complete runtime dependency chain on a clean
+  destination host; the packager does not automatically bundle arbitrary
+  system or package-manager libraries.
+
+The historical four-host run at `aee13a36ffd9` passed. Each delivered revision
+requires its own complete verification, including provenance and Cargo tests;
+historical success does not establish support for later changes.
 
 For a bounded cost sample on the existing Rust pipeline fixture, run
 `tests/obfuscation/rust/benchmark_rust.py` with `--rustc`, `--objdump`, and
