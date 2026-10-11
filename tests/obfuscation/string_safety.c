@@ -16,6 +16,9 @@ static const char section_message[]
 static const char early_message[] = "early-constructor-data";
 static const char *const early_pointer = early_message;
 static const char late_message[] = "late-constructor-data";
+// An internal array is eligible for encoding on every target. Inline literals
+// may instead be emitted as linker-coalesced COMDAT data (notably on Windows).
+static const char short_message[] = "obf-short-literal";
 static size_t early_size;
 static size_t late_size;
 
@@ -38,5 +41,5 @@ int main(void) {
       late_size != sizeof(late_message) - 1 ||
       strlen(section_message) != sizeof(section_message) - 1)
     return 1;
-  return puts("obf-short-literal") < 0;
+  return puts(short_message) < 0 || puts("pooled-inline-literal") < 0;
 }

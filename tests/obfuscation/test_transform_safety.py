@@ -10,6 +10,7 @@ from pathlib import Path
 SEED = "00112233445566778899aabbccddeeff"
 SHORT_LITERAL = b"obf-short-literal"
 LATE_LITERAL = b"late-constructor-data"
+POOLED_LITERAL = b"pooled-inline-literal"
 TARGETS = (
     "aarch64-apple-macosx13.0", "x86_64-pc-windows-msvc",
     "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu",
@@ -30,6 +31,40 @@ def function_body(ir, name):
     match = re.search(rf"(?ms)^define [^\n]*@{name}\([^)]*\)[^{{]*\{{(.*?)^}}", ir)
     assert match, f"Function {name} missing"
     return match.group(1)
+
+
+def check_string_safety(ir, diagnostics, label, binary=None):
+    encoded = [SHORT_LITERAL, LATE_LITERAL]
+    retained = [b"section-read-only", b"early-constructor-data"]
+    if re.search(r'^target triple = "[^"]*windows', ir, re.MULTILINE):
+        # Clang gives Windows inline literals linkonce_odr COMDAT storage.
+        # Each translation unit could otherwise emit a decoder for the single
+        # allocation retained by the linker, corrupting the shared bytes.
+        pooled_line = next((line for line in ir.splitlines()
+                            if line.startswith("@")
+                            and f'c"{POOLED_LITERAL.decode()}\\00"' in line), None)
+        assert pooled_line, f"{label}: missing pooled literal initializer"
+        assert "linkonce_odr" in pooled_line and "comdat" in pooled_line, pooled_line
+        assert " constant " in pooled_line, pooled_line
+        symbol = pooled_line.split(" = ", 1)[0][1:].strip('"')
+        assert f'symbol="{symbol}" reason=weak-or-comdat' in diagnostics, diagnostics
+        retained.append(POOLED_LITERAL)
+    else:
+        encoded.append(POOLED_LITERAL)
+
+    for literal in encoded:
+        assert literal.decode() not in ir, f"{label}: IR retains {literal!r}"
+        if binary is not None:
+            assert literal not in binary, f"{label}: binary retains {literal!r}"
+    for literal in retained:
+        assert f'c"{literal.decode()}\\00"' in ir, f"{label}: IR lost skipped {literal!r}"
+        if binary is not None:
+            assert literal in binary, f"{label}: binary lost skipped {literal!r}"
+    assert "load volatile i8" in ir, f"{label}: decoder reads must survive optimization"
+    assert "store volatile i8" in ir, f"{label}: decoder writes must survive optimization"
+    for symbol, reason in (("section_message", "explicit-section"),
+                           ("early_message", "early-initialization")):
+        assert f'symbol="{symbol}" reason={reason}' in diagnostics, diagnostics
 
 
 def main():
@@ -71,29 +106,22 @@ def main():
                 run([opt, "-passes=verify", "-disable-output", str(ir_path)])
                 run([*command, "-o", str(executable)])
                 execution = run([str(executable)], timeout=10)
-                results[variant] = (ir_path.read_text(encoding="utf-8"), executable.read_bytes())
+                results[variant] = (ir_path.read_text(encoding="utf-8"), executable.read_bytes(), emitted.stderr)
                 if fixture == "string_safety":
-                    assert execution.stdout.strip() == SHORT_LITERAL.decode(), execution.stdout
+                    assert execution.stdout.splitlines() == [
+                        SHORT_LITERAL.decode(), POOLED_LITERAL.decode(),
+                    ], execution.stdout
                 if variant != "obfuscated":
                     continue
-                if fixture == "string_safety":
-                    for symbol, reason in (("section_message", "explicit-section"),
-                                           ("early_message", "early-initialization")):
-                        assert f'symbol="{symbol}" reason={reason}' in emitted.stderr, emitted.stderr
-                else:
+                if fixture != "string_safety":
                     assert 'symbol="naked_target" reason=naked' in emitted.stderr, emitted.stderr
 
-            base_ir, base_binary = results["baseline"]
-            obf_ir, obf_binary = results["obfuscated"]
+            base_ir, base_binary, _ = results["baseline"]
+            obf_ir, obf_binary, diagnostics = results["obfuscated"]
             if fixture == "string_safety":
-                for literal in (SHORT_LITERAL, LATE_LITERAL):
+                for literal in (SHORT_LITERAL, LATE_LITERAL, POOLED_LITERAL):
                     assert literal in base_binary, f"Baseline fixture lost {literal!r}"
-                    assert literal not in obf_binary, f"{level} executable retains {literal!r}"
-                    assert literal.decode() not in obf_ir, f"{level} IR retains {literal!r}"
-                assert "load volatile i8" in obf_ir, "Decoder reads must survive optimization"
-                assert "store volatile i8" in obf_ir, "Decoder writes must survive optimization"
-                assert 'c"section-read-only\\00"' in obf_ir
-                assert 'c"early-constructor-data\\00"' in obf_ir
+                check_string_safety(obf_ir, diagnostics, f"{level} executable", obf_binary)
             else:
                 assert function_body(base_ir, "naked_target") == function_body(obf_ir, "naked_target")
                 assert "load volatile i32" in function_body(obf_ir, "ordinary_target")
@@ -135,11 +163,16 @@ def main():
                 ]
                 result = run([*command, "-S", "-emit-llvm", "-o", str(ir_path)])
                 run([opt, "-passes=verify", "-disable-output", str(ir_path)])
+                object_bytes = None
                 if can_emit_object:
-                    run([*command, "-c", "-o", f"{stem}.o"])
-                expected = ("explicit-section", "early-initialization") if fixture == "string_safety" else ("naked",)
-                for reason in expected:
-                    assert f"reason={reason}" in result.stderr, result.stderr
+                    object_path = Path(f"{stem}.o")
+                    run([*command, "-c", "-o", str(object_path)])
+                    object_bytes = object_path.read_bytes()
+                if fixture == "string_safety":
+                    check_string_safety(ir_path.read_text(encoding="utf-8"), result.stderr,
+                                        f"{target} {level} object", object_bytes)
+                else:
+                    assert 'symbol="naked_target" reason=naked' in result.stderr, result.stderr
         object_status = ("object checks passed" if can_emit_object else
                          f"object checks skipped: {backend} backend is not registered")
         print(f"{target}: O0/O2 IR verified; {object_status}; cross-target runtime not run", flush=True)
