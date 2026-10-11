@@ -3,8 +3,10 @@
 import hashlib
 import json
 import os
+import shutil
 import stat
 import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -13,7 +15,7 @@ from pathlib import Path
 from unittest import mock
 
 import bootstrap
-from package import PINS, manifest_files, validated_rust_source_commit
+from package import PINS, ignored_sources, manifest_files, validated_rust_source_commit
 from provenance import (STAGE_RECORD, digest_json, file_inventory, sha256,
                         build_wrapper,
                         source_identity, stage_inventory, verify_stage,
@@ -153,6 +155,83 @@ class PackageIntegrityTests(unittest.TestCase):
             with mock.patch("provenance.source_identity", return_value="new source"):
                 with self.assertRaisesRegex(ValueError, "LLVM/build source changed"):
                     verify_stage(stage, [tool], root)
+
+    def test_stage_inventory_prunes_sources_before_traversal_and_matches_package(self):
+        with tempfile.TemporaryDirectory() as temp:
+            stage = Path(temp) / "stage1"
+            expected_names = ("bin/rustc", "bin/rustdoc", "lib/librustc_driver.so",
+                              "lib/rustlib/native/lib/libtest.rlib",
+                              "lib/rustlib/native/lib/libstd.rlib", "share/src/keep.rs")
+            expected_paths = []
+            for name in (*expected_names, "lib/rustlib/src/rust/omitted.rs",
+                         "lib/rustlib/rustc-src/rust/omitted.rs", STAGE_RECORD):
+                path = stage / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(name)
+                if name in expected_names:
+                    expected_paths.append(path)
+            expected = file_inventory(expected_paths, stage)
+            excluded = [stage / "lib/rustlib" / name for name in ("src", "rustc-src")]
+            scandir = os.scandir
+
+            def guarded_scandir(directory):
+                self.assertFalse(any(Path(directory).is_relative_to(path) for path in excluded),
+                                 f"traversed excluded Rust sources: {directory}")
+                return scandir(directory)
+
+            with mock.patch("provenance.os.scandir", side_effect=guarded_scandir):
+                self.assertEqual(stage_inventory(stage), expected)
+            delivered = Path(temp) / "delivered"
+            shutil.copytree(stage, delivered, ignore=ignored_sources)
+            for name in ("src", "rustc-src"):
+                self.assertFalse((delivered / "lib/rustlib" / name).exists())
+            self.assertEqual(stage_inventory(delivered), expected)
+
+    @unittest.skipIf(os.name == "nt", "Windows source junctions are tested separately")
+    def test_stage_inventory_hashes_file_links_without_following_directory_links(self):
+        with tempfile.TemporaryDirectory() as temp:
+            stage = Path(temp) / "stage1"
+            (stage / "bin").mkdir(parents=True)
+            rustc = stage / "bin/rustc"
+            rustc.write_bytes(b"compiler")
+            alias = stage / "bin/rustc-alias"
+            alias.symlink_to("rustc")
+            (stage / "cycle").symlink_to(stage, target_is_directory=True)
+            (stage / "dangling").symlink_to("missing")
+            self.assertEqual(stage_inventory(stage), file_inventory([rustc, alias], stage))
+
+    @unittest.skipUnless(os.name == "nt", "requires a native Windows directory junction")
+    def test_stage_inventory_prunes_cyclic_windows_source_junctions(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "rust"
+            stage = source / "build/stage1"
+            rustc = stage / "bin/rustc.exe"
+            rustc.parent.mkdir(parents=True)
+            rustc.write_bytes(b"compiler")
+            junctions = []
+            try:
+                for name in ("src", "rustc-src"):
+                    junction = stage / "lib/rustlib" / name / "rust"
+                    junction.parent.mkdir(parents=True)
+                    subprocess.run(["cmd.exe", "/d", "/c", "mklink", "/J",
+                                    str(junction), str(source)], check=True,
+                                   capture_output=True, text=True, timeout=10)
+                    junctions.append(junction)
+                    self.assertTrue(junction.is_junction())
+                # Keep a traversal regression bounded even with the real cycle:
+                # source/build/stage1/lib/rustlib/src/rust -> source.
+                result = subprocess.run(
+                    [sys.executable, "-B", "-c",
+                     "import json, sys; from pathlib import Path; "
+                     "from provenance import stage_inventory; "
+                     "print(json.dumps(stage_inventory(Path(sys.argv[1]))))", str(stage)],
+                    cwd=Path(__file__).parent, check=True, capture_output=True,
+                    text=True, timeout=10)
+                self.assertEqual(json.loads(result.stdout), file_inventory([rustc], stage))
+            finally:
+                # Remove only each junction before TemporaryDirectory cleanup.
+                for junction in reversed(junctions):
+                    os.rmdir(junction)
 
     def test_wrapper_provenance_rejects_stale_source_and_binary(self):
         with tempfile.TemporaryDirectory() as temp:

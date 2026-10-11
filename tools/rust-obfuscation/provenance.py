@@ -83,10 +83,25 @@ def file_inventory(paths, root=None):
 
 
 def stage_files(stage):
-    # The delivered sysroot intentionally excludes Rust source links.
-    return [p for p in stage.rglob("*") if p.is_file() and p.name != STAGE_RECORD
-            and not any(parent.name in ("src", "rustc-src") and parent.parent.name == "rustlib"
-                        for parent in p.parents)]
+    # Match package.ignored_sources before inspecting or descending into source
+    # entries. On Windows these contain junctions back to the Rust checkout,
+    # which itself contains this stage and would make recursive globbing cycle.
+    files = []
+    pending = [Path(stage)]
+    while pending:
+        directory = pending.pop()
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                if (directory.name == "rustlib" and
+                        entry.name in ("src", "rustc-src")):
+                    continue
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append(Path(entry.path))
+                elif entry.name != STAGE_RECORD and entry.is_file():
+                    # Hash file symlink contents, but never follow directory
+                    # symlinks, consistent with the previous glob traversal.
+                    files.append(Path(entry.path))
+    return files
 
 
 def stage_inventory(stage):
