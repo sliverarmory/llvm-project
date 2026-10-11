@@ -58,6 +58,8 @@ def main():
 
     work_dir.mkdir(parents=True, exist_ok=True)
     suite_dir = Path(__file__).resolve().parent
+    print("running test_binary_evidence.py", flush=True)
+    subprocess.run([sys.executable, "-B", str(suite_dir / "test_binary_evidence.py")], check=True)
     for script, needs_opt, accepts_objdump in SUITES:
         if script in ("test_split_machine.py", "report_static_recovery.py") and not objdump:
             print(f"skipping {script} (pass --objdump to run it)",

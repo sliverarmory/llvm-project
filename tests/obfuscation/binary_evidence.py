@@ -51,9 +51,18 @@ def instruction_metrics(instructions):
 def final_section_sizes(objdump, executable):
     output = checked([str(objdump), "--section-headers", str(executable)])
     sections = []
-    for name, size, kind in re.findall(
-            r"(?m)^\s*\d+\s+(\S+)\s+([0-9a-fA-F]+)\s+[0-9a-fA-F]+\s+(\S.*)$", output):
-        sections.append({"name": name, "bytes": int(size, 16), "kind": kind.strip()})
+    for line in output.splitlines():
+        # ELF includes an unnamed null section and named sections with no
+        # Type value. Keep named untyped rows without consuming the next row.
+        # Horizontal whitespace is deliberate: a table field cannot cross a
+        # line boundary even when the trailing Type column is empty.
+        row = re.fullmatch(
+            r"[ \t]*\d+[ \t]+(\S+)[ \t]+([0-9a-fA-F]+)[ \t]+"
+            r"[0-9a-fA-F]+(?:[ \t]+(.*))?", line)
+        if row:
+            name, size, kind = row.groups()
+            sections.append({"name": name, "bytes": int(size, 16),
+                             "kind": (kind or "").strip()})
     if not sections:
         raise RuntimeError(f"no final section sizes found for {executable}")
     return {"sections": sections,
