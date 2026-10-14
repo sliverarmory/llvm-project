@@ -1,0 +1,12 @@
+[package]
+name = "cargo-test-gate"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[lib]
+name = "cargo_test_gate"
+
+[profile.test]
+opt-level = 2

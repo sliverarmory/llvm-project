@@ -1,0 +1,7 @@
+[package]
+name = "obf-output-dylib"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["dylib"]

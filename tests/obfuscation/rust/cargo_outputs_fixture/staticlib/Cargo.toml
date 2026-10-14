@@ -1,0 +1,7 @@
+[package]
+name = "obf-output-staticlib"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["staticlib"]

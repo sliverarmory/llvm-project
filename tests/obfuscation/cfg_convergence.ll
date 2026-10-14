@@ -3,6 +3,26 @@
 declare token @llvm.experimental.convergence.entry() convergent
 declare token @llvm.experimental.convergence.loop() convergent
 declare i32 @convergent_op(i32) convergent
+declare void @may_throw()
+declare i32 @__gxx_personality_v0(...)
+
+; The convergent call is in a protected EH block, while entry and normal are
+; otherwise split candidates. A function-wide preflight must still reject it.
+define i32 @convergent_eh_cleanup(i32 %value) noinline optnone personality ptr @__gxx_personality_v0 {
+entry:
+  %base = add i32 %value, 1
+  invoke void @may_throw()
+    to label %normal unwind label %cleanup
+
+normal:
+  %result = add i32 %base, 2
+  ret i32 %result
+
+cleanup:
+  %pad = landingpad { ptr, i32 } cleanup
+  %unused = call i32 @convergent_op(i32 %base)
+  resume { ptr, i32 } %pad
+}
 
 define i32 @controlled_loop(i32 %value) convergent noinline optnone {
 entry:

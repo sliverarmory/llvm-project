@@ -176,7 +176,9 @@ bool Substitution::runOnFunction(Function &F) {
       return false;
     }
     bool Changed = substitute(tmp);
-    if (!Changed)
+    if (Changed)
+      reportObfuscationEffect("sub", "function", F.getName());
+    else
       reportObfuscationSkip("sub", "function", F.getName(),
                             "no-eligible-instructions");
     return Changed;

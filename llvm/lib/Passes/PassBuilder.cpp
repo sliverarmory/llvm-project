@@ -410,9 +410,83 @@
 #include "llvm/Transforms/Vectorize/SLPVectorizer.h"
 #include "llvm/Transforms/Vectorize/SandboxVectorizer/SandboxVectorizer.h"
 #include "llvm/Transforms/Vectorize/VectorCombine.h"
+#include <memory>
 #include <optional>
 
 using namespace llvm;
+
+namespace {
+
+enum class RustObfuscationPass {
+  All,
+  String,
+  Split,
+  BogusControlFlow,
+  Flattening,
+  Substitution,
+  ConstantEncoding,
+  GlobalAccessIndirection,
+};
+
+// The list is a selection, not a scheduling order. The pipeline callbacks
+// always use the order documented in the Rust roadmap.
+static cl::list<RustObfuscationPass> RustObfuscationPipeline(
+    "rust-obf-pipeline", cl::CommaSeparated,
+    cl::desc("Opt in to the stage-aware Rust obfuscation pipeline; select "
+             "all or comma-separated pass names"),
+    cl::values(
+        clEnumValN(RustObfuscationPass::All, "all", "Select all seven passes"),
+        clEnumValN(RustObfuscationPass::String, "obf-string", "Encode strings"),
+        clEnumValN(RustObfuscationPass::Split, "obf-split", "Split basic blocks"),
+        clEnumValN(RustObfuscationPass::BogusControlFlow, "obf-bcf",
+                   "Insert bogus control flow"),
+        clEnumValN(RustObfuscationPass::Flattening, "obf-fla",
+                   "Flatten control flow"),
+        clEnumValN(RustObfuscationPass::Substitution, "obf-sub",
+                   "Substitute instructions"),
+        clEnumValN(RustObfuscationPass::ConstantEncoding, "obf-const",
+                   "Encode selected integer constants"),
+        clEnumValN(RustObfuscationPass::GlobalAccessIndirection,
+                   "obf-global-access", "Indirect selected global accesses")));
+
+// A selected Rust dependency must be transformed while its crate identity is
+// still known. Once Thin/Fat LTO imports or merges modules, the final crate's
+// process-wide LLVM options cannot distinguish selected dependency code from
+// unselected dependencies or the sysroot.
+static cl::opt<bool> RustObfuscationPrelinkOnly(
+    "rust-obf-prelink-only", cl::init(false),
+    cl::desc("Run selected Rust obfuscation passes before LTO, not after it"));
+
+static bool isSelected(RustObfuscationPass Pass) {
+  for (RustObfuscationPass Selected : RustObfuscationPipeline)
+    if (Selected == RustObfuscationPass::All || Selected == Pass)
+      return true;
+  return false;
+}
+
+static void addLateRustObfuscationPasses(ModulePassManager &MPM) {
+  if (isSelected(RustObfuscationPass::Split))
+    MPM.addPass(createModuleToFunctionPassAdaptor(
+        SplitBasicBlockPass(/*Flag=*/true)));
+  if (isSelected(RustObfuscationPass::BogusControlFlow))
+    MPM.addPass(BogusControlFlowPass(/*Flag=*/true));
+  if (isSelected(RustObfuscationPass::Flattening))
+    MPM.addPass(
+        createModuleToFunctionPassAdaptor(FlatteningPass(/*Flag=*/true)));
+  if (isSelected(RustObfuscationPass::Substitution))
+    MPM.addPass(
+        createModuleToFunctionPassAdaptor(SubstitutionPass(/*Flag=*/true)));
+  if (isSelected(RustObfuscationPass::ConstantEncoding))
+    MPM.addPass(ConstantEncodingPass(/*Flag=*/true));
+  if (isSelected(RustObfuscationPass::GlobalAccessIndirection))
+    MPM.addPass(GlobalAccessIndirectionPass(/*Flag=*/true));
+}
+
+} // namespace
+
+bool llvm::isRustObfuscationPipelineEnabled() {
+  return !RustObfuscationPipeline.empty();
+}
 
 cl::opt<std::optional<PrintPipelinePassesFormat>, false,
         PrintPipelinePassesFormatParser>
@@ -586,6 +660,51 @@ PassBuilder::PassBuilder(TargetMachine *TM, PipelineTuningOptions PTO,
     : TM(TM), PTO(PTO), PGOOpt(PGOOpt), PIC(PIC), FS(std::move(FS)) {
   if (TM)
     TM->registerPassBuilderCallbacks(*this);
+  if (isRustObfuscationPipelineEnabled()) {
+    // Rust's local ThinLTO path builds a pre-link pipeline to write embedded
+    // bitcode, followed by a non-LTO pipeline for its immediate object file.
+    // Both use this PassBuilder. Remember whether the pre-link callback was
+    // scheduled so the same module is not transformed in both pipelines.
+    auto ScheduledPrelink = std::make_shared<bool>(false);
+    if (isSelected(RustObfuscationPass::String))
+      registerPipelineStartEPCallback(
+          [](ModulePassManager &MPM, OptimizationLevel) {
+            // Encode Rust byte-array literals before pre-link simplification
+            // can copy or fold their plaintext, and before embedded bitcode
+            // is written. Link-time pipelines do not invoke this callback.
+            MPM.addPass(StringObfuscationPass(/*Flag=*/true,
+                                              /*RustByteArrays=*/true));
+          });
+    registerOptimizerLastEPCallback(
+        [ScheduledPrelink](ModulePassManager &MPM, OptimizationLevel Level,
+           ThinOrFullLTOPhase Phase) {
+          if (RustObfuscationPrelinkOnly) {
+            if (Phase == ThinOrFullLTOPhase::ThinLTOPreLink ||
+                Phase == ThinOrFullLTOPhase::FullLTOPreLink) {
+              *ScheduledPrelink = true;
+              addLateRustObfuscationPasses(MPM);
+            } else if (Phase == ThinOrFullLTOPhase::None &&
+                       !*ScheduledPrelink) {
+              addLateRustObfuscationPasses(MPM);
+            }
+            return;
+          }
+          // Rust 1.99 uses buildO0DefaultPipeline for every pre-link O0
+          // stage; its ThinLTO and full-LTO O0 backends have no matching
+          // optimizer-last callback. For optimized builds, run on non-LTO
+          // codegen or after ThinLTO imports, never in Thin/Fat pre-link.
+          if (Level == OptimizationLevel::O0 ||
+              Phase == ThinOrFullLTOPhase::None ||
+              Phase == ThinOrFullLTOPhase::ThinLTOPostLink)
+            addLateRustObfuscationPasses(MPM);
+        });
+    registerFullLinkTimeOptimizationLastEPCallback(
+        [](ModulePassManager &MPM, OptimizationLevel Level) {
+          // The O0 pre-link pipeline already ran these passes.
+          if (!RustObfuscationPrelinkOnly && Level != OptimizationLevel::O0)
+            addLateRustObfuscationPasses(MPM);
+        });
+  }
   if (PIC) {
     PIC->registerClassToPassNameCallback([this, PIC]() {
       // MSVC requires this to be captured if it's used inside decltype.

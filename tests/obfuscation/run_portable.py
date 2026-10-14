@@ -8,6 +8,9 @@ from pathlib import Path
 
 SUITES = (
     ("test_transforms.py", True, False),
+    ("test_transform_safety.py", True, False),
+    ("test_build_manifest.py", True, False),
+    ("test_split_machine.py", True, True),
     ("test_opt_passes.py", True, False),
     ("test_convergence.py", True, False),
     ("test_cfg_convergence.py", True, False),
@@ -18,6 +21,8 @@ SUITES = (
     ("test_objc_metadata.py", True, False),
     ("test_constant_encoding.py", True, True),
     ("test_global_access.py", True, True),
+    ("report_static_recovery.py", False, True),
+    ("rust/test_string_data.py", True, False),
 )
 
 
@@ -53,7 +58,13 @@ def main():
 
     work_dir.mkdir(parents=True, exist_ok=True)
     suite_dir = Path(__file__).resolve().parent
+    print("running test_binary_evidence.py", flush=True)
+    subprocess.run([sys.executable, "-B", str(suite_dir / "test_binary_evidence.py")], check=True)
     for script, needs_opt, accepts_objdump in SUITES:
+        if script in ("test_split_machine.py", "report_static_recovery.py") and not objdump:
+            print(f"skipping {script} (pass --objdump to run it)",
+                  flush=True)
+            continue
         suite_work_dir = work_dir / Path(script).stem
         command = [
             sys.executable, str(suite_dir / script),

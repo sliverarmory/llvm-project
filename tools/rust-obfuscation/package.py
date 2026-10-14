@@ -1,0 +1,199 @@
+"""Build a provenance-bearing, relocatable Rust obfuscation toolchain archive."""
+
+import argparse
+import hashlib
+import json
+import os
+import platform
+import shutil
+import subprocess
+import tarfile
+import tempfile
+import zipfile
+from pathlib import Path
+from bootstrap import check_rust_source
+from verify_integrity import validate_native_rustc_host, validate_package_path
+from provenance import STAGE_RECORD, verify_stage, verify_wrapper, wrapper_record_path
+
+
+ROOT = Path(__file__).resolve().parents[2]
+PINS = json.loads((Path(__file__).parent / "pins.json").read_text())
+
+
+def run(*args):
+    result = subprocess.run(args, cwd=ROOT, capture_output=True, text=True,
+                            check=True, timeout=30)
+    return result.stdout.strip()
+
+
+def sha256(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def ignored_sources(directory, names):
+    if Path(directory).name == "rustlib":
+        return [name for name in ("src", "rustc-src") if name in names]
+    return []
+
+
+def copy_tool(source, destination):
+    if not source.is_file():
+        raise ValueError(f"required tool is absent: {source}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, destination)
+
+
+def validated_rust_source_commit(source):
+    # Bootstrap accepts either the pinned Git checkout or the verified source
+    # archive. Git invoked inside an archive tree would walk up to the LLVM
+    # checkout and report its commit instead of the Rust revision.
+    check_rust_source(source)
+    return PINS["rust_commit"]
+
+
+def manifest_files(package_dir):
+    files = []
+    for path in sorted(package_dir.rglob("*")):
+        validate_package_path(path.relative_to(package_dir).as_posix())
+        if path.is_symlink():
+            raise ValueError(f"archive would contain an external symlink: {path}")
+        if path.is_file() and path != package_dir / "manifest.json":
+            files.append({"path": path.relative_to(package_dir).as_posix(),
+                          "bytes": path.stat().st_size,
+                          "sha256": sha256(path)})
+    return files
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--stage1", type=Path, required=True)
+    parser.add_argument("--rust-source", type=Path, default=ROOT / "build-rust-1.99",
+                        help="pinned Rust 1.99 source checkout for license and provenance")
+    parser.add_argument("--wrapper", type=Path, required=True)
+    parser.add_argument("--opt", type=Path, required=True)
+    parser.add_argument("--objdump", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True,
+                        help="archive path ending in .tar.gz or .zip")
+    parser.add_argument("--allow-dirty", action="store_true",
+                        help="mark a local development archive as dirty")
+    args = parser.parse_args()
+
+    output = args.output.resolve()
+    if not (str(output).endswith(".tar.gz") or output.suffix == ".zip"):
+        parser.error("--output must end in .tar.gz or .zip")
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    stage1 = args.stage1.resolve()
+    rust_source = args.rust_source.resolve()
+    wrapper = args.wrapper.resolve()
+    opt = args.opt.resolve()
+    objdump = args.objdump.resolve()
+    exe = ".exe" if os.name == "nt" else ""
+    llvm_ar = objdump.with_name("llvm-ar" + exe)
+    llvm_dis = objdump.with_name("llvm-dis" + exe)
+    for tool in (stage1 / "bin" / f"rustc{exe}", stage1 / "bin" / f"rustdoc{exe}", wrapper, opt, objdump,
+                 llvm_ar, llvm_dis):
+        if not tool.is_file():
+            raise ValueError(f"required tool is absent: {tool}")
+    source_revision = validated_rust_source_commit(rust_source)
+
+    revision = run("git", "rev-parse", "HEAD")
+    dirty = bool(run("git", "status", "--porcelain"))
+    if dirty and not args.allow_dirty:
+        raise ValueError("source tree is dirty; commit the milestone or pass --allow-dirty for a local test")
+    rust_version = run(str(stage1 / "bin" / f"rustc{exe}"), "-vV")
+    if (f"release: {PINS['rust_version']}" not in rust_version or
+            f"LLVM version: {PINS['llvm_version']}" not in rust_version):
+        raise ValueError("stage1 does not match the pinned Rust/LLVM versions")
+    validate_native_rustc_host(rust_version)
+    try:
+        stage_provenance = verify_stage(stage1, (opt, objdump, llvm_ar, llvm_dis))
+        wrapper_provenance = verify_wrapper(wrapper)
+    except (OSError, KeyError, ValueError) as error:
+        raise ValueError(f"build provenance verification failed; rebuild compiler/wrapper: {error}") from error
+    if stage_provenance["rust_source_commit"] != source_revision:
+        raise ValueError("stage1 build provenance uses a different Rust source")
+
+    label = f"rust-obfuscation-{revision[:12]}-{platform.system().lower()}-{platform.machine().lower()}"
+    with tempfile.TemporaryDirectory(prefix="rust-obf-package-", dir=output.parent) as temp:
+        package_dir = Path(temp) / label
+        shutil.copytree(stage1, package_dir / "rust-toolchain",
+                        ignore=ignored_sources)
+        for source, name in ((wrapper, f"rust-obf-cargo{exe}"),
+                             (opt, f"opt{exe}"),
+                             (objdump, f"llvm-objdump{exe}"),
+                             (llvm_ar, f"llvm-ar{exe}"),
+                             (llvm_dis, f"llvm-dis{exe}")):
+            copy_tool(source, package_dir / "bin" / name)
+        copy_tool(wrapper_record_path(wrapper),
+                  wrapper_record_path(package_dir / "bin" / f"rust-obf-cargo{exe}"))
+        copy_tool(ROOT / "tools/rust-obfuscation/cargo-wrapper/README.md",
+                  package_dir / "CARGO-WRAPPER.md")
+        copy_tool(ROOT / "tools/rust-obfuscation/README.md",
+                  package_dir / "BUILD.md")
+        copy_tool(ROOT / "tools/rust-obfuscation/DELIVERY.md",
+                  package_dir / "DELIVERY.md")
+        copy_tool(ROOT / "tools/rust-obfuscation/pins.json",
+                  package_dir / "pins.json")
+        copy_tool(ROOT / "tests/obfuscation/rust/PIPELINE.md",
+                  package_dir / "PIPELINE.md")
+        copy_tool(ROOT / "tests/obfuscation/rust/STRING_DATA.md",
+                  package_dir / "STRING_DATA.md")
+        copy_tool(ROOT / "tests/obfuscation/rust/EH_REGIONS.md",
+                  package_dir / "EH_REGIONS.md")
+        copy_tool(ROOT / "tests/obfuscation/rust/CARGO_OUTPUTS.md",
+                  package_dir / "CARGO_OUTPUTS.md")
+        copy_tool(ROOT / "tools/rust-obfuscation/verify_integrity.py",
+                  package_dir / "verify_integrity.py")
+        for name in ("COPYRIGHT", "LICENSE-APACHE", "LICENSE-MIT"):
+            copy_tool(rust_source / name, package_dir / "licenses" / "rust" / name)
+        copy_tool(ROOT / "llvm/LICENSE.TXT", package_dir / "licenses" / "llvm" / "LICENSE.TXT")
+        provenance = {
+            "schema_version": 1,
+            "llvm_source_commit": revision,
+            "source_dirty": dirty,
+            "rust_source_commit": source_revision,
+            "llvm_base_commit": PINS["llvm_base_commit"],
+            "rustc_vv": rust_version,
+            "opt_version": run(str(opt), "--version"),
+            "objdump_version": run(str(objdump), "--version"),
+            "host_system": platform.system(),
+            "host_machine": platform.machine(),
+            "build_provenance": {
+                "stage1_build_revision": stage_provenance["build_revision"],
+                "wrapper_build_revision": wrapper_provenance["build_revision"],
+                "source_identity": stage_provenance["source_identity"],
+                "wrapper_source_identity": wrapper_provenance["source_identity"],
+                "stage1_record_sha256": sha256(stage1 / STAGE_RECORD),
+                "wrapper_record_sha256": sha256(wrapper_record_path(wrapper)),
+            },
+            "files": manifest_files(package_dir),
+        }
+        (package_dir / "manifest.json").write_text(
+            json.dumps(provenance, indent=2, sort_keys=True) + "\n")
+
+        if str(output).endswith(".tar.gz"):
+            with tarfile.open(output, "w:gz") as archive:
+                archive.add(package_dir, arcname=label)
+        else:
+            with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED,
+                                 compresslevel=6) as archive:
+                for path in sorted(package_dir.rglob("*")):
+                    if path.is_file():
+                        archive.write(path, arcname=f"{label}/{path.relative_to(package_dir).as_posix()}")
+
+    digest = sha256(output)
+    (output.parent / (output.name + ".sha256")).write_text(
+        f"{digest}  {output.name}\n")
+    print(f"archive={output}")
+    print(f"sha256={digest}")
+    print(f"source_commit={revision}")
+    print(f"source_dirty={dirty}")
+
+
+if __name__ == "__main__":
+    main()

@@ -37,6 +37,12 @@ class AAManager;
 class TargetMachine;
 class ModuleSummaryIndex;
 
+/// Whether the opt-in Rust obfuscation pipeline was requested through LLVM's
+/// command-line options (for example, rustc -C llvm-args). Frontends that
+/// already register obfuscation callbacks use this to avoid inserting the
+/// same passes twice.
+LLVM_ABI bool isRustObfuscationPipelineEnabled();
+
 /// Tunable parameters for passes in the default pipelines.
 class PipelineTuningOptions {
 public:

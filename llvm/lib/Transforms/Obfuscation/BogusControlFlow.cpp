@@ -94,6 +94,7 @@
 //
 //===---------------------------------------------------------------------===//
 
+#include "EHRegion.h"
 #include "llvm/Transforms/Obfuscation/BogusControlFlow.h"
 #include "llvm/Transforms/Obfuscation/OptionParser.h"
 #include "llvm/Transforms/Obfuscation/Utils.h"
@@ -174,6 +175,12 @@ struct BogusControlFlow : public FunctionPass {
     }
     // If fla annotations
     if (toObfuscate(flag, &F, "bcf")) {
+      // Naked functions rely on their assembly controlling register and stack
+      // use. Predicate loads and cloned blocks would violate that contract.
+      if (F.hasFnAttribute(Attribute::Naked)) {
+        reportObfuscationSkip("bcf", "function", F.getName(), "naked");
+        return false;
+      }
       // The bogus paths clone calls and introduce cycles. Convergence control
       // tokens constrain both placement and cycles, so this rewriter cannot
       // safely transform functions that use them.
@@ -181,14 +188,14 @@ struct BogusControlFlow : public FunctionPass {
         reportObfuscationSkip("bcf", "function", F.getName(), "convergent");
         return false;
       }
-      // Splitting or cloning EH and indirect control flow blocks can break
-      // unwind edges or produce invalid terminators. Leave such functions
-      // untouched rather than partially rewriting their CFG.
+      bool HasEH = obfuscation::hasExceptionalControlFlow(F);
+      SmallPtrSet<BasicBlock *, 32> ProtectedEHBlocks;
+      if (HasEH)
+        obfuscation::collectProtectedEHBlocks(F, ProtectedEHBlocks);
+      // Convergence is a function-wide constraint. For EH, only individual
+      // normal blocks are rewritten; invoke edges, pads, and funclet bodies
+      // remain untouched.
       for (BasicBlock &BB : F) {
-        if (BB.isEHPad()) {
-          reportObfuscationSkip("bcf", "function", F.getName(), "eh-pad");
-          return false;
-        }
         for (Instruction &I : BB) {
           if (isa<ConvergenceControlInst>(I)) {
             reportObfuscationSkip("bcf", "function", F.getName(),
@@ -206,26 +213,37 @@ struct BogusControlFlow : public FunctionPass {
           }
         }
         Instruction *Term = BB.getTerminator();
-        if (!isa<BranchInst>(Term) && !isa<SwitchInst>(Term) &&
+        if (!HasEH && !isa<BranchInst>(Term) && !isa<SwitchInst>(Term) &&
             !isa<ReturnInst>(Term) && !isa<UnreachableInst>(Term)) {
           reportObfuscationSkip("bcf", "function", F.getName(),
                                 "unsupported-terminator");
           return false;
         }
       }
-      if (!bogus(F)) {
+      // Report protected blocks once before the per-round candidate walk.
+      // Their identities remain visible even when ordinary blocks are cloned.
+      for (BasicBlock &BB : F)
+        if (ProtectedEHBlocks.contains(&BB))
+          reportObfuscationSkip("bcf", "block", BB.getNameOrAsOperand(),
+                                "protected-eh-region");
+      bool HadCandidate = false;
+      if (!bogus(F, ProtectedEHBlocks, HadCandidate)) {
         reportObfuscationSkip("bcf", "function", F.getName(),
-                              "no-block-selected");
+                              HadCandidate ? "no-block-selected"
+                                           : "no-eligible-normal-block");
         return false;
       }
       doF(F);
+      reportObfuscationEffect("bcf", "function", F.getName());
       return true;
     }
 
     return false;
   } // end of runOnFunction()
 
-  bool bogus(Function &F) {
+  bool bogus(Function &F,
+             const SmallPtrSetImpl<BasicBlock *> &ProtectedEHBlocks,
+             bool &HadCandidate) {
     // For statistics and debug
     ++NumFunction;
     int NumBasicBlocks = 0;
@@ -281,8 +299,43 @@ struct BogusControlFlow : public FunctionPass {
         // Basic Blocks' selection
         BasicBlock *basicBlock = basicBlocks.front();
         basicBlocks.pop_front();
-        if ((int)llvm::cryptoutils->get_range(100) < ObfProbRate &&
-            !hasMustTailCall(*basicBlock)) {
+        if (ProtectedEHBlocks.contains(basicBlock))
+          continue;
+        Instruction *Term = basicBlock->getTerminator();
+        if (!isa<BranchInst>(Term) && !isa<SwitchInst>(Term) &&
+            !isa<ReturnInst>(Term) && !isa<UnreachableInst>(Term)) {
+          reportObfuscationSkip("bcf", "block", basicBlock->getName(),
+                                "unsupported-terminator");
+          continue;
+        }
+        bool CrossesEHRegion = false;
+        for (unsigned Succ = 0; Succ < Term->getNumSuccessors(); ++Succ)
+          CrossesEHRegion |=
+              ProtectedEHBlocks.contains(Term->getSuccessor(Succ));
+        if (CrossesEHRegion) {
+          reportObfuscationSkip("bcf", "block", basicBlock->getName(),
+                                "eh-boundary");
+          continue;
+        }
+        if (hasMustTailCall(*basicBlock)) {
+          reportObfuscationSkip("bcf", "block", basicBlock->getName(),
+                                "musttail");
+          continue;
+        }
+        bool HasUnsafeToken = false;
+        for (Instruction &I : *basicBlock) {
+          HasUnsafeToken |= I.getType()->isTokenTy();
+          if (auto *Call = dyn_cast<CallBase>(&I))
+            HasUnsafeToken |=
+                Call->countOperandBundlesOfType(LLVMContext::OB_funclet) != 0;
+        }
+        if (HasUnsafeToken) {
+          reportObfuscationSkip("bcf", "block", basicBlock->getName(),
+                                "token-or-funclet");
+          continue;
+        }
+        HadCandidate = true;
+        if ((int)llvm::cryptoutils->get_range(100) < ObfProbRate) {
           // Splitting creates three blocks. The clone contains no more than
           // the original block's instructions, and each original binary op
           // can add at most 20 junk instructions. Reserve final opaque

@@ -1,11 +1,20 @@
 #include "llvm/Transforms/Obfuscation/Utils.h"
+#include "llvm/Transforms/Obfuscation/CryptoUtils.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/Demangle/Demangle.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/JSON.h"
+#include "llvm/Support/Path.h"
+#include "llvm/Support/Process.h"
 #include "llvm/Support/raw_ostream.h"
+#include <cstdlib>
+#include <fstream>
+#include <mutex>
 
 using namespace llvm;
 
@@ -18,13 +27,61 @@ static cl::opt<bool> ReportObfuscationSkips(
     "obf-report-skips", cl::init(false),
     cl::desc("Report why requested obfuscation transformations were skipped"));
 
+// Cargo uses one file per rustc invocation. Compiler launchers may instead
+// supply a directory: each cc1 or LTO process then writes its own file, even
+// when one driver command compiles multiple translation units in parallel.
+static void appendObfuscationEvent(StringRef Event, StringRef Pass,
+                                   StringRef Kind, StringRef Symbol,
+                                   StringRef Reason, uint64_t Count) {
+  SmallString<256> EventPath;
+  const char *Path = std::getenv("OBF_EVENT_FILE");
+  if (!Path || !*Path)
+    Path = std::getenv("RUST_OBF_EVENT_FILE");
+  if (const char *Directory = std::getenv("OBF_EVENT_DIR");
+      Directory && *Directory) {
+    EventPath = Directory;
+    sys::path::append(EventPath, "events-" +
+                                    std::to_string(sys::Process::getProcessId()) +
+                                    ".jsonl");
+    Path = EventPath.c_str();
+  }
+  if (!Path || !*Path)
+    return;
+  static std::mutex EventMutex;
+  std::lock_guard<std::mutex> Lock(EventMutex);
+  std::ofstream Out(Path, std::ios::binary | std::ios::app);
+  if (!Out)
+    report_fatal_error(Twine("cannot open obfuscation event file: ") + Path);
+  json::Object Record{{"event", Event.str()},
+                      {"pass", Pass.str()},
+                      {"kind", Kind.str()},
+                      {"raw_name", Symbol.str()},
+                      {"demangled_name", demangle(Symbol.str())},
+                      {"count", static_cast<int64_t>(Count)}};
+  if (!Reason.empty())
+    Record["reason"] = Reason.str();
+  std::string Line;
+  raw_string_ostream Stream(Line);
+  Stream << json::Value(std::move(Record));
+  Out << Line << '\n';
+  Out.flush();
+  if (!Out)
+    report_fatal_error(Twine("cannot write obfuscation event file: ") + Path);
+}
+
 void reportObfuscationSkip(StringRef Pass, StringRef Kind, StringRef Symbol,
                            StringRef Reason) {
+  appendObfuscationEvent("skip", Pass, Kind, Symbol, Reason, 0);
   if (!ReportObfuscationSkips)
     return;
   errs() << "obf-skip pass=" << Pass << " kind=" << Kind << " symbol=\"";
   errs().write_escaped(Symbol);
   errs() << "\" reason=" << Reason << '\n';
+}
+
+void reportObfuscationEffect(StringRef Pass, StringRef Kind, StringRef Symbol,
+                             uint64_t Count) {
+  appendObfuscationEvent("effect", Pass, Kind, Symbol, "", Count);
 }
 
 static bool isAllowedFunction(StringRef Name) {
@@ -149,6 +206,7 @@ std::string readAnnotate(Function *F) {
 }
 
 bool toObfuscate(bool flag, Function *f, std::string const &attribute) {
+  clearObfuscationRandomContext();
   std::string NegativeAttribute = "no" + attribute;
   bool Positive = false;
   bool Negative = false;
@@ -177,5 +235,6 @@ bool toObfuscate(bool flag, Function *f, std::string const &attribute) {
     reportObfuscationSkip(attribute, "function", f->getName(), "not-selected");
     return false;
   }
+  setObfuscationRandomContext(attribute, f->getName());
   return true;
 }

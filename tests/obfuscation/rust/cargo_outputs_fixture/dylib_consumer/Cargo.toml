@@ -1,0 +1,7 @@
+[package]
+name = "obf-output-dylib-consumer"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+obf-output-dylib = { path = "../dylib" }

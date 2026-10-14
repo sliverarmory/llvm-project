@@ -321,9 +321,11 @@ def check_lto(clang, source, work_dir, baseline_outputs, objdump, required,
         "selected": ("-gai", "-gai-only-globals=selected_value",
                      "-obf-only-functions=selected"),
     }.items():
-        path = work_dir / f"lto-{name}"
+        path = work_dir / f"lto-{name}{'.exe' if sys.platform == 'win32' else ''}"
         options = [piece for flag in flags for piece in ("-mllvm", flag)]
-        result = run([*clang, "-O2", "-flto", *options, str(source),
+        export = (["-Xlinker", "/EXPORT:selected"]
+                  if sys.platform == "win32" else [])
+        result = run([*clang, "-O2", "-flto", *options, str(source), *export,
                       "-o", str(path)], timeout=180, check=False)
         if result.returncode:
             if name == "baseline":

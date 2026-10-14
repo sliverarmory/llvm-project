@@ -1,0 +1,8 @@
+[package]
+name = "rust-obf-lto-app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rust-obf-lto-chosen = { path = "../chosen" }
+rust-obf-lto-plain = { path = "../plain" }

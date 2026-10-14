@@ -1,0 +1,12 @@
+[package]
+name = "rust-obf-app"
+version = "0.1.0"
+edition.workspace = true
+build = "build.rs"
+
+[dependencies]
+rust-obf-member = { path = "../member" }
+rust-obf-macro-host = { path = "../macro_host" }
+itoa = "=1.0.15"
+ryu = "=1.0.20"
+adler2 = "=2.0.1"

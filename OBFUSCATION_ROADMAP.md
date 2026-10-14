@@ -33,42 +33,60 @@ test script takes `--clang build-llvm-project/bin/clang`,
 | 6 | Add selection policy and performance reporting: per-function controls, selected strings, explicit skip reasons, and size/time measurements. | Selection tests plus a baseline-versus-obfuscated report from final binaries. | Complete: O0/O2 selection and runtime checks, all five regression suites, and a final-binary report passed. |
 | 7 | Add selective integer-constant encoding. | IR semantics, cross-optimization, and binary-pattern checks for selected constants. | Complete: typed `opt`/Clang O0/O2 checks, seeded idempotence, arm64 final-code inspection, and full gate passed. |
 | 8 | Add selective global-access indirection with ABI exclusions. | Runtime and verifier tests across supported targets, including LTO. | Complete: O0/O2 and full-LTO runtime, final-code slot checks, four cross-target object formats, and full gate passed. |
-| 9 | Expand release smoke tests to every packaged platform. | Each release target compiles and runs the portable transform suite. | Implemented: 11-suite extracted-archive smoke passed locally on macOS arm64, including full LTO; hosted matrix awaits CI execution. |
+| 9 | Expand release smoke tests to every packaged platform. | Each release target compiles and runs the portable transform suite. | Implemented. Four-host historical CI evidence is recorded below; qualify each later revision through its own complete run. |
 
 The global-access pass makes a whole-global decision: if any use escapes or a
 direct access is outside the selected functions, it skips that global with a
 reason. This deliberately favors a predictable selection boundary over partial
 indirection. `-obf-report-skips` also reports names absent from the
-`-gai-only-globals` and `-sobf-only-globals` lists. An unmatched
-`-obf-only-functions` name is still a possible silent no-op across compilation
-units; add a per-build selection manifest before making that a hard error.
+`-gai-only-globals` and `-sobf-only-globals` lists. The
+[Clang build manifest](tools/clang-obfuscation/README.md) now aggregates compiler
+events across translation units and parallel compiler processes. Its optional
+strict finish step rejects absent or untransformed selections across the
+complete build. Direct compiler flags alone do not provide that build-wide
+check. Reports describe pass activity; final-binary effects remain a separate
+acceptance requirement.
 
 Step 9 builds and checks the tools inside each Windows amd64, macOS arm64,
 Linux amd64, and Linux arm64 release archive before the release job can run.
 The macOS archive includes `libLTO.dylib`, and its extracted-tool smoke gate
-requires an LTO link and final-code check. The local zip/unzip rehearsal passed
-the portable suite and Clang resource-directory check; the full C, C++,
-Objective-C, and Objective-C++ HTTPS integration suite passed separately at
-O0/O2. The hosted release matrix has not run against these uncommitted changes.
+requires an LTO link and final-code check.
 
-## Follow-up candidates
+The historical [four-host run at `aee13a36ffd9`](https://github.com/sliverarmory/llvm-project/actions/runs/38073707099)
+passed the extracted Rust toolchain gate and portable Clang tests on Windows
+amd64, macOS arm64, Linux amd64, and Linux arm64. Its portable Clang checks used
+the build-tree Clang; this is distinct from the LLVM/Clang release workflow's
+extracted-archive gate. Later revisions also gate build manifests, provenance
+checks, and the reports below. Retain the exact revision, terminal CI results,
+and archive checksums when qualifying a release.
 
-| Priority | Candidate | Design and acceptance requirement |
+## Implemented follow-up work
+
+| Work | Implementation | Verification boundary |
 | --- | --- | --- |
-| 1 | Selection manifest and cost report | Record matched, transformed, skipped, and absent symbols across all compilation units. Fail a build only when the caller asks for strict selection. Measure final code size and runtime per pass, not just IR growth. |
-| 2 | Indirect calls and branches | Start with direct calls to local, non-interposable functions. Define explicit exclusions for `musttail`, `invoke`, funclets, CFI, pointer authentication, and unusual calling conventions. Require O0/O2, exception, and full-LTO final-code checks on each target. |
-| 3 | Function outlining or wrapping | Select small internal functions with ordinary ABI only. Check recursion, debug info, unwind behavior, ThinLTO import, and code-size cost before widening eligibility. |
-| 4 | Machine-IR obfuscation | Prototype one target at a time after instruction selection, with register and unwind validation. The LLVM IR passes should remain the portable baseline. |
-| 5 | String and constant recovery tests | Add known-plaintext and static-pattern recovery experiments against the emitted binaries, since a decoder or two-share table is an obstacle to casual inspection rather than secrecy. |
+| Selection manifest | `tools/clang-obfuscation/clang_obf.py` records matched, transformed, skipped, absent, and untransformed selections across the complete build; strict mode is opt-in. Committed in `42a365c6f`. | Focused build-manifest regressions run in the portable suite on each native host. |
+| Per-pass cost report | `tests/obfuscation/report_size_time.py` compares an ordinary build, each of the seven passes, and the combined sequence, using final-binary effects as well as size and timing measurements. | Local macOS arm64 execution passed all nine variants with matching output and individual final-code/data witnesses. Native CI retains per-host reports; these measurements do not set performance thresholds. |
+| String and constant recovery experiments | `tests/obfuscation/report_static_recovery.py` attempts known-prefix string recovery and static two-share constant recovery from final executables. | Local macOS arm64 O0/O2 execution preserved output for six inputs and recovered both selected values despite their plaintext/immediate representations being absent. Native CI repeats the experiment; results characterize those encoding patterns and attack assumptions. |
 
-Step 6's local macOS arm64 report is generated by
-`tests/obfuscation/report_size_time.py` using the built LLVM 23 Clang. The
-32-million-iteration workload produced the same checksum in both variants.
-Combined obfuscation increased the final binary from 33,712 to 50,224 bytes
-(1.49x), compile-and-link median from 0.0574 to 0.0621 seconds (1.08x), and
-runtime median from 0.1048 to 0.1707 seconds (1.63x). These are indicative
-single-host measurements, not release performance thresholds. The machine
-report is in `build-llvm-project/performance-report-final/`.
+Cost reports must identify the compiler and host and preserve raw samples.
+See [measurement and recovery guidance](tests/obfuscation/MEASUREMENTS.md) for
+commands, recorded fields, and interpretation limits.
+Compare final executable/code size, compile time, compiler memory, and runtime
+with the same fixture and settings. Earlier single-host combined-pass numbers
+do not replace results from the current per-pass report. Successful data
+recovery is expected evidence of these encodings' limits, not a claim that
+obfuscated values are secret.
+
+## Optional research
+
+These are possible future directions, not missing requirements for the current
+implementation or active audit work.
+
+| Candidate | Design and acceptance requirement |
+| --- | --- |
+| Indirect calls and branches | Start with direct calls to local, non-interposable functions. Define explicit exclusions for `musttail`, `invoke`, funclets, CFI, pointer authentication, and unusual calling conventions. Require O0/O2, exception, and full-LTO final-code checks on each target. |
+| Function outlining or wrapping | Select small internal functions with ordinary ABI only. Check recursion, debug info, unwind behavior, ThinLTO import, and code-size cost before widening eligibility. |
+| Machine-IR obfuscation | Prototype one target at a time after instruction selection, with register and unwind validation. The LLVM IR passes should remain the portable baseline. |
 
 ## Research behind the order
 

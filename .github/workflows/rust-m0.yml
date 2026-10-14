@@ -1,0 +1,199 @@
+name: Rust obfuscation toolchain
+
+on:
+  pull_request:
+  push:
+    branches: [main, feat/rust-obfuscation]
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-obfuscation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native:
+    name: Native Rust 1.99 and extracted artifact (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 350
+    env:
+      CARGO_HOME: ${{ github.workspace }}/build-rust-1.99/build/obfuscation-cargo-home
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-amd64
+            runner: ubuntu-24.04
+            host: x86_64-unknown-linux-gnu
+            target: X86
+            exe: ''
+            extension: tar.gz
+          - platform: linux-arm64
+            runner: ubuntu-24.04-arm
+            host: aarch64-unknown-linux-gnu
+            target: AArch64
+            exe: ''
+            extension: tar.gz
+          - platform: macos-arm64
+            runner: macos-15
+            host: aarch64-apple-darwin
+            target: AArch64
+            exe: ''
+            extension: tar.gz
+          - platform: windows-amd64
+            runner: windows-2022
+            host: x86_64-pc-windows-msvc
+            target: X86
+            exe: '.exe'
+            extension: zip
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # bootstrap.py verifies ancestry from the pinned LLVM base commit.
+          # Full commit history keeps the proof valid as this branch grows.
+          fetch-depth: 0
+          filter: blob:none
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+
+      - name: Reclaim unused Linux runner disk
+        if: runner.os == 'Linux'
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/local/share/powershell /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Install Linux build and HTTPS dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build g++ xz-utils pkg-config openssl libcurl4-openssl-dev libssl-dev libobjc-13-dev
+
+      - name: Install macOS build dependencies
+        if: runner.os == 'macOS'
+        run: brew install ninja
+
+      - name: Set up MSVC
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install Windows build and HTTPS dependencies
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install ninja -y --no-progress
+          if ($LASTEXITCODE -ne 0) { throw 'ninja installation failed' }
+          & (Join-Path $env:VCPKG_INSTALLATION_ROOT 'vcpkg.exe') install curl:x64-windows
+          if ($LASTEXITCODE -ne 0) { throw 'vcpkg curl installation failed' }
+          $prefix = Join-Path $env:VCPKG_INSTALLATION_ROOT 'installed\x64-windows'
+          $libDir = Join-Path $prefix 'lib'
+          $binDir = Join-Path $prefix 'bin'
+          $ffiDir = Join-Path $PWD.Path 'build-llvm-project\ffi-libs'
+          New-Item -ItemType Directory -Force -Path $ffiDir | Out-Null
+          Copy-Item (Join-Path $libDir 'libcurl.lib') (Join-Path $ffiDir 'curl.lib')
+          "LIB=$ffiDir;$libDir;$env:LIB" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $binDir | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      - name: Configure assertions-enabled LLVM and Clang (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cmake -S llvm -B build-llvm-project -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLVM_ENABLE_ASSERTIONS=ON -DLLVM_ENABLE_PROJECTS=clang -DLLVM_TARGETS_TO_BUILD=${{ matrix.target }} -DLLVM_INCLUDE_TESTS=ON -DLLVM_INCLUDE_EXAMPLES=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF -DLLVM_ENABLE_TERMINFO=OFF -DLLVM_ENABLE_ZSTD=OFF -DLLVM_ENABLE_ZLIB=OFF -DLLVM_ENABLE_LIBXML2=OFF -DLLVM_PARALLEL_LINK_JOBS=1
+
+      - name: Configure assertions-enabled LLVM and Clang (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          cmake -S llvm -B build-llvm-project -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 -DLLVM_ENABLE_ASSERTIONS=ON -DLLVM_ENABLE_PROJECTS=clang -DLLVM_TARGETS_TO_BUILD=${{ matrix.target }} -DLLVM_INCLUDE_TESTS=ON -DLLVM_INCLUDE_EXAMPLES=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF -DLLVM_ENABLE_TERMINFO=OFF -DLLVM_ENABLE_ZSTD=OFF -DLLVM_ENABLE_ZLIB=OFF -DLLVM_ENABLE_LIBXML2=OFF -DLLVM_PARALLEL_LINK_JOBS=1
+
+      - name: Configure assertions-enabled LLVM and Clang (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # Match the static MSVC CRT used by Rust 1.99's own LLVM build.
+          cmake -S llvm -B build-llvm-project -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded -DLLVM_ENABLE_ASSERTIONS=ON -DLLVM_ENABLE_PROJECTS=clang -DLLVM_TARGETS_TO_BUILD=${{ matrix.target }} -DLLVM_INCLUDE_TESTS=ON -DLLVM_INCLUDE_EXAMPLES=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF -DLLVM_ENABLE_TERMINFO=OFF -DLLVM_ENABLE_ZSTD=OFF -DLLVM_ENABLE_ZLIB=OFF -DLLVM_ENABLE_LIBXML2=OFF -DLLVM_PARALLEL_LINK_JOBS=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build LLVM tools and obfuscation unit tests
+        run: cmake --build build-llvm-project --target clang opt llvm-objdump llvm-config ObfuscationTests --parallel 4
+
+      - name: Check LLVM obfuscation unit tests
+        run: python -c "import subprocess; subprocess.run(['build-llvm-project/unittests/Transforms/Obfuscation/ObfuscationTests${{ matrix.exe }}'], check=True)"
+
+      - name: Check Rust bootstrap and delivery unit tests
+        run: python -B -m unittest discover -s tools/rust-obfuscation -p 'test_*.py' -v
+
+      - name: Check isolated final machine-code extraction
+        run: python -B tests/obfuscation/rust/test_machine_code.py
+
+      - name: Fetch pinned Rust 1.99 source
+        run: git clone --depth 1 --branch 1.99.0 --filter=blob:none https://github.com/rust-lang/rust.git build-rust-1.99
+
+      - name: Build pinned stage-1 Rust compiler and sysroot
+        run: python -B tools/rust-obfuscation/bootstrap.py build --jobs 4
+
+      - name: Build Cargo launcher from its lockfile
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/build-llvm-project/cargo-wrapper-target
+        run: python -B tools/rust-obfuscation/provenance.py build-wrapper --target-dir build-llvm-project/cargo-wrapper-target
+
+      - name: Check Cargo launcher unit tests
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/build-llvm-project/cargo-wrapper-target
+        run: cargo test --locked --manifest-path tools/rust-obfuscation/cargo-wrapper/Cargo.toml
+
+      - name: Verify LLVM obfuscation pipeline
+        run: python -B tests/obfuscation/rust/test_pipeline.py --opt build-llvm-project/bin/opt${{ matrix.exe }} --clang build-llvm-project/bin/clang${{ matrix.exe }}
+
+      - name: Verify native and cross-target EH IR
+        run: python -B tests/obfuscation/test_eh_regions.py --clang build-llvm-project/bin/clang${{ matrix.exe }} --opt build-llvm-project/bin/opt${{ matrix.exe }} --work-dir build-llvm-project/eh-ir
+
+      - name: Package pinned native Rust toolchain
+        run: python -B tools/rust-obfuscation/package.py --stage1 build-rust-1.99/build/${{ matrix.host }}/stage1 --rust-source build-rust-1.99 --wrapper build-llvm-project/cargo-wrapper-target/release/rust-obf-cargo${{ matrix.exe }} --opt build-llvm-project/bin/opt${{ matrix.exe }} --objdump build-llvm-project/bin/llvm-objdump${{ matrix.exe }} --output build-llvm-project/rust-obfuscation-${{ matrix.platform }}.${{ matrix.extension }}
+
+      - name: Verify extracted toolchain, HTTPS, Cargo, EH, and cost
+        run: python -B tools/rust-obfuscation/verify_package.py --archive build-llvm-project/rust-obfuscation-${{ matrix.platform }}.${{ matrix.extension }} --work-dir build-llvm-project/rust-extracted --expected-commit ${{ github.sha }} --full --clang build-llvm-project/bin/clang${{ matrix.exe }} --online --live-https --benchmark
+
+      - name: Verify portable Clang obfuscation suites
+        run: python -B tests/obfuscation/run_portable.py --clang build-llvm-project/bin/clang${{ matrix.exe }} --opt build-llvm-project/bin/opt${{ matrix.exe }} --objdump build-llvm-project/bin/llvm-objdump${{ matrix.exe }} --work-dir build-llvm-project/portable-rust
+
+      - name: Measure each Clang obfuscation pass from final binaries
+        run: python -B tests/obfuscation/report_size_time.py --clang build-llvm-project/bin/clang${{ matrix.exe }} --opt build-llvm-project/bin/opt${{ matrix.exe }} --objdump build-llvm-project/bin/llvm-objdump${{ matrix.exe }} --work-dir build-llvm-project/clang-cost
+
+      - name: Verify four-language HTTPS clients on Linux
+        if: runner.os == 'Linux'
+        run: python -B tests/obfuscation/test_http_programs.py --clang build-llvm-project/bin/clang --opt build-llvm-project/bin/opt --work-dir build-llvm-project/http-rust
+
+      - name: Upload passing native toolchain archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-obfuscation-${{ matrix.platform }}
+          path: |
+            build-llvm-project/rust-obfuscation-${{ matrix.platform }}.${{ matrix.extension }}
+            build-llvm-project/rust-obfuscation-${{ matrix.platform }}.${{ matrix.extension }}.sha256
+            build-llvm-project/rust-extracted/smoke-report.json
+            build-llvm-project/rust-extracted/benchmark/benchmark-report.json
+            build-llvm-project/clang-cost/obfuscation-performance.json
+            build-llvm-project/clang-cost/obfuscation-performance.md
+            build-llvm-project/portable-rust/report_static_recovery/static-recovery.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload Rust diagnostic reports and emitted IR
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-obfuscation-diagnostics-${{ matrix.platform }}
+          path: |
+            build-llvm-project/rust-extracted/**/*.json
+            build-llvm-project/rust-extracted/**/*.ll
+            build-llvm-project/eh-ir/*.ll
+            build-llvm-project/portable-rust/**/*.ll
+            build-llvm-project/portable-rust/**/*.json
+            build-llvm-project/clang-cost/**
+            build-llvm-project/http-rust/*.ll
+          if-no-files-found: ignore

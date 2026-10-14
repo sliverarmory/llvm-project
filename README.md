@@ -14,6 +14,31 @@ at commit `0d261d1ca552c95a8f007e061c787ac7132fbcbc`.
 - `-mllvm -bcf_prob=<N>`: block obfuscation probability in `%` (default `30`, valid `1..100`)
 - `-mllvm -bcf_loop=<N>`: BCF loop count (default `1`, valid `>0`)
 - `-mllvm -fla`: control-flow flattening
+- `-mllvm -constenc -mllvm -constenc-values=i32:0x5a17`: selected integer-constant encoding
+- `-mllvm -gai -mllvm -gai-only-globals=state`: selected private integer-global access indirection
+
+All seven transforms also have named new-pass-manager passes in `opt`:
+`obf-string`, `obf-sub`, `obf-split`, `obf-bcf`, `obf-fla`, `obf-const`, and
+`obf-global-access`. Use `-obf-only-functions` for exact LLVM function names,
+`-sobf-only-globals` for selected string storage, and `-obf-report-skips` for
+eligibility diagnostics. Numeric controls reject invalid values.
+
+The [Clang build manifest launcher](tools/clang-obfuscation/README.md) collects
+effects across parallel translation units and can enforce strict selection
+after the complete build. Compiler events establish pass activity; verify
+runtime behavior and final code/data separately.
+
+## Rust and Cargo
+
+The fork includes a pinned Rust 1.99 compiler/sysroot and Cargo launcher.
+It supports package and target selection, Rust byte strings, ordinary regions
+inside unwind functions, and pre-link selection across local/cross-crate LTO.
+The custom sysroot includes the test harness and rustdoc. See
+[build instructions](tools/rust-obfuscation/README.md),
+[installation and delivery](tools/rust-obfuscation/DELIVERY.md), and
+[Cargo configuration](tools/rust-obfuscation/cargo-wrapper/README.md).
+Stock rustc is not interchangeable with this toolchain. Consult the exact
+revision's native extracted-archive CI results for platform qualification.
 
 `split`, `bcf`, and `fla` are now wired into Clang's new PM pipeline:
 
@@ -27,9 +52,10 @@ From the repository root:
 ```bash
 cmake -S llvm -B build-llvm-project \
   -DLLVM_ENABLE_PROJECTS=clang \
+  -DLLVM_ENABLE_ASSERTIONS=ON \
   -DCMAKE_BUILD_TYPE=Release
 
-cmake --build build-llvm-project --target clang opt -j8
+cmake --build build-llvm-project --target clang opt llvm-objdump ObfuscationTests -j8
 ```
 
 ## Verify the transforms
@@ -39,10 +65,11 @@ The smoke test compiles each transform separately and together at `-O0` and
 results with an independent oracle. It also checks function annotations.
 
 ```bash
-python3 tests/obfuscation/test_transforms.py \
+python3 tests/obfuscation/run_portable.py \
   --clang build-llvm-project/bin/clang \
   --opt build-llvm-project/bin/opt \
-  --work-dir build-llvm-project/transform-smoke
+  --objdump build-llvm-project/bin/llvm-objdump \
+  --work-dir build-llvm-project/portable-smoke
 ```
 
 The integration test builds HTTPS clients in C, C++, Objective-C, and
@@ -60,8 +87,10 @@ python3 tests/obfuscation/test_http_programs.py \
   --work-dir build-llvm-project/http-integration
 ```
 
-GitHub Actions runs both suites on Ubuntu. The release workflow runs them
-before packaging its Linux amd64 archive.
+GitHub Actions runs the portable suite across the four native Rust hosts and
+the HTTPS suite on Linux. Tag releases require extracted LLVM/Clang and Rust
+archive gates before publishing both toolchain families. Rust releases retain
+checksums, per-host smoke reports, and benchmark evidence with their archives.
 
 The CI suite also compiles Objective-C and Objective-C++ metadata probes for
 the Apple, GNUstep, and GCC runtimes at both optimization levels. This guards
@@ -172,11 +201,15 @@ Expected: no plaintext match.
 
 ### String obfuscation
 
-- obfuscates constant C-string globals (`ConstantDataSequential::isCString()`)
+- Clang's `-sobf` encodes constant C-string globals; the Rust pipeline also
+  handles eligible non-NUL byte arrays, UTF-8, and embedded NUL
 - skips LLVM metadata, Objective-C runtime metadata, and constant-string
   backing storage used before startup constructors run
 - uses per-byte rolling mask in decode
 - emits decode startup via `@llvm.global_ctors`
+- preserves explicit sections and strings reachable from priority-zero
+  constructors; observable decoder accesses prevent optimization from
+  restoring short plaintext literals
 
 ### Substitution
 
@@ -188,6 +221,8 @@ Expected: no plaintext match.
 - `split`: random split points per block
 - `bcf`: inserts opaque predicates and altered blocks
 - `fla`: rewrites CFG into dispatcher loop/switch form
+- CFG passes preserve protected EH regions and report exclusions; BCF skips
+  naked functions whose assembly controls register and stack use
 
 ## Troubleshooting
 

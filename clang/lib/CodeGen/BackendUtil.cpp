@@ -1191,24 +1191,28 @@ void EmitAssemblyHelper::RunOptimizationPipeline(
             MPM.addPass(InstrProfilingLoweringPass(*Options, false));
           });
 
-    if (ClStringObf)
+    // The opt-in PassBuilder pipeline owns all seven passes when requested.
+    // Do not also insert Clang's annotation/legacy-flag callbacks.
+    if (!isRustObfuscationPipelineEnabled()) {
+      if (ClStringObf)
+        PB.registerPipelineStartEPCallback(
+            [](ModulePassManager &MPM, OptimizationLevel Level) {
+              (void)Level;
+              MPM.addPass(StringObfuscationPass(/*Flag=*/true));
+            });
+
       PB.registerPipelineStartEPCallback(
           [](ModulePassManager &MPM, OptimizationLevel Level) {
-            (void)Level;
-            MPM.addPass(StringObfuscationPass(/*Flag=*/true));
+            if (Level == OptimizationLevel::O0)
+              addObfuscationPasses(MPM);
           });
-
-    PB.registerPipelineStartEPCallback(
-        [](ModulePassManager &MPM, OptimizationLevel Level) {
-          if (Level == OptimizationLevel::O0)
-            addObfuscationPasses(MPM);
-        });
-    PB.registerOptimizerLastEPCallback(
-        [](ModulePassManager &MPM, OptimizationLevel Level,
-           ThinOrFullLTOPhase) {
-          if (Level != OptimizationLevel::O0)
-            addObfuscationPasses(MPM);
-        });
+      PB.registerOptimizerLastEPCallback(
+          [](ModulePassManager &MPM, OptimizationLevel Level,
+             ThinOrFullLTOPhase) {
+            if (Level != OptimizationLevel::O0)
+              addObfuscationPasses(MPM);
+          });
+    }
 
     // TODO: Consider passing the MemoryProfileOutput to the pass builder via
     // the PGOOptions, and set this up there.

@@ -63,6 +63,20 @@ jobs:
             --opt build-llvm-project/bin/opt \
             --work-dir build-llvm-project/http-integration
 
+      - name: Measure each pass from final binaries
+        run: python -B tests/obfuscation/report_size_time.py --clang build-llvm-project/bin/clang --opt build-llvm-project/bin/opt --objdump build-llvm-project/bin/llvm-objdump --work-dir build-llvm-project/clang-cost
+
+      - name: Upload cost and recovery evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: transform-measurements-linux-amd64
+          path: |
+            build-llvm-project/clang-cost/obfuscation-performance.*
+            build-llvm-project/clang-cost/*.asm.txt
+            build-llvm-project/clang-cost/*.events.jsonl
+            build-llvm-project/portable-smoke/report_static_recovery/static-recovery.json
+          if-no-files-found: error
+
       - name: Upload emitted IR on failure
         if: failure()
         uses: actions/upload-artifact@v4
