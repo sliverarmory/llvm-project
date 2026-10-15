@@ -26,7 +26,7 @@ and skip events when `RUST_OBF_EVENT_FILE` is set. Relevant reasons include:
 | --- | --- |
 | `weak-or-comdat`, `non-local` | Duplicate/weak data or externally visible definitions; separate decoders could disagree after linking. |
 | `unsafe-global-user`, `metadata`, `llvm-metadata` | An exported descriptor, `llvm.used`, or other metadata requires stable pre-constructor data. |
-| `early-initialization`, `early-ctor-indirect-call` | A priority-zero constructor can read the bytes before the decoder; indirect calls from such a constructor conservatively exclude the allocation. |
+| `early-initialization`, `early-ctor-indirect-call` | An ELF `.preinit_array` entry, explicit priority-zero `.init_array` entry, or priority-zero constructor can read the bytes before the decoder; indirect calls from these conservatively exclude the allocation. |
 | `function-not-selected`, `no-runtime-use` | The allocation crosses the function selection boundary or has no runtime reader. |
 | `explicit-section`, `thread-local`, `address-space`, `external-init` | Storage has placement or initialization constraints. |
 | `unsupported-constant-use`, `alias-or-ifunc`, `pointer-escapes` | A constant address calculation, alias, or unsupported pointer operation prevents a safe rewrite. |
@@ -40,8 +40,11 @@ requires `weak-or-comdat` from each pass invocation, and links them with
 to one allocation with exact bytes. ELF and COFF use an explicit COMDAT group;
 Mach-O uses its weak-definition coalescing because it cannot lower COMDAT IR.
 `string_data_indirect_ctor.ll` checks the conservative priority-zero indirect
-call exclusion. The focused test also runs the pass twice to verify that it
-does not register a second decoder.
+call exclusion. `string_data_preinit.ll` and
+`string_data_preinit_indirect.ll` check direct and indirect ELF preinit readers,
+an explicit priority-zero `.init_array` reader, and continued encoding of
+unrelated later data. The focused test also runs
+the pass twice to verify that it does not register a second decoder.
 `string_data.rs` verifies the exact bytes in an executable; the FFI staticlib
 fixture is consumed by `string_data_ffi.c`. The test checks that each selected
 plaintext marker appears in a baseline final artifact and is absent from the
@@ -49,6 +52,9 @@ obfuscated artifact. The C harness holds its expected bytes as numeric values
 XOR-encoded behind volatile reads so it cannot supply the plaintext witness.
 The test checks the harness object, Rust archive, and linked C executable:
 only the baseline archive and executable may contain the marker.
+On Linux, `string_data_preinit.rs` and its C consumer also verify that a Rust
+ELF preinit function observes its original bytes before constructors run, while
+a separate later string is still encoded.
 
 Run the portable test with:
 

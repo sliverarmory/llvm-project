@@ -133,42 +133,75 @@ static bool hasCStringInitializer(const GlobalVariable &GV) {
          cast<ConstantDataSequential>(GV.getInitializer())->isCString();
 }
 
-// A decoder registered at priority zero precedes constructors with larger
-// priorities. Equal priorities have unspecified order. Include direct callees
-// so a selected byte array cannot be read through a helper before decoding.
-static void collectEarlyCtorReaders(
-    const Module &M, SmallPtrSetImpl<const Function *> &EarlyReaders,
-    bool &HasIndirectCall) {
-  const GlobalVariable *Ctors = M.getNamedGlobal("llvm.global_ctors");
-  if (!Ctors || !Ctors->hasInitializer())
-    return;
-  const auto *Entries = dyn_cast<ConstantArray>(Ctors->getInitializer());
-  if (!Entries) {
-    HasIndirectCall = true;
+// ELF .preinit_array entries run before constructors. Explicit .init_array.0
+// entries can tie the decoder's priority-zero constructor and run first.
+static bool isEarlyInitializerSection(StringRef Section) {
+  if (Section == ".preinit_array" || Section.starts_with(".preinit_array."))
+    return true;
+  if (!Section.consume_front(".init_array."))
+    return false;
+  return !Section.empty() && Section.find_first_not_of('0') == StringRef::npos;
+}
+
+// Include direct callees so a selected byte array cannot be read through a
+// helper before decoding.
+static void
+collectEarlyInitializerFunctions(const Constant *Initializer,
+                                 SmallVectorImpl<const Function *> &Pending,
+                                 bool &HasIndirectCall) {
+  if (const auto *F = dyn_cast<Function>(Initializer->stripPointerCasts())) {
+    Pending.push_back(F);
     return;
   }
+  if (const auto *Entries = dyn_cast<ConstantArray>(Initializer)) {
+    for (const Use &Entry : Entries->operands())
+      collectEarlyInitializerFunctions(cast<Constant>(Entry.get()), Pending,
+                                       HasIndirectCall);
+    return;
+  }
+  // An unresolved entry might call a reader before the decoder runs.
+  HasIndirectCall = true;
+}
 
+static void
+collectEarlyStartupReaders(const Module &M,
+                           SmallPtrSetImpl<const Function *> &EarlyReaders,
+                           bool &HasIndirectCall) {
+  const GlobalVariable *Ctors = M.getNamedGlobal("llvm.global_ctors");
   SmallVector<const Function *, 8> Pending;
-  for (const Use &Entry : Entries->operands()) {
-    const auto *Record = dyn_cast<ConstantStruct>(Entry.get());
-    if (!Record || Record->getNumOperands() < 2) {
+  if (Ctors && Ctors->hasInitializer()) {
+    const auto *Entries = dyn_cast<ConstantArray>(Ctors->getInitializer());
+    if (!Entries) {
+      HasIndirectCall = true;
+    } else {
+      for (const Use &Entry : Entries->operands()) {
+        const auto *Record = dyn_cast<ConstantStruct>(Entry.get());
+        if (!Record || Record->getNumOperands() < 2) {
+          HasIndirectCall = true;
+          continue;
+        }
+        const auto *Priority = dyn_cast<ConstantInt>(Record->getOperand(0));
+        if (!Priority) {
+          HasIndirectCall = true;
+          continue;
+        }
+        if (!Priority->isZero())
+          continue;
+        collectEarlyInitializerFunctions(cast<Constant>(Record->getOperand(1)),
+                                         Pending, HasIndirectCall);
+      }
+    }
+  }
+
+  for (const GlobalVariable &GV : M.globals()) {
+    if (!isEarlyInitializerSection(GV.getSection()))
+      continue;
+    if (!GV.isConstant() || !GV.hasInitializer()) {
       HasIndirectCall = true;
       continue;
     }
-    const auto *Priority = dyn_cast<ConstantInt>(Record->getOperand(0));
-    if (!Priority) {
-      HasIndirectCall = true;
-      continue;
-    }
-    if (!Priority->isZero())
-      continue;
-    const auto *F = dyn_cast<Function>(
-        Record->getOperand(1)->stripPointerCasts());
-    if (!F) {
-      HasIndirectCall = true;
-      continue;
-    }
-    Pending.push_back(F);
+    collectEarlyInitializerFunctions(GV.getInitializer(), Pending,
+                                     HasIndirectCall);
   }
 
   while (!Pending.empty()) {
@@ -459,7 +492,7 @@ public:
     bool Changed = false;
     SmallPtrSet<const Function *, 16> EarlyReaders;
     bool HasIndirectEarlyCall = false;
-    collectEarlyCtorReaders(M, EarlyReaders, HasIndirectEarlyCall);
+    collectEarlyStartupReaders(M, EarlyReaders, HasIndirectEarlyCall);
 
     // rustc often creates private literal allocations without an LLVM name.
     // Derive stable names for safe, eligible arrays before applying exact

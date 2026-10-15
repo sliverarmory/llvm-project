@@ -287,6 +287,51 @@ def check_weak_comdat(opt, clang, work):
           flush=True)
 
 
+def check_preinit(opt, work):
+    source = ROOT / "string_data_preinit.ll"
+    output = work / "rust-preinit.ll"
+    events = work / "rust-preinit-events.jsonl"
+    events.unlink(missing_ok=True)
+    result = run([
+        str(opt), f"-obf-test-seed={SEED}", "-sobf-rust-bytes",
+        "-obf-report-skips", "-passes=obf-string,verify", "-S",
+        str(source), "-o", str(output),
+    ], env={**os.environ, "RUST_OBF_EVENT_FILE": str(events)})
+    ir = output.read_bytes()
+    diagnostics = result.stderr.decode()
+    for name, marker in (("early", b"rust-preinit-secret"),
+                         ("early_sub", b"rust-preinit-sub"),
+                         ("early_init", b"rust-zero-init-secret")):
+        require(f'symbol="{name}" reason=early-initialization' in diagnostics,
+                f"{name}: early ELF reader was not excluded:\n{diagnostics}")
+        require(marker in ir and
+                re.search(rb"(?m)^@" + name.encode() + rb" = private constant", ir),
+                f"{name}: early ELF byte array changed")
+    require(b"rust-late-secret" not in ir and
+            re.search(rb"(?m)^@late = private global", ir),
+            "unrelated post-constructor byte array was not encoded")
+    effects = [json.loads(line) for line in events.read_text().splitlines()
+               if line.strip()]
+    encoded = {event["raw_name"] for event in effects
+               if event.get("event") == "effect" and event.get("kind") == "global"}
+    require(encoded == {"late"},
+            f"early initializer selection encoded unexpected byte arrays: {encoded!r}")
+
+    indirect = work / "rust-preinit-indirect.ll"
+    result = run([
+        str(opt), f"-obf-test-seed={SEED}", "-sobf-rust-bytes",
+        "-sobf-only-globals=indirect_data", "-obf-report-skips",
+        "-passes=obf-string,verify", "-S",
+        str(ROOT / "string_data_preinit_indirect.ll"), "-o", str(indirect),
+    ])
+    require('symbol="indirect_data" reason=early-ctor-indirect-call'
+            in result.stderr.decode() and
+            b"rust-indirect-secret" in indirect.read_bytes(),
+            "indirect preinit call was not conservatively excluded")
+    print("PASS ELF early readers: preinit, priority-zero, indirect skips; later bytes encoded",
+          flush=True)
+
+
 def check_opt(opt, clang, work):
     check_unnamed_literal(opt, work)
     check_weak_comdat(opt, clang, work)
@@ -392,6 +437,7 @@ def check_opt(opt, clang, work):
     require('symbol="indirect_data" reason=early-ctor-indirect-call'
             in result.stderr.decode(),
             "priority-zero indirect constructor was not excluded")
+    check_preinit(opt, work)
     print("PASS opt Rust byte arrays: bounded selection and documented exclusions", flush=True)
 
 
@@ -491,6 +537,58 @@ def check_rust(rustc, opt, clang, work):
         require((ffi_marker in executable.read_bytes()) == (label == "baseline"),
                 f"Rust FFI {label} final executable plaintext witness failed")
     print("PASS Rust staticlib: C consumer sees exact bytes; final plaintext absent",
+          flush=True)
+    if sys.platform.startswith("linux"):
+        check_rust_preinit(rustc, opt, clang, work)
+
+
+def check_rust_preinit(rustc, opt, clang, work):
+    source = ROOT / "string_data_preinit.rs"
+    early = b"rust-preinit-secret"
+    late = b"rust-late-secret"
+    consumer = work / "preinit-consumer.o"
+    run([*clang, "-O2", "-c", str(ROOT / "string_data_preinit.c"),
+         "-o", str(consumer)])
+    require(early not in consumer.read_bytes() and late not in consumer.read_bytes(),
+            "C preinit consumer masks the Rust final-data witnesses")
+    for level in (0, 2):
+        for label, options in (("baseline", ()),
+                               ("encoded", ("-rust-obf-pipeline=obf-string",
+                                            f"-obf-test-seed={SEED}",
+                                            "-obf-report-skips"))):
+            stem = work / f"preinit-O{level}-{label}"
+            ir_path = stem.with_suffix(".ll")
+            obj_path = stem.with_suffix(".o")
+            command = [str(rustc), "--edition=2021", "--crate-type=lib",
+                       "--crate-name", f"preinit_{label}",
+                       "-C", f"opt-level={level}", "-C", "codegen-units=1",
+                       "-C", "panic=abort", "-C", "debuginfo=0"]
+            if options:
+                command.extend(("-C", f"llvm-args={' '.join(options)}"))
+            command.extend((f"--emit=llvm-ir={ir_path},obj={obj_path}",
+                            str(source)))
+            result = run(command, timeout=360)
+            run([str(opt), "-passes=verify", "-disable-output", str(ir_path)])
+            ir = ir_path.read_bytes()
+            obj = obj_path.read_bytes()
+            require(early in ir and early in obj,
+                    f"Rust O{level}/{label}: preinit bytes were changed")
+            if label == "encoded":
+                require(b"reason=early-initialization" in result.stderr and
+                        late not in ir and late not in obj,
+                        f"Rust O{level}: preinit skip or later encoding missing")
+            else:
+                require(late in ir and late in obj,
+                        f"Rust O{level}: baseline later bytes missing")
+            executable = work / f"preinit-O{level}-{label}-linked"
+            run([*clang, str(consumer), str(obj_path), "-o", str(executable)],
+                timeout=360)
+            output = run([str(executable)], timeout=15).stdout
+            require(output == b"preinit=114 observed=114 later=114\n",
+                    f"Rust O{level}/{label}: wrong preinit bytes: {output!r}")
+            require((late in executable.read_bytes()) == (label == "baseline"),
+                    f"Rust O{level}/{label}: linked later-byte effect missing")
+    print("PASS Rust ELF preinit: O0/O2 startup bytes and selective encoding",
           flush=True)
 
 
