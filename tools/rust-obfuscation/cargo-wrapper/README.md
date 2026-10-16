@@ -2,8 +2,8 @@
 
 `rust-obf-cargo` launches Cargo with the pinned Rust 1.99/LLVM 23 compiler and
 intercepts each rustc invocation. Package rules resolve through `cargo metadata`
-to exact manifest directories, so a workspace member and a registry dependency
-with similar crate names cannot be confused. The wrapper adds the milestone-1
+to exact manifest directories, so workspace, registry, Git, and external path
+packages with similar crate names cannot be confused. The wrapper adds the milestone-1
 LLVM pipeline only to selected target crates. It schedules the late passes
 before LTO imports or merges crate modules, preserving package selection in
 Thin and fat LTO. Cargo host build scripts and proc macros are excluded. It
@@ -37,10 +37,33 @@ Example `obfuscation.json` (use an absolute path to the custom compiler):
       "version": "2.0.1",
       "source": "registry",
       "passes": ["obf-sub"]
+    },
+    {
+      "name": "my-local-dependency",
+      "source": "path",
+      "passes": ["obf-sub"]
+    },
+    {
+      "name": "my-git-dependency",
+      "source": "git",
+      "passes": ["obf-sub"]
     }
   ]
 }
 ```
+
+`source` is one of `workspace`, `registry`, `git`, or `path`. `path` selects
+local packages outside Cargo's `workspace_members`; Cargo can classify a path
+dependency inside the workspace as a workspace member. Each rule must match
+exactly one package by source, name, and optional version. If several packages
+share those values, set `package_id` to the exact `packages[].id` returned by
+`cargo metadata --format-version 1`. For example, two Git repositories can
+contain the same package name and version. The wrapper rejects an ambiguous or
+missing match before compiling. A first offline build of a Git dependency
+requires that Cargo has already fetched it. If two package IDs share one
+canonical manifest directory (for example, two Git refs pointing at one
+commit), the wrapper rejects selection because Cargo's rustc invocations
+cannot be attributed to one ID safely.
 
 Run it from the Cargo workspace:
 
