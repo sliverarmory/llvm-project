@@ -42,6 +42,8 @@ struct Rule {
     version: Option<String>,
     source: String,
     #[serde(default)]
+    package_id: Option<String>,
+    #[serde(default)]
     targets: Vec<String>,
     #[serde(default)]
     crate_types: Vec<String>,
@@ -205,11 +207,17 @@ fn validate(config: &Config) -> io::Result<()> {
         }
     }
     for rule in &config.packages {
-        if !matches!(rule.source.as_str(), "workspace" | "registry") {
+        if !matches!(
+            rule.source.as_str(),
+            "workspace" | "registry" | "git" | "path"
+        ) {
             return Err(fail(format!(
-                "{}: source must be workspace or registry",
+                "{}: source must be workspace, registry, git, or path",
                 rule.name
             )));
+        }
+        if rule.package_id.as_ref().is_some_and(String::is_empty) {
+            return Err(fail(format!("{}: package_id cannot be empty", rule.name)));
         }
         if rule.passes.is_empty() || rule.passes.iter().any(|p| !PASSES.contains(&p.as_str())) {
             return Err(fail(format!("{}: unknown or empty pass list", rule.name)));
@@ -337,26 +345,51 @@ fn cargo_metadata(cargo: &Path, cargo_args: &[OsString]) -> io::Result<Metadata>
 }
 
 fn resolve_rules(config: &Config, metadata: &Metadata) -> io::Result<Vec<ResolvedRule>> {
-    let members: BTreeSet<_> = metadata.workspace_members.iter().collect();
+    let members: BTreeSet<&str> = metadata
+        .workspace_members
+        .iter()
+        .map(String::as_str)
+        .collect();
     config.packages.iter().map(|rule| {
         let candidates: Vec<_> = metadata.packages.iter().filter(|package| {
-            let source_match = if rule.source == "workspace" {
-                members.contains(&package.id)
-            } else {
-                package.source.as_deref().is_some_and(|source| source.starts_with("registry+"))
+            let source_match = match rule.source.as_str() {
+                "workspace" => members.contains(package.id.as_str()),
+                "path" => package.source.is_none() && !members.contains(package.id.as_str()),
+                "registry" => package.source.as_deref()
+                    .is_some_and(|source| source.starts_with("registry+")),
+                "git" => package.source.as_deref()
+                    .is_some_and(|source| source.starts_with("git+")),
+                _ => false,
             };
             source_match && package.name == rule.name
                 && rule.version.as_deref().is_none_or(|version| version == package.version)
+                && rule.package_id.as_deref().is_none_or(|id| id == package.id)
         }).collect();
-        if candidates.len() != 1 {
+        if candidates.is_empty() {
             return Err(fail(format!(
-                "{}: expected one {} package in cargo metadata, found {}; add a version if ambiguous",
-                rule.name, rule.source, candidates.len()
+                "{}: no matching {} package in cargo metadata",
+                rule.name, rule.source
+            )));
+        }
+        if candidates.len() > 1 {
+            return Err(fail(format!(
+                "{}: {} {} packages match in cargo metadata; set version or exact package_id to disambiguate",
+                rule.name, candidates.len(), rule.source
             )));
         }
         let package = candidates[0];
         let manifest_dir = package.manifest_path.parent()
             .ok_or_else(|| fail("package manifest has no parent"))?.canonicalize()?;
+        for other in metadata.packages.iter().filter(|other| other.id != package.id) {
+            let other_dir = other.manifest_path.parent()
+                .ok_or_else(|| fail("package manifest has no parent"))?.canonicalize()?;
+            if other_dir == manifest_dir {
+                return Err(fail(format!(
+                    "{}: multiple Cargo package IDs share the same manifest directory; rustc invocations cannot be selected safely",
+                    rule.name
+                )));
+            }
+        }
         Ok(ResolvedRule {
             rule: rule.clone(),
             package_id: package.id.clone(),
@@ -1139,6 +1172,7 @@ mod tests {
             name: "fixture".to_owned(),
             version: None,
             source: "workspace".to_owned(),
+            package_id: None,
             targets: targets.iter().map(|value| value.to_string()).collect(),
             crate_types: crate_types.iter().map(|value| value.to_string()).collect(),
             passes: vec!["obf-sub".to_owned()],
@@ -1146,6 +1180,97 @@ mod tests {
             globals: Vec::new(),
             constants: Vec::new(),
         }
+    }
+
+    #[test]
+    fn resolves_all_cargo_source_kinds_without_cross_selecting() {
+        let root = unique_dir(&env::temp_dir().join("rust-obf-cargo-source-tests"))
+            .unwrap()
+            .canonicalize()
+            .unwrap();
+        let mut packages = Vec::new();
+        for (kind, id, source) in [
+            ("workspace", "path+file:///workspace#same@0.1.0", None),
+            ("path", "path+file:///external#same@0.1.0", None),
+            (
+                "registry",
+                "registry+https://example.test/index#same@0.1.0",
+                Some("registry+https://example.test/index"),
+            ),
+            (
+                "git",
+                "git+file:///repo#same@0.1.0",
+                Some("git+file:///repo#0123456789abcdef"),
+            ),
+            (
+                "git-other",
+                "git+file:///other#same@0.1.0",
+                Some("git+file:///other#0123456789abcdef"),
+            ),
+        ] {
+            let manifest_dir = root.join(kind);
+            fs::create_dir(&manifest_dir).unwrap();
+            packages.push(MetadataPackage {
+                id: id.to_owned(),
+                name: "same".to_owned(),
+                version: "0.1.0".to_owned(),
+                source: source.map(str::to_owned),
+                manifest_path: manifest_dir.join("Cargo.toml"),
+            });
+        }
+        let mut metadata = Metadata {
+            workspace_members: vec![packages[0].id.clone()],
+            workspace_root: root.clone(),
+            packages,
+        };
+        let config_for = |source: &str, package_id: Option<&str>| {
+            let mut selected = rule(&[], &[], &[]);
+            selected.name = "same".to_owned();
+            selected.version = Some("0.1.0".to_owned());
+            selected.source = source.to_owned();
+            selected.package_id = package_id.map(str::to_owned);
+            Config {
+                version: 1,
+                rustc: PathBuf::from("rustc"),
+                cargo: None,
+                seed: None,
+                strict: true,
+                packages: vec![selected],
+            }
+        };
+        for (source, id) in [
+            ("workspace", metadata.packages[0].id.as_str()),
+            ("path", metadata.packages[1].id.as_str()),
+            ("registry", metadata.packages[2].id.as_str()),
+        ] {
+            let selected = resolve_rules(&config_for(source, None), &metadata).unwrap();
+            assert_eq!(selected[0].package_id, id);
+            assert_eq!(selected[0].manifest_dir, root.join(source));
+        }
+        assert!(resolve_rules(&config_for("git", None), &metadata).is_err());
+        for index in [3, 4] {
+            let id = metadata.packages[index].id.as_str();
+            let selected = resolve_rules(&config_for("git", Some(id)), &metadata).unwrap();
+            assert_eq!(selected[0].package_id, id);
+        }
+        assert!(resolve_rules(&config_for("git", Some("missing")), &metadata).is_err());
+        assert!(resolve_rules(
+            &config_for("path", Some(metadata.packages[0].id.as_str())),
+            &metadata
+        )
+        .is_err());
+        assert!(validate(&config_for("git", Some(""))).is_err());
+        assert!(validate(&config_for("unknown", None)).is_err());
+        metadata.packages[4].manifest_path = metadata.packages[3].manifest_path.clone();
+        for index in [3, 4] {
+            let id = metadata.packages[index].id.as_str();
+            let error = resolve_rules(&config_for("git", Some(id)), &metadata).unwrap_err();
+            assert!(
+                error.to_string().contains("same manifest directory"),
+                "{error}"
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn event(name: &str, effect: bool) -> Event {

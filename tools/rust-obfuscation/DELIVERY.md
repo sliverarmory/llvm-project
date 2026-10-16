@@ -129,6 +129,16 @@ compiler's absolute path. For example:
       "version": "2.0.1",
       "source": "registry",
       "passes": ["obf-sub"]
+    },
+    {
+      "name": "my-local-dependency",
+      "source": "path",
+      "passes": ["obf-sub"]
+    },
+    {
+      "name": "my-git-dependency",
+      "source": "git",
+      "passes": ["obf-sub"]
     }
   ]
 }
@@ -142,14 +152,22 @@ compiler's absolute path. For example:
 
 `seed` is optional. A 32-hex-character seed is useful for reproducible test
 builds; omitting it uses the toolchain's normal entropy path. The wrapper
-resolves package rules through `cargo metadata` to exact manifests, selects
-target crates, and excludes host build scripts and proc macros. It adds the
+accepts `workspace`, `registry`, `path`, and `git` sources and resolves package
+rules through `cargo metadata` to exact manifests. A `path` rule selects a
+non-workspace local package. Rules must match one package; set optional
+`package_id` to the exact metadata `packages[].id` when name, version, and
+source still match several packages. The wrapper selects target crates and
+excludes host build scripts and proc macros. It adds the
 native host target if no `--target` was passed and creates a fresh target
 directory for each invocation. It refuses an existing `RUSTC_WRAPPER` or
 `RUSTC_WORKSPACE_WRAPPER` and a user-supplied Cargo target directory. `build`,
 `test`, `run`, `rustc`, and `check` are accepted Cargo commands. Bundled
 `CARGO-WRAPPER.md` has the full rule schema. `CARGO_OUTPUTS.md` describes the
 library and consumer acceptance fixture.
+
+If distinct Cargo package IDs share one canonical manifest directory, the
+wrapper rejects them because a rustc invocation cannot be attributed to one
+ID safely. This can occur when two Git refs point to the same commit.
 
 The pass names are `obf-string`, `obf-split`, `obf-bcf`, `obf-fla`, `obf-sub`,
 `obf-const`, and `obf-global-access`. The pipeline always runs them in its
