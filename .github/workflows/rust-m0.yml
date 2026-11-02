@@ -51,7 +51,7 @@ jobs:
             extension: zip
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # bootstrap.py verifies ancestry from the pinned LLVM base commit.
           # Full commit history keeps the proof valid as this branch grows.
@@ -81,7 +81,7 @@ jobs:
 
       - name: Set up MSVC
         if: runner.os == 'Windows'
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: ilammy/msvc-dev-cmd@a102174a2b586eec2ea151a69e6fd14404a8ce7c # v1.13.0
 
       - name: Install Windows build and HTTPS dependencies
         if: runner.os == 'Windows'
@@ -169,7 +169,7 @@ jobs:
         run: python -B tests/obfuscation/test_http_programs.py --clang build-llvm-project/bin/clang --opt build-llvm-project/bin/opt --work-dir build-llvm-project/http-rust
 
       - name: Upload passing native toolchain archive
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: rust-obfuscation-${{ matrix.platform }}
           path: |
@@ -185,7 +185,7 @@ jobs:
 
       - name: Upload Rust diagnostic reports and emitted IR
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: rust-obfuscation-diagnostics-${{ matrix.platform }}
           path: |
