@@ -16,7 +16,10 @@ class ReleaseEvidenceTests(unittest.TestCase):
         for platform in PLATFORMS:
             clang = self.root / f"archive-{platform}"
             clang.mkdir()
-            (clang / f"llvm-obfuscator-v1-{platform}.zip").write_bytes(b"clang")
+            clang_zip = clang / f"llvm-obfuscator-v1-{platform}.zip"
+            clang_zip.write_bytes(b"clang")
+            clang_zip.with_name(clang_zip.name + ".sha256").write_text(
+                f"{sha256(clang_zip)}  {clang_zip.name}\n")
             rust = self.root / f"rust-obfuscation-{platform}"
             rust.mkdir()
             ext = "zip" if platform.startswith("windows") else "tar.gz"
@@ -34,8 +37,8 @@ class ReleaseEvidenceTests(unittest.TestCase):
 
     def test_stages_all_four_hosts_and_unique_evidence_names(self):
         assets = collect(self.root, "v1", "abc")
-        self.assertEqual(20, len(assets))
-        self.assertEqual(20, len({name for _, name in assets}))
+        self.assertEqual(24, len(assets))
+        self.assertEqual(24, len({name for _, name in assets}))
 
     def test_rejects_wrong_revision_or_incomplete_smoke(self):
         for field, value in (("source_commit", "old"), ("source_dirty", True),

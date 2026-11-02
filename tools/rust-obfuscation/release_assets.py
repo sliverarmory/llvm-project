@@ -23,7 +23,10 @@ def collect(artifacts, tag, expected_commit):
     for platform in PLATFORMS:
         clang = exactly_one(artifacts / f"archive-{platform}",
                             f"llvm-obfuscator-{tag}-{platform}.zip")
+        verify_archive_sidecar(clang)
         assets.append((clang, clang.name))
+        assets.append((clang.parent / (clang.name + ".sha256"),
+                       clang.name + ".sha256"))
         root = artifacts / f"rust-obfuscation-{platform}"
         extension = "zip" if platform.startswith("windows") else "tar.gz"
         archive = exactly_one(root, f"rust-obfuscation-{platform}.{extension}")
