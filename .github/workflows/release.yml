@@ -158,6 +158,7 @@ jobs:
             test -x "${PKG_DIR}/bin/${tool}"
           done
           (cd "${OUT_DIR}" && zip -r "${{ matrix.archive }}" "llvm-obfuscator-${TAG}-${TARGET}")
+          (cd "${OUT_DIR}" && sha256sum "${{ matrix.archive }}" > "${{ matrix.archive }}.sha256")
 
       - name: Package archive (Windows)
         if: runner.os == 'Windows'
@@ -199,6 +200,11 @@ jobs:
           $archivePath = Join-Path $outDir "${{ matrix.archive }}"
           if (Test-Path $archivePath) { Remove-Item $archivePath -Force }
           Compress-Archive -Path $pkgDir -DestinationPath $archivePath
+
+          # Same format the rust toolchain sidecars use:
+          # "<lowercase sha256>  <archive filename>" (two spaces)
+          $archiveHash = (Get-FileHash $archivePath -Algorithm SHA256).Hash.ToLower()
+          "$archiveHash  $(Split-Path -Path $archivePath -Leaf)" | Out-File -FilePath "$archivePath.sha256" -Encoding ascii
 
       - name: Extract and validate archive (Linux/macOS)
         if: runner.os != 'Windows'
@@ -307,7 +313,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: archive-${{ matrix.target }}
-          path: dist/${{ matrix.archive }}
+          path: |
+            dist/${{ matrix.archive }}
+            dist/${{ matrix.archive }}.sha256
           if-no-files-found: error
           retention-days: 7
 
