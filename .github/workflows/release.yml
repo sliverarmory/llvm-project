@@ -89,7 +89,7 @@ jobs:
         run: |
           set -euo pipefail
           cmake -S llvm -B build-llvm-project -G Ninja \
-            -DLLVM_ENABLE_PROJECTS=clang \
+            -DLLVM_ENABLE_PROJECTS="clang;lld" -DLLVM_ENABLE_LIBXML2=OFF \
             -DLLVM_PARALLEL_LINK_JOBS=1 \
             -DCMAKE_BUILD_TYPE=Release
 
@@ -98,7 +98,7 @@ jobs:
         run: |
           set -euo pipefail
           cmake -S llvm -B build-llvm-project -G Ninja \
-            -DLLVM_ENABLE_PROJECTS=clang \
+            -DLLVM_ENABLE_PROJECTS="clang;lld" -DLLVM_ENABLE_LIBXML2=OFF \
             -DLLVM_PARALLEL_LINK_JOBS=1 \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
             -DCMAKE_BUILD_TYPE=Release
@@ -108,7 +108,7 @@ jobs:
         shell: pwsh
         run: |
           cmake -S llvm -B build-llvm-project -G Ninja `
-            -DLLVM_ENABLE_PROJECTS=clang `
+            -DLLVM_ENABLE_PROJECTS="clang;lld" -DLLVM_ENABLE_LIBXML2=OFF `
             -DLLVM_PARALLEL_LINK_JOBS=1 `
             -DCMAKE_BUILD_TYPE=Release
 
@@ -116,12 +116,12 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           set -euo pipefail
-          cmake --build build-llvm-project --target clang opt llvm-objdump --parallel 4
+          cmake --build build-llvm-project --target clang lld opt llvm-objdump --parallel 4
 
       - name: Build Clang and LLVM tools (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: cmake --build build-llvm-project --target clang opt llvm-objdump --parallel 4
+        run: cmake --build build-llvm-project --target clang lld opt llvm-objdump --parallel 4
 
       - name: Build Clang's linker plugin (macOS)
         if: runner.os == 'macOS'
@@ -139,7 +139,7 @@ jobs:
           mkdir -p "${PKG_DIR}/bin"
           mkdir -p "${PKG_DIR}/lib"
 
-          for tool in clang clang++ opt llvm-objdump; do
+          for tool in clang clang++ opt llvm-objdump lld ld.lld ld64.lld lld-link wasm-ld; do
             test -x "build-llvm-project/bin/${tool}"
           done
           test -d build-llvm-project/lib/clang
@@ -147,6 +147,11 @@ jobs:
           cp -a build-llvm-project/bin/clang* "${PKG_DIR}/bin/"
           cp -a build-llvm-project/bin/opt* "${PKG_DIR}/bin/"
           cp -a build-llvm-project/bin/llvm-objdump "${PKG_DIR}/bin/"
+          cp -a build-llvm-project/bin/lld* "${PKG_DIR}/bin/"
+          cp -a build-llvm-project/bin/ld.lld* "${PKG_DIR}/bin/"
+          cp -a build-llvm-project/bin/ld64.lld* "${PKG_DIR}/bin/"
+          cp -a build-llvm-project/bin/lld-link* "${PKG_DIR}/bin/"
+          cp -a build-llvm-project/bin/wasm-ld* "${PKG_DIR}/bin/"
           cp -a build-llvm-project/lib/clang "${PKG_DIR}/lib/"
           if [[ "${{ matrix.target }}" == "macos-arm64" ]]; then
             test -f build-llvm-project/lib/libLTO.dylib
@@ -154,7 +159,7 @@ jobs:
           fi
           cp README.md "${PKG_DIR}/README.md"
 
-          for tool in clang clang++ opt llvm-objdump; do
+          for tool in clang clang++ opt llvm-objdump lld ld.lld ld64.lld lld-link wasm-ld; do
             test -x "${PKG_DIR}/bin/${tool}"
           done
           (cd "${OUT_DIR}" && zip -r "${{ matrix.archive }}" "llvm-obfuscator-${TAG}-${TARGET}")
@@ -174,7 +179,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path $binDir | Out-Null
           New-Item -ItemType Directory -Force -Path $libDir | Out-Null
 
-          foreach ($tool in @('clang.exe', 'clang++.exe', 'opt.exe', 'llvm-objdump.exe')) {
+          foreach ($tool in @('clang.exe', 'clang++.exe', 'opt.exe', 'llvm-objdump.exe', 'lld.exe', 'ld.lld.exe')) {
             if (-not (Test-Path -LiteralPath (Join-Path 'build-llvm-project/bin' $tool) -PathType Leaf)) {
               throw "Required build tool is missing: $tool"
             }
@@ -186,11 +191,15 @@ jobs:
           Copy-Item build-llvm-project/bin/clang*.exe -Destination $binDir -ErrorAction Stop
           Copy-Item build-llvm-project/bin/opt*.exe -Destination $binDir -ErrorAction Stop
           Copy-Item build-llvm-project/bin/llvm-objdump.exe -Destination $binDir -ErrorAction Stop
+          Copy-Item build-llvm-project/bin/lld*.exe -Destination $binDir -ErrorAction Stop
+          Copy-Item build-llvm-project/bin/ld.lld*.exe -Destination $binDir -ErrorAction Stop
+          Copy-Item build-llvm-project/bin/ld64.lld*.exe -Destination $binDir -ErrorAction Stop
+          Copy-Item build-llvm-project/bin/wasm-ld*.exe -Destination $binDir -ErrorAction Stop
           Copy-Item build-llvm-project/lib/clang -Destination $libDir -Recurse -Force -ErrorAction Stop
 
           Copy-Item README.md -Destination (Join-Path $pkgDir "README.md")
 
-          foreach ($tool in @('clang.exe', 'clang++.exe', 'opt.exe', 'llvm-objdump.exe')) {
+          foreach ($tool in @('clang.exe', 'clang++.exe', 'opt.exe', 'llvm-objdump.exe', 'lld.exe', 'ld.lld.exe')) {
             if (-not (Test-Path -LiteralPath (Join-Path $binDir $tool) -PathType Leaf)) {
               throw "Required packaged tool is missing: $tool"
             }
@@ -209,7 +218,7 @@ jobs:
           PKG_DIR="dist/verify/llvm-obfuscator-${GITHUB_REF_NAME}-${{ matrix.target }}"
           PKG_ROOT="$(cd "${PKG_DIR}" && pwd -P)"
 
-          for tool in clang clang++ opt llvm-objdump; do
+          for tool in clang clang++ opt llvm-objdump lld ld.lld ld64.lld lld-link wasm-ld; do
             test -x "${PKG_ROOT}/bin/${tool}"
           done
           test -d "${PKG_ROOT}/lib/clang"
@@ -241,7 +250,7 @@ jobs:
           $pkgDir = Join-Path $verifyDir "llvm-obfuscator-${env:GITHUB_REF_NAME}-${{ matrix.target }}"
           $pkgRoot = (Resolve-Path -LiteralPath $pkgDir).Path
 
-          foreach ($tool in @('clang.exe', 'clang++.exe', 'opt.exe', 'llvm-objdump.exe')) {
+          foreach ($tool in @('clang.exe', 'clang++.exe', 'opt.exe', 'llvm-objdump.exe', 'lld.exe', 'ld.lld.exe')) {
             if (-not (Test-Path -LiteralPath (Join-Path (Join-Path $pkgRoot 'bin') $tool) -PathType Leaf)) {
               throw "Required extracted tool is missing: $tool"
             }
